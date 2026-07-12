@@ -1,0 +1,8 @@
+.DS_Store
+build/
+appex/build/
+ingest/
+appex/CodeSaverExtension/Resources/corpus.bin
+appex/CodeSaverExtension/Resources/corpus-index.json
+setup.conf
+__pycache__/

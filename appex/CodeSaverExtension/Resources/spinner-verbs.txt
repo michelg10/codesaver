@@ -1,0 +1,121 @@
+Meowing,Meowed
+Relapsing,Relapsed
+Rehabing,Rehabed
+Clobbering,Clobbered
+Drumming,Drummed
+Firestorming,Firestormed
+Icestorming,Icestormed
+Codexing,Codexed
+ByteDancin',ByteDanced
+Nuking,Nuked
+Panicking,Panicked
+Reaping zombies,Reaped zombies
+Busily relaxing,Busily relaxed
+Sprokbooking,Sprokbooked
+Winning,Won
+Sleeping,Slept
+Ghosting,Ghosted
+Styling,Styled
+Ultrathinking,Ultrathought
+Orphaning,Orphaned
+ChatGPTing,ChatGPTed
+St-r-awbe-r-r-ying,St-r-awbe-r-r-ied
+Pretraining,Pretrained
+Reasoning,Reasoned
+Gene-iusing,Gene-iused
+Slacking,Slacked
+Crushing,Crushed
+Slopifying,Slopified
+Tokenizing,Tokenized
+Prefilling,Prefilled
+Decoding,Decoded
+Masculinating,Masculinated
+Snapping,Snapped
+Yapping,Yapped
+侬好ing,侬好ed
+Choking,Choked
+Slapping,Slapped
+Caffeinating,Caffeinated
+Clauding,Clauded
+BitDancin',BitDanced
+Sunnying,Sunnyed
+Tokenmaxxing,Tokenmaxxed
+Designing,Designed
+Building,Built
+Shipping,Shipped
+Chinaing,Chinaed
+Thinking,Thought
+IB Risktaking,IB Risktook
+CodeAssigning,CodeAssigned
+TikToking,TikToked
+Drinking,Drank
+Stedouble1aing,Stedouble1aed
+Jessing,Jessed
+Cheating,Cheated
+Self-Supervising,Self-Supervised
+卷ing,卷ed
+Claudemaxxing,Claudemaxxed
+Vibecoding,Vibecoded
+Edging,Edged
+Blundering,Blundered
+Hallucinating,Hallucinated
+Pouting,Pouted
+Slopperating,Slopperated
+Slopmaxxing,Slopmaxxed
+DeepSeeking,DeepSeeked
+Exposing,Exposed
+Smurfing,Smurfed
+Yeeting,Yeeted
+Finetuning,Finetuned
+Procrastinating,Procrastinated
+Shitposting,Shitposted
+WeChatting,WeChatted
+Sycophanting,Sycophanted
+Overthinking,Overthought
+You're absolutely right!ing,You're absolutely right!ed
+Reaching usage limit,Usage limit reached
+Hardly working,Hardly worked
+Wasting time in meetings,Wasted time in meetings
+Wasting tokens,Wasted tokens
+Overfitting,Overfitted
+Pinocchioing,Pinocchioed
+Noiring,Noired
+Slugging,Slugged
+Purring,Purred
+Ratatatouing,Ratatatouilled
+Rawdogging,Rawdogged
+Smoking,Smoked
+Transformering,Transformered
+Self-Attentioning,Self-Attentioned
+Balling,Balled
+Lying,Lied
+S&Ming,S&M'ed
+Deeply learning,Deeply learned
+Spelunking,Spelunked
+Matchamacalliting,Matchamacallitted
+Feeling the AGI,Felt the AGI
+Quasicoding,Quasicoded
+Omniauraling,Omniauraled
+Catting,Catted
+Mojibakeing,Mojibaked
+Forking parents,Forked parents
+Killing children,Killed children
+Replicating slaves,Replicated slaves
+Electing masters,Elected masters
+Deprecating self,Deprecated self
+Fingering users,Fingered users
+Haluluing,Halulued
+Detaching HEAD,Detached HEAD
+Backpropagating,Backpropagated
+Reward hacking,Reward hacked
+Benchmaxxing,Benchmaxxed
+Distilling,Distilled
+Quantizing,Quantized
+Sandbagging,Sandbagged
+Touching fish,Touched fish
+0x8BADF00Ding,0x8BADF00D
+0xDEAD10CCing,0xDEAD10CCed
+Claudestining,Claudestined
+Embedding spyware,Embedded spyware
+Agentically creating,Agentically created
+Crashing out,Crashed out
