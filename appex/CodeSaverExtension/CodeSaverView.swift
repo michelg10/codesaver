@@ -2577,10 +2577,16 @@ public final class CodeSaverView: ScreenSaverView {
     }
 
 
+    // CODESAVER_CLOCK_EPOCH (unix seconds): pin the clock to epoch + sim time,
+    // so offscreen snapshot renders tick at video speed instead of render speed.
+    private static let clockEpoch: Date? = ProcessInfo.processInfo
+        .environment["CODESAVER_CLOCK_EPOCH"].flatMap(Double.init)
+        .map(Date.init(timeIntervalSince1970:))
+
     /// Refreshes the 1 Hz clock raster; shared by the CG path and the Metal
     /// quad builder.
     private func ensureClockCache() -> ClockCache? {
-        let date = Date()
+        let date = Self.clockEpoch?.addingTimeInterval(now) ?? Date()
         // Gregorian explicitly: day/year numerics must match the POSIX-locale
         // month/weekday names (a Buddhist-calendar system yields year 2569).
         let c = Calendar(identifier: .gregorian).dateComponents([.hour, .minute, .second, .day, .year], from: date)
@@ -2621,11 +2627,11 @@ public final class CodeSaverView: ScreenSaverView {
         // ╭─ /* Sat Jul 11 2026 */ ──────────╮
         // │   time in half-block digits      │
         // ╰────────────────────────── PM ─╯
-        let f = monoFont(h * clockScale, .regular)
-        let charW = ("\u{2588}" as NSString).size(withAttributes: [.font: f]).width
+        var f = monoFont(h * clockScale, .regular)
+        var charW = ("\u{2588}" as NSString).size(withAttributes: [.font: f]).width
         // Slightly tighter than the natural line height so half-block rows
         // tile without seams (overdraw between rows is invisible).
-        let step = (f.ascender - f.descender) * 0.9
+        var step = (f.ascender - f.descender) * 0.9
 
         let timeStr = "\(hourStr):\(minStr):\(secStr)"
         let dateStr = "/* \(wd) \(mo) \(day) \(c.year ?? 0) */"
@@ -2661,6 +2667,16 @@ public final class CodeSaverView: ScreenSaverView {
         let inner = max(elementW + Int(clockPadCells) * 2, dateStr.count + 4)
         let leftPad = (inner - elementW) / 2 + lead
         let rightPad = inner - elementW - (leftPad - lead)
+
+        // Height-derived cells can overflow a narrow (portrait) screen —
+        // shrink the font so the box always fits the width.
+        let maxBoxW = bounds.width * 0.88
+        let boxCols = CGFloat(inner + 2)
+        if boxCols * charW > maxBoxW {
+            f = monoFont(h * clockScale * maxBoxW / (boxCols * charW), .regular)
+            charW = ("\u{2588}" as NSString).size(withAttributes: [.font: f]).width
+            step = (f.ascender - f.descender) * 0.9
+        }
 
         // Opaque colors: rows overlap slightly to avoid seams, and translucent
         // glyphs would double-composite into visible bands where they do.

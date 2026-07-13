@@ -32,6 +32,12 @@ struct PreviewMain {
         guard let view = CodeSaverView(frame: NSRect(origin: .zero, size: size), isPreview: false) else {
             fatalError("failed to create view")
         }
+        // CODESAVER_CLOCK_TOPFRAC overrides the clock's top offset (fraction
+        // of height) — e.g. to clear app chrome in social-format renders.
+        if let v = ProcessInfo.processInfo.environment["CODESAVER_CLOCK_TOPFRAC"]
+            .flatMap(Double.init) {
+            view.clockTopFrac = CGFloat(v)
+        }
         let step = 1.0 / 30.0
         var sim = 0.0
         for target in times.sorted() {
