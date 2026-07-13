@@ -101,6 +101,45 @@ public final class CodeSaverView: ScreenSaverView {
         use24Hour = p.bool(forKey: "use24HourTime")
     }
 
+    /// The clock only appears on the designated main display (the one that
+    /// owns the menu bar). If we can't tell which display we're on, assume
+    /// main so the clock never silently disappears. The preview always shows
+    /// it regardless of which display the System Settings window is on.
+    ///
+    /// In the appex, every display's view lives in one extension process,
+    /// each hosted in a window positioned at the target display's origin in
+    /// CoreGraphics coordinates (top-left origin) used unconverted as a Cocoa
+    /// frame — so window.screen is nil (or briefly wrong, see below) for
+    /// displays off the primary row, but the window's origin identifies the
+    /// display. Match the origin, not the full rect: the window's size has
+    /// historically been the main display's size (Aerial does the same).
+    /// window.screen remains as a fallback for real windows (legacy .saver,
+    /// the preview harness) whose origin matches no display.
+    ///
+    /// The host initially places every window on the main display and migrates
+    /// it to its real target moments later; since this is evaluated every
+    /// draw, a wrong early answer self-corrects after the migration.
+    private var clockVisible: Bool {
+        guard showClock else { return false }
+        if isPreview { return true }
+        guard let window else { return true }
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+        var count: UInt32 = 0
+        if CGGetActiveDisplayList(UInt32(ids.count), &ids, &count) == .success {
+            for id in ids.prefix(Int(count)) {
+                let origin = CGDisplayBounds(id).origin
+                if abs(origin.x - window.frame.origin.x) < 0.5,
+                   abs(origin.y - window.frame.origin.y) < 0.5 {
+                    return CGDisplayIsMain(id) != 0
+                }
+            }
+        }
+        if let screen = window.screen,
+           let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID {
+            return CGDisplayIsMain(id) != 0
+        }
+        return true
+    }
     // MARK: Tunable clock style
     // Adjusted live by the preview harness's debug sliders; the shipped saver
     // uses these defaults.
@@ -708,7 +747,7 @@ public final class CodeSaverView: ScreenSaverView {
 
         drawRows()
         drawVignette()
-        if showClock { drawClock() }
+        if clockVisible { drawClock() }
         drawSpinnerPanel()
     }
 
@@ -1185,15 +1224,27 @@ public final class CodeSaverView: ScreenSaverView {
         let size = text.size()
         let padH: CGFloat = uiFont.pointSize * 1.7
         let padV: CGFloat = uiFont.pointSize * 1.05
-        // Something owns the top of the screen — our own clock when enabled,
-        // else the system lock-screen clock (assume its top 17%). Center in
-        // what remains: that's the visual center.
-        let safeTop = showClock
-            ? clockBottom + lineH * panelGapMult
-            : bounds.height * 0.17
-        // Bias is expressed in clock-cell units so it scales with the clock.
-        let textY = safeTop + (bounds.height - safeTop - size.height) / 2
-            + bounds.height * clockScale * panelBias
+        // Who owns the top of the screen decides where the panel centers:
+        // our clock here → center in what remains below it; our clock enabled
+        // but on another display → nothing owns the top (enabling our clock
+        // implies the user disabled the system one), so center exactly; clock
+        // disabled → the system lock-screen clock owns the top, center in
+        // what remains. The 17% is not the clock's measured extent (it spans
+        // roughly 22% of screen height) but its visual weight: reserving 17%
+        // is what makes the panel *feel* centered under it.
+        let textY: CGFloat
+        if clockVisible {
+            let safeTop = clockBottom + lineH * panelGapMult
+            // Bias is expressed in clock-cell units so it scales with the clock.
+            textY = safeTop + (bounds.height - safeTop - size.height) / 2
+                + bounds.height * clockScale * panelBias
+        } else if showClock {
+            textY = (bounds.height - size.height) / 2
+        } else {
+            let safeTop = bounds.height * 0.17
+            textY = safeTop + (bounds.height - safeTop - size.height) / 2
+                + bounds.height * clockScale * panelBias
+        }
         let panel = NSRect(
             x: (bounds.width - size.width) / 2 - padH,
             y: textY - padV,
