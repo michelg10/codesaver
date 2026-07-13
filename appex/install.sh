@@ -30,6 +30,7 @@ if [[ ! -f CodeSaverExtension/Resources/corpus.bin || ! -f CodeSaverExtension/Re
 fi
 
 echo "── building…"
+mkdir -p build  # tee opens its log before xcodebuild creates the directory
 # Build number = install timestamp (overrides BuildNumber.xcconfig without
 # touching the tracked file), so "which build is installed?" has an answer.
 BUILD_NUM="$(date +%y%m%d.%H%M)"
