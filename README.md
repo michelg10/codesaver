@@ -13,7 +13,7 @@ CodeSaver fills the screen with code sampled from your own GitHub repos, typed o
 ## What it does
 
 - **Background**: chunks of real code from your repos type in across the screen — glowing typing head, block cursor, whitespace skipped so the stream never stutters, settled lines dimming with age. Chunks place around loose band anchors with gaussian jitter, and new lines clip whatever they land on, terminal-style, so the layout never reads as a grid.
-- **Spinner**: cycles verbs from a `Gerund,Past` list through a full request lifecycle — a latency window with just the glyph and glowing verb, then a streaming phase with elapsed time, an asymptotic line counter, ↓/↑ arrows with long-tailed dwell times (↑ = upload bursts: rarer, counter surges, typing speeds up), and a status that escalates `coding → still coding → almost done coding with xhigh effort` on a fixed clock each time it appears. Eventually:
+- **Spinner**: cycles verbs from a tab-delimited `Gerund<TAB>Past` list through a full request lifecycle — a latency window with just the glyph and glowing verb, then a streaming phase with elapsed time, an asymptotic line counter, ↓/↑ arrows with long-tailed dwell times (↑ = upload bursts: rarer, counter surges, typing speeds up), and a status that escalates `coding → still coding → almost done coding with xhigh effort` on a fixed clock each time it appears. Eventually:
 
   ```
   ✻ Sprokbooked for 2m 7s
@@ -39,7 +39,7 @@ CodeSaver fills the screen with code sampled from your own GitHub repos, typed o
 
 Then pick **CodeSaver** in System Settings → Screen Saver. `open /Applications/CodeSaver.app` gives you a host app with install status and a live preview window.
 
-`setup.sh` writes a gitignored `setup.conf` with your GitHub username (non-fork repos only; a manifest makes ingest re-runs incremental), your Apple team ID (auto-detected from your signing certificate when possible), and optionally the path to your own spinner-verbs list — CSV lines of `Gerund,Past`. If you don't supply one, the bundled list is used.
+`setup.sh` writes a gitignored `setup.conf` with your GitHub username (non-fork repos only; a manifest makes ingest re-runs incremental), your Apple team ID (auto-detected from your signing certificate when possible), and optionally the path to your own spinner-verbs list — tab-delimited lines of `Gerund<TAB>Past`. If you don't supply one, the bundled list is used.
 
 `ingest.py` filters out non-source files (extension allowlist, size windows, `node_modules`-style dirs, generated-file patterns, bulk directories). `make_corpus.py` packs every cleaned file **whole** into `corpus.bin` with a repo-keyed byte index (`corpus-index.json`), deduplicating by content hash and dropping secret-looking lines. At runtime the saver memory-maps the corpus and draws a fresh ~400-file subset each launch — repos weighted by √(file count) with a per-repo share cap, so big projects dominate only within reason — decoding files lazily and refreshing half the subset every time a spinner "request" completes. **The corpus files are gitignored on purpose** — they embed your actual code, private repos included, and so does the built app.
 

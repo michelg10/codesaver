@@ -273,11 +273,11 @@ public final class CodeSaverView: ScreenSaverView {
             return nil
         }
 
-        // Verbs: "Gerund,Past" per line.
+        // Verbs: "Gerund<TAB>Past" per line.
         let verbText = readFirst("spinner-verbs.txt")
-            ?? "Coding,Coded\nCompiling,Compiled\nRefactoring,Refactored\nShipping,Shipped"
+            ?? "Coding\tCoded\nCompiling\tCompiled\nRefactoring\tRefactored\nShipping\tShipped"
         verbs = verbText.split(separator: "\n").compactMap { line in
-            let parts = line.split(separator: ",", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+            let parts = line.split(separator: "\t", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
             guard parts.count == 2, !parts[0].isEmpty, !parts[1].isEmpty else { return nil }
             return (ing: parts[0], past: parts[1])
         }

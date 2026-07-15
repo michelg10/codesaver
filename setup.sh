@@ -18,7 +18,7 @@ fi
 
 # ── Spinner verbs ─────────────────────────────────────────────────────────────
 echo
-echo "Spinner verbs file: CSV lines of \"Gerund,Past\" (e.g. \"Reticulating,Reticulated\")."
+echo "Spinner verbs file: tab-delimited lines of \"Gerund<TAB>Past\" (e.g. \"Reticulating<TAB>Reticulated\")."
 echo "Leave empty to use the bundled list."
 read "verbs?Path to your verbs file []: "
 verbs=${verbs/#\~/$HOME}
