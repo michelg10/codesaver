@@ -47,9 +47,8 @@ class CodeSaverViewController: ScreenSaverViewController {
     /// (learned the hard way). The cost: the System Settings preview renders
     /// at full-screen metrics rather than as a true miniature.
     override func loadView() {
-        logger.info("loadView()")
-
         let frame = NSScreen.main?.frame ?? NSRect(x: 0, y: 0, width: 1920, height: 1080)
+        logger.notice("loadView() — initial frame \(Double(frame.width), privacy: .public)×\(Double(frame.height), privacy: .public)")
         let view = CodeSaverView(frame: frame, isPreview: false)
         saverView = view
         self.view = view ?? NSView(frame: frame)

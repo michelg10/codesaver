@@ -1,6 +1,9 @@
 import AppKit
 import ScreenSaver
 import QuartzCore
+import os.log
+
+private let viewLog = AppexLog.logger("View")
 
 // MARK: - Helpers
 
@@ -434,16 +437,33 @@ public final class CodeSaverView: ScreenSaverView {
     // arrives shortly after we land in a window, drive ourselves.
     public override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        if window != nil {
+        if let win = window {
+            viewLog.notice("viewDidMoveToWindow — window frame \(Double(win.frame.width), privacy: .public)×\(Double(win.frame.height), privacy: .public), view bounds \(Double(self.bounds.width), privacy: .public)×\(Double(self.bounds.height), privacy: .public)")
+            rescueZeroSizedWindow()
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                guard let self, self.window != nil, !self.frameworkDriven else { return }
-                self.startFallbackTimer()
+                guard let self, self.window != nil else { return }
+                self.rescueZeroSizedWindow()
+                if !self.frameworkDriven { self.startFallbackTimer() }
             }
         } else {
             stopFallbackTimer()
             // Re-arm for a possible next window whose host doesn't drive frames.
             frameworkDriven = false
         }
+    }
+
+    /// On macOS 26 the ViewBridge sizing handshake from the host can fail to
+    /// deliver a frame, leaving the remote service window at 0×0 forever: the
+    /// model animates, draw(_:) never fires, and the saver composites as pure
+    /// black (System Settings preview included). If the host hasn't sized us,
+    /// adopt the screen's size ourselves — a genuine host size transaction
+    /// arriving later still wins, so this is purely a fallback.
+    private func rescueZeroSizedWindow() {
+        guard let win = window, win.frame.width < 1 || win.frame.height < 1 else { return }
+        var f = win.frame
+        f.size = win.screen?.frame.size ?? NSScreen.main?.frame.size ?? NSSize(width: 1920, height: 1080)
+        viewLog.notice("zero-sized service window — self-rescuing to \(Double(f.width), privacy: .public)×\(Double(f.height), privacy: .public)")
+        win.setFrame(f, display: true)
     }
 
     private func startFallbackTimer() {
@@ -739,7 +759,13 @@ public final class CodeSaverView: ScreenSaverView {
 
     // MARK: Drawing
 
+    private var loggedFirstDraw = false
+
     public override func draw(_ rect: NSRect) {
+        if !loggedFirstDraw {
+            loggedFirstDraw = true
+            viewLog.notice("first draw — bounds \(Double(self.bounds.width), privacy: .public)×\(Double(self.bounds.height), privacy: .public)")
+        }
         ensureSetup()
         bgColor.setFill()
         bounds.fill()
