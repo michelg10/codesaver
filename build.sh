@@ -5,7 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-SRC=appex/CodeSaverExtension/CodeSaverView.swift
+SRC=(appex/CodeSaverExtension/CodeSaverView.swift appex/CodeSaver/Helpers/Logger.swift)
 BUILD=build
 BUNDLE=$BUILD/CodeSaver.saver
 SDK=$(xcrun --show-sdk-path)
@@ -24,9 +24,9 @@ fi
 # --- Compile + link the .saver bundle binary (arm64 + x86_64) ---------------
 echo "── compiling saver…"
 for ARCH in arm64 x86_64; do
-  swiftc -O -parse-as-library -module-name CodeSaver \
+  swiftc -O -wmo -parse-as-library -module-name CodeSaver \
     -target "$ARCH-apple-macos13.0" -sdk "$SDK" \
-    -c "$SRC" -o "$BUILD/CodeSaverView-$ARCH.o"
+    -c "${SRC[@]}" -o "$BUILD/CodeSaverView-$ARCH.o"
   xcrun clang -bundle -target "$ARCH-apple-macos13.0" -isysroot "$SDK" \
     "$BUILD/CodeSaverView-$ARCH.o" \
     -framework ScreenSaver -framework AppKit -framework QuartzCore \
@@ -48,7 +48,7 @@ echo "── built $BUNDLE"
 # --- Preview / snapshot harness (native arch only) --------------------------
 echo "── compiling preview harness…"
 swiftc -O -parse-as-library -module-name CodeSaverPreview \
-  appex/CodeSaverExtension/CodeSaverView.swift Sources/PreviewMain.swift \
+  "${SRC[@]}" Sources/PreviewMain.swift \
   -framework ScreenSaver -framework AppKit -framework QuartzCore \
   -o "$BUILD/preview"
 echo "── built $BUILD/preview  (run it for a live window)"

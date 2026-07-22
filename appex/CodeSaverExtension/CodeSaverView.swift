@@ -71,11 +71,9 @@ private final class Writer {
 @objc(CodeSaverView)
 public final class CodeSaverView: ScreenSaverView {
 
-    // Spinner glyph frames, played forward then reversed.
-    private static let spinnerFrames: [String] = {
-        let forward = ["\u{B7}", "\u{2722}", "\u{2733}", "\u{2736}", "\u{273B}", "\u{273D}"]
-        return forward + forward.dropFirst().dropLast().reversed()
-    }()
+    // Spinner glyph frames; a cosine phase sweeps the index 0→5→0.
+    private static let spinnerFrames =
+        ["\u{B7}", "\u{2722}", "\u{2733}", "\u{2736}", "\u{273B}", "\u{273D}"]
 
     // MARK: Palette
 
@@ -1199,8 +1197,9 @@ public final class CodeSaverView: ScreenSaverView {
         let elapsed = now - phaseStart
         let verb = verbs[verbIndex]
 
-        // Animated glyph.
-        let frame = Self.spinnerFrames[Int(now / 0.35) % Self.spinnerFrames.count]
+        // Animated glyph: cosine phase, period 2000 ms, eased at both ends.
+        let spinnerPhase = (1 - cos(2 * Double.pi * now / 2.0)) / 2
+        let frame = Self.spinnerFrames[Int((spinnerPhase * 5).rounded())]
         let glyphShadow = NSShadow()
         glyphShadow.shadowColor = accentHot.withAlphaComponent(0.8)
         glyphShadow.shadowBlurRadius = uiFont.pointSize * 0.5
