@@ -6,10 +6,14 @@ import AppKit
 //   preview --snapshot <outdir> <t1> <t2> …  — render offscreen PNGs at sim times (seconds)
 //
 // Set CODESAVER_RESOURCES to a directory containing corpus.txt / spinner-verbs.txt.
+// Boom intro: click anywhere in the live window to detonate at that point, or
+// set CODESAVER_BOOM="x,y[,armSeconds]" (fractions of the view) to arm it at
+// launch — the deterministic path for snapshots.
 
 @main
 struct PreviewMain {
     static func main() {
+        ensureStandInCapture()
         let args = CommandLine.arguments
         if args.count >= 3, args[1] == "--snapshot" {
             snapshot(outDir: args[2], times: args.dropFirst(3).compactMap { Double($0) })
@@ -19,7 +23,12 @@ struct PreviewMain {
     }
 
     static func snapshot(outDir: String, times: [Double]) {
-        let size = NSSize(width: 1728, height: 1080)
+        // CODESAVER_SNAPSIZE=WxH overrides — e.g. 5120x2880 for perf timing.
+        var size = NSSize(width: 1728, height: 1080)
+        if let spec = ProcessInfo.processInfo.environment["CODESAVER_SNAPSIZE"] {
+            let parts = spec.split(separator: "x").compactMap { Double($0) }
+            if parts.count == 2 { size = NSSize(width: parts[0], height: parts[1]) }
+        }
         guard let view = CodeSaverView(frame: NSRect(origin: .zero, size: size), isPreview: false) else {
             fatalError("failed to create view")
         }
@@ -30,26 +39,20 @@ struct PreviewMain {
                 view.advance(by: step)
                 sim += step
             }
-            guard let rep = NSBitmapImageRep(
-                bitmapDataPlanes: nil, pixelsWide: Int(size.width), pixelsHigh: Int(size.height),
-                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
-                colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
-            ), let raw = NSGraphicsContext(bitmapImageRep: rep) else { fatalError("no bitmap") }
-            // The view is flipped: use a flipped context plus a CTM flip so text renders upright.
-            let ctx = NSGraphicsContext(cgContext: raw.cgContext, flipped: true)
-            NSGraphicsContext.saveGraphicsState()
-            NSGraphicsContext.current = ctx
-            ctx.cgContext.saveGState()
-            ctx.cgContext.translateBy(x: 0, y: size.height)
-            ctx.cgContext.scaleBy(x: 1, y: -1)
-            view.draw(view.bounds)
-            ctx.cgContext.restoreGState()
-            NSGraphicsContext.restoreGraphicsState()
-            let name = String(format: "frame-%07.2fs.png", target)
-            let url = URL(fileURLWithPath: outDir).appendingPathComponent(name)
+            // Metal is THE renderer: the snapshot is an offscreen GPU frame.
+            guard let cg = view.metalDebugSnapshot() else {
+                print(String(format: "t=%.2f — no Metal frame", target))
+                continue
+            }
+            let url = URL(fileURLWithPath: outDir)
+                .appendingPathComponent(String(format: "frame-%07.2fs.png", target))
+            let rep = NSBitmapImageRep(cgImage: cg)
             try! rep.representation(using: .png, properties: [:])!.write(to: url)
             print("wrote \(url.path)")
         }
+        // The renderer's perf counters arrive as async blocks on the main
+        // queue; pump it briefly so 60-frame averages reach the diag log.
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
     }
 
     static func runWindow() {
@@ -80,6 +83,58 @@ struct PreviewMain {
     }
 
     static var tuning: TuningController?
+
+    /// Boom stand-in capture: the harness can't (and shouldn't) take real
+    /// screenshots, and a black stand-in makes the asciify act invisible.
+    /// Preference order: CODESAVER_CAPTURE, then a user-dropped
+    /// build/stand-in-capture.png (gitignored — it's a real screen), then a
+    /// synthesized bright fake desktop (wallpaper, menu bar, windows, dock).
+    static func ensureStandInCapture() {
+        guard ProcessInfo.processInfo.environment["CODESAVER_CAPTURE"] == nil else { return }
+        // Next to the executable (build/), regardless of launch cwd.
+        let dropped = URL(fileURLWithPath: CommandLine.arguments[0])
+            .deletingLastPathComponent().appendingPathComponent("stand-in-capture.png")
+        if FileManager.default.fileExists(atPath: dropped.path) {
+            setenv("CODESAVER_CAPTURE", dropped.path, 1)
+            return
+        }
+        let size = NSSize(width: 1728, height: 1080)
+        let img = NSImage(size: size)
+        img.lockFocus()
+        NSGradient(colors: [NSColor(calibratedRed: 0.18, green: 0.28, blue: 0.45, alpha: 1),
+                            NSColor(calibratedRed: 0.45, green: 0.30, blue: 0.50, alpha: 1)])?
+            .draw(in: NSRect(origin: .zero, size: size), angle: 60)
+        NSColor(white: 0.92, alpha: 1).setFill()
+        NSRect(x: 0, y: 1052, width: 1728, height: 28).fill()
+        NSColor(white: 0.96, alpha: 1).setFill()
+        NSRect(x: 124, y: 304, width: 752, height: 580).fill()
+        NSColor(white: 0.55, alpha: 1).setFill()
+        for i in 0..<22 {
+            let y: CGFloat = 330 + CGFloat(i) * 24
+            let w: CGFloat = 400 + CGFloat((i * 137) % 300)
+            NSRect(x: 150, y: y, width: w, height: 10).fill()
+        }
+        NSColor(white: 0.12, alpha: 1).setFill()
+        NSRect(x: 950, y: 180, width: 640, height: 540).fill()
+        NSColor(calibratedRed: 0.4, green: 0.9, blue: 0.5, alpha: 1).setFill()
+        for i in 0..<16 {
+            let y: CGFloat = 210 + CGFloat(i) * 30
+            let w: CGFloat = 200 + CGFloat((i * 211) % 380)
+            NSRect(x: 970, y: y, width: w, height: 8).fill()
+        }
+        NSColor(white: 0.85, alpha: 0.9).setFill()
+        NSBezierPath(roundedRect: NSRect(x: 500, y: 16, width: 728, height: 64),
+                     xRadius: 16, yRadius: 16).fill()
+        img.unlockFocus()
+        let url = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("codesaver-fake-desktop.png")
+        if let tiff = img.tiffRepresentation,
+           let rep = NSBitmapImageRep(data: tiff),
+           let png = rep.representation(using: .png, properties: [:]) {
+            try? png.write(to: url)
+            setenv("CODESAVER_CAPTURE", url.path, 1)
+        }
+    }
 }
 
 /// Hosts the saver view bottom-anchored with `extra` points extending above
@@ -158,6 +213,14 @@ final class TuningController: NSObject {
                  get: { Double(view.codeGlowStrength) }, set: { view.codeGlowStrength = CGFloat($0) }),
             Knob(label: "Vignette darkness", min: 0.0, max: 0.7, integer: false, key: "vignetteMax",
                  get: { Double(view.vignetteMax) }, set: { view.vignetteMax = CGFloat($0) }),
+            Knob(label: "Boom: front 1 sweep (s)", min: 0.4, max: 2.0, integer: false, key: "boomWave1",
+                 get: { view.boomWave1 }, set: { view.boomWave1 = $0 }),
+            Knob(label: "Boom: front gap (s)", min: 0.2, max: 2.0, integer: false, key: "boomGap",
+                 get: { view.boomGap }, set: { view.boomGap = $0 }),
+            Knob(label: "Boom: front 2 sweep (s)", min: 0.4, max: 2.5, integer: false, key: "boomWave2",
+                 get: { view.boomWave2 }, set: { view.boomWave2 = $0 }),
+            Knob(label: "Boom: debris density", min: 0, max: 0.25, integer: false, key: "boomDebrisDensity",
+                 get: { view.boomDebrisDensity }, set: { view.boomDebrisDensity = $0 }),
         ]
         launchDefaults = knobs.map { $0.get() }
     }
@@ -205,11 +268,20 @@ final class TuningController: NSObject {
         reset.frame = NSRect(x: 14, y: 12, width: 160, height: 26)
         content.addSubview(reset)
 
+        let replay = NSButton(title: "Replay boom", target: self, action: #selector(replayBoom(_:)))
+        replay.bezelStyle = .rounded
+        replay.frame = NSRect(x: 184, y: 12, width: 130, height: 26)
+        content.addSubview(replay)
+
         p.contentView = content
         let f = window.frame
         p.setFrameOrigin(NSPoint(x: f.maxX + 12, y: f.maxY - panelH))
         p.makeKeyAndOrderFront(nil)
         panel = p
+    }
+
+    @objc private func replayBoom(_ sender: Any?) {
+        view.replayBoom()
     }
 
     @objc private func resetDefaults(_ sender: Any?) {

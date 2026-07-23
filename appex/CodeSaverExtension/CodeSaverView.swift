@@ -53,6 +53,8 @@ private final class Segment {
     var settledAt: Double = -100
     var tint: CGFloat = 0
     var isComment = false
+    /// Boom debris: fades white → grey → gone instead of aging like code.
+    var fading = false
 }
 
 private final class Writer {
@@ -64,6 +66,238 @@ private final class Writer {
     var cps: Double = 80
     var carry: Double = 0
     var pauseUntil: Double = 0
+}
+
+// MARK: - Boom session
+
+/// One boom per saver activation, shared by every display's view. The first
+/// view to wake reads the igniter's capture manifest, builds a single
+/// BoomCore spanning all displays, and anchors the shared clock; sibling
+/// views attach to it. Every view derives sim time from the same monotonic
+/// anchor, so three displays act as one machine.
+final class BoomSession {
+    enum Kind: String { case idle, corner }
+
+    let core: BoomCore
+    let backdrops: [Int: CGImage]    // field index → captured desktop
+    /// The mapped raw captures behind those images — the Metal renderers
+    /// read these pages directly as zero-copy textures.
+    let backdropBuffers: [Int: BoomCaptureBuffer]
+    let kind: Kind
+    let verb: String
+    let armDuration: Double          // idle: 5 s pre-animation; corner: none
+
+    /// Wall anchor of the shared clock — nil until every display is ready.
+    /// Activation is a burst of work on one main thread (session load, window
+    /// migration, pipeline warm-up, backdrop uploads); anchoring at creation
+    /// let the countdown burn through it, so late displays joined mid-show
+    /// and the init stalls made the boom judder and de-sync. The clock now
+    /// starts only when the whole stage is set.
+    private var anchorMedia: Double?
+    private var readyFields = Set<Int>()
+    private let createdMedia = CACurrentMediaTime()
+    /// A display that never reports (asleep, mirrored, host quirk, staging
+    /// failure) must not hold the show hostage: the clock starts this many
+    /// seconds after session creation no matter what.
+    private static let readyBackstop = 4.0
+
+    /// Shared sim seconds: negative while armed, 0 at detonation. Before the
+    /// anchor exists the clock holds just shy of its start — the armed scene
+    /// (or, for corner triggers, the pre-detonation beat) freezes in place.
+    var simTime: Double { simTime(at: CACurrentMediaTime()) }
+
+    /// Sim seconds at a given host time — the frame clock passes the vsync
+    /// timestamp so per-frame sim steps stay exactly even (wall-clock
+    /// callback jitter must not leak into tick counts).
+    func simTime(at wall: Double) -> Double {
+        guard let anchor = anchorMedia else { return min(-0.05, -armDuration) }
+        let t = wall - anchor - armDuration
+        // Boom time (t ≥ 0) runs through the slow-motion dilation; the armed
+        // countdown stays wall-clock. Continuous at t = 0.
+        return t < 0 ? t : t / CodeSaverView.boomTimeScale
+    }
+
+    /// Until the anchor exists every display holds pure black — the reveal
+    /// (all desktops at once, same tick) is the show's actual first frame.
+    var isAnchored: Bool { anchorMedia != nil }
+
+    // (A deadViews fast-path used to live here — views reporting their own
+    // clocks dead so the anchor stopped waiting for them. The screen-link +
+    // adoption machinery made every commissioned view stageable, its call
+    // sites evaporated, and "my view-link died" stopped implying "my display
+    // isn't coming". A display that truly never stages now costs the
+    // readyBackstop, which is the honest signal.)
+
+    /// A view reports its display fully staged: field bound (post-migration,
+    /// so the origin match is real), textures uploaded, frames rendering.
+    /// The clock anchors when every display's field has reported.
+    func markReady(_ fieldIndex: Int) {
+        guard anchorMedia == nil else { return }
+        if readyFields.insert(fieldIndex).inserted {
+            viewLog.notice("boom display ready: field \(fieldIndex, privacy: .public) (\(self.readyFields.count, privacy: .public)/\(self.core.fields.count, privacy: .public))")
+            BoomDiag.log("ready: field \(fieldIndex) (\(readyFields.count)/\(core.fields.count))")
+        }
+        maybeAnchor("all live displays staged")
+    }
+
+    private func maybeAnchor(_ reason: String) {
+        guard anchorMedia == nil else { return }
+        guard readyFields.count >= max(1, core.fields.count) else { return }
+        anchorMedia = CACurrentMediaTime()
+        viewLog.notice("boom clock anchored")
+        BoomDiag.log("anchored — \(reason) (ready \(readyFields.count)/\(core.fields.count))")
+    }
+
+    /// Per-frame: fires the readiness backstop.
+    func pollReadiness() {
+        guard anchorMedia == nil,
+              CACurrentMediaTime() - createdMedia > Self.readyBackstop else { return }
+        anchorMedia = CACurrentMediaTime()
+        viewLog.notice("boom clock anchored by backstop — ready: \(self.readyFields.count, privacy: .public)/\(self.core.fields.count, privacy: .public)")
+        BoomDiag.log("anchored by BACKSTOP — ready \(readyFields.count)/\(core.fields.count)")
+    }
+
+    // The host parks every window at the main display's origin before
+    // migrating it — so two views can transiently bind the SAME field. Only
+    // the first claimant renders it; a stuck sibling holds black instead of
+    // double-rendering the same content out of phase on top of the owner
+    // (two independent ~30 fps clocks compositing = beat-frequency stutter).
+    // Claims EXPIRE: a view whose display link dies (its window parked on a
+    // display that isn't compositing) must not hold a field hostage — the
+    // live view actually on that display steals the claim within half a
+    // second. Renewed on every rendered frame.
+    private var fieldOwners: [Int: (owner: ObjectIdentifier, at: Double)] = [:]
+
+    func claimField(_ index: Int, by owner: ObjectIdentifier) -> Bool {
+        let now = CACurrentMediaTime()
+        if let current = fieldOwners[index], current.owner != owner {
+            guard now - current.at >= 0.5 else { return false }
+            BoomDiag.log("field \(index) claim STOLEN from a stalled view")
+        }
+        fieldOwners[index] = (owner, now)
+        return true
+    }
+
+    func releaseField(_ index: Int, by owner: ObjectIdentifier) {
+        if fieldOwners[index]?.owner == owner { fieldOwners[index] = nil }
+    }
+
+    /// A field nobody (alive) is rendering — what a view whose window never
+    /// migrated adopts by elimination.
+    func unclaimedField(count: Int) -> Int? {
+        let now = CACurrentMediaTime()
+        return (0..<count).first {
+            fieldOwners[$0] == nil || now - fieldOwners[$0]!.at > 0.5
+        }
+    }
+
+    static var shared: BoomSession?
+    private static var attempted = false
+
+    private init(core: BoomCore, backdrops: [Int: CGImage],
+                 backdropBuffers: [Int: BoomCaptureBuffer], kind: Kind, verb: String) {
+        self.core = core
+        self.backdrops = backdrops
+        self.backdropBuffers = backdropBuffers
+        self.kind = kind
+        self.verb = verb
+        // Corner triggers get a beat too: the desktop fades in, settles on
+        // screen for a moment, and only then burns — instead of flooding the
+        // instant the reveal lands.
+        self.armDuration = kind == .corner ? 1.5 : 5
+    }
+
+    /// Loads the manifest once per activation; all views share the result.
+    /// The helper deletes the manifest the moment the user returns, so a
+    /// fresh file means "the user has been away since this was captured".
+    static func loadIfNeeded(codeLines: () -> [String], verbs: [String]) -> BoomSession? {
+        if let shared { return shared }
+        guard !attempted else { return nil }
+        attempted = true
+        let loadStart = CACurrentMediaTime()
+
+        let dir = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent("Library/Application Support/CodeSaver")
+        guard let data = try? Data(contentsOf: dir.appendingPathComponent("boom-manifest.json")),
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let kindRaw = obj["kind"] as? String, let kind = Kind(rawValue: kindRaw),
+              let capturedAt = obj["capturedAt"] as? Double,
+              let mouseX = obj["mouseX"] as? Double, let mouseY = obj["mouseY"] as? Double,
+              let displayList = obj["displays"] as? [[String: Any]], !displayList.isEmpty
+        else { return nil }
+        // Corner captures are only fresh for moments; idle captures stay
+        // valid as long as the user never came back (backstop: 6 h).
+        let age = Date().timeIntervalSince1970 - capturedAt
+        guard age > -5, age < (kind == .corner ? 20 : 6 * 3600) else { return nil }
+
+        let origin = CGPoint(x: mouseX, y: mouseY)
+        struct Disp { let x, y, w, h: Double; let image: String? }
+        let disps: [Disp] = displayList.compactMap { d in
+            guard let x = d["x"] as? Double, let y = d["y"] as? Double,
+                  let w = d["w"] as? Double, let h = d["h"] as? Double,
+                  w > 8, h > 8 else { return nil }
+            return Disp(x: x, y: y, w: w, h: h, image: d["image"] as? String)
+        }
+        // Grids on the main thread (font metrics); the per-display work fans
+        // out across cores. Raw captures ("CSRW", written by the igniter) are
+        // mmap'd — no decode at all, the pixels are the helper's own decoded
+        // buffer still sitting in the page cache; legacy/stand-in images
+        // fall back to an actual decode. Colorize is the only real work left.
+        let grids = disps.map { BoomGrid(size: CGSize(width: $0.w, height: $0.h)) }
+        var decoded = [(color: [UInt32], image: CGImage, buffer: BoomCaptureBuffer?)?](
+            repeating: nil, count: disps.count)
+        decoded.withUnsafeMutableBufferPointer { buf in
+            DispatchQueue.concurrentPerform(iterations: disps.count) { i in
+                guard let name = disps[i].image else { return }
+                let url = dir.appendingPathComponent(name)
+                if name.hasSuffix(".raw"), let mapped = BoomCaptureBuffer.map(url),
+                   let cg = mapped.makeImage() {
+                    buf[i] = (BoomCore.colorize(cg, grid: grids[i]), cg, mapped)
+                    return
+                }
+                guard let img = NSImage(contentsOf: url),
+                      let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil)
+                else { return }
+                buf[i] = (BoomCore.colorize(cg, grid: grids[i]), cg, nil)
+            }
+        }
+        var fields: [BoomField] = []
+        var backdrops: [Int: CGImage] = [:]
+        var buffers: [Int: BoomCaptureBuffer] = [:]
+        var radius: CGFloat = 0
+        for (i, d) in disps.enumerated() {
+            var color = [UInt32](repeating: 0, count: grids[i].cols * grids[i].rows)
+            if let dec = decoded[i] {
+                color = dec.color
+                backdrops[fields.count] = dec.image
+                buffers[fields.count] = dec.buffer
+            }
+            fields.append(BoomField(grid: grids[i], originCG: CGPoint(x: d.x, y: d.y),
+                                    color: color))
+            for c in [CGPoint(x: d.x, y: d.y), CGPoint(x: d.x + d.w, y: d.y),
+                      CGPoint(x: d.x, y: d.y + d.h), CGPoint(x: d.x + d.w, y: d.y + d.h)] {
+                radius = max(radius, hypot(c.x - origin.x, c.y - origin.y))
+            }
+        }
+        // No captured images at all (e.g. Screen Recording was denied when
+        // the helper armed): a boom over pure black isn't a show — start the
+        // saver normally instead.
+        guard !fields.isEmpty, !backdrops.isEmpty else { return nil }
+
+        let core = BoomCore(
+            params: BoomCore.Params(originCG: origin, radius: max(radius, 1),
+                                    seed: UInt64(abs(capturedAt * 1000)) | 1,
+                                    codeLines: codeLines()),
+            fields: fields)
+        let session = BoomSession(core: core, backdrops: backdrops,
+                                  backdropBuffers: buffers, kind: kind,
+                                  verb: verbs.randomElement() ?? "Idling")
+        shared = session
+        BoomDiag.log(String(format: "session load: kind=%@ displays=%d mapped-raw=%d took %.1f ms",
+                            kind.rawValue, fields.count, buffers.count,
+                            (CACurrentMediaTime() - loadStart) * 1000))
+        return session
+    }
 }
 
 // MARK: - View
@@ -166,6 +400,103 @@ public final class CodeSaverView: ScreenSaverView {
     public var codeGlowStrength: CGFloat = 1.0   // typing-head trail glow
     public var vignetteMax: CGFloat = 0.42       // edge darkening at the corners
 
+    // MARK: Boom intro
+    // The saver can open with the two-boom ignition (see BoomCore.swift): an
+    // idle status line at the (former) mouse position detonates; the first
+    // cell-quantized front converts the desktop into terminal cells, the
+    // second wipes them to black, flung glyphs travel through the grid and
+    // settle, the line zaps to its home panel in whole-cell hops, and the
+    // writers ignite in the second front's wake. Armed by the igniter helper
+    // (serialized BoomCore handoff), the CODESAVER_BOOM env var (snapshots),
+    // or a click in the preview window.
+
+    public var boomWave1 = 0.85 * BoomCore.tempo               // first front's sweep, s
+    public var boomGap = BoomCore.gapBase * BoomCore.tempo     // detonation → second front, s
+    public var boomWave2 = BoomCore.wave2Base * BoomCore.tempo // second front's sweep, s
+    public var boomDebrisDensity: Double = 0.065 // fling chance per revealed cell
+
+    /// Slow-motion INSPECTION lever only — dilating the clock spreads the
+    /// 60 Hz sim ticks over more wall time, so cell-quantized motion drops
+    /// below full frame rate (at 3×, effectively 20 fps). Real pacing lives
+    /// in BoomCore.tempo, which stretches the choreography at full tick
+    /// rate. Keep this at 1 outside debugging sessions.
+    static let boomTimeScale: Double = 1
+
+    private enum Intro { case none, armed, boom }
+    private var intro = Intro.none
+    private var boomOriginNorm = CGPoint(x: 0.5, y: 0.55)  // fraction of bounds
+    private var armEndsAt: Double = 0         // sim time of detonation
+    private var armTotal: Double = 5          // full armed length (choreography clock)
+    private var cursorRaster: CGImage?        // arrow cursor, rasterized once per scale
+    private var cursorRasterScale: CGFloat = 0
+    private var boomStart: Double = 0
+    private var handoffChecked = false
+    private var boomSession: BoomSession?
+    private var boomCore: BoomCore?
+    private var boomFieldIndex = 0
+    /// This view's display origin in global CG coords (zero outside handoff).
+    private var viewOriginCG = CGPoint.zero
+
+    // Metal is THE renderer — no CPU fallback (it was pure mirror overhead;
+    // every Mac this runs on has a GPU). If Metal init ever fails, the view
+    // stays black and logs; that's the whole degradation story.
+    private static var metalDisabled = false
+    private var boomMetal: BoomMetalRenderer?
+    private var metalHost: BoomMetalHostView?
+
+    private var metalActive: Bool { boomMetal != nil && metalHost != nil }
+
+    private let viewBirth = CACurrentMediaTime()
+
+    /// Short per-view tag so multi-display diag streams are attributable.
+    private lazy var diagID = String(format: "v%04x",
+                                     UInt16(truncatingIfNeeded: ObjectIdentifier(self).hashValue))
+
+    /// Session runs hold pure black until every display has staged: the
+    /// reveal — all desktops in the same tick — is the show's first frame,
+    /// instead of backdrops popping in one at a time as windows come up.
+    private var introHoldingCurtain: Bool {
+        intro == .armed && boomSession?.isAnchored == false
+    }
+    private var wasHoldingCurtain = false
+
+    /// The reveal is a traditional fade: the desktops rise out of black
+    /// together over this window, starting the moment the clock anchors —
+    /// a hard cut from black read as an awkward blip.
+    private static let revealFadeDuration = 0.45
+
+    /// 0 → black, 1 → desktop fully on. Only session-armed runs fade; the
+    /// boom itself (and local preview arms) run at full brightness.
+    private var armedRevealProgress: Double {
+        guard intro == .armed, let session = boomSession else { return 1 }
+        guard session.isAnchored else { return 0 }
+        return clampd((session.simTime + session.armDuration) / Self.revealFadeDuration, 0, 1)
+    }
+
+    private var resolvedBoomOrigin: NSPoint {
+        // Session runs measure against the field's true display size — the
+        // service window's bounds can briefly be the wrong display's.
+        if let core = boomCore, boomSession != nil {
+            let s = core.fields[boomFieldIndex].grid.size
+            return NSPoint(x: boomOriginNorm.x * s.width, y: boomOriginNorm.y * s.height)
+        }
+        return NSPoint(x: boomOriginNorm.x * bounds.width, y: boomOriginNorm.y * bounds.height)
+    }
+
+    /// Whether the detonation point is on this view's display — the armed
+    /// line and departure flash belong to that display alone.
+    private var boomOriginOnThisDisplay: Bool {
+        let o = resolvedBoomOrigin
+        return o.x >= 0 && o.x < bounds.width && o.y >= 0 && o.y < bounds.height
+    }
+
+    /// When the second front reaches a point of this view, in sim seconds.
+    private func boomSecondHit(ofLocal p: NSPoint) -> Double {
+        guard let core = boomCore else { return 0 }
+        return core.secondHit(ofGlobal: CGPoint(x: p.x + viewOriginCG.x,
+                                                y: p.y + viewOriginCG.y))
+    }
+
     // MARK: Content
 
     private var verbs: [(ing: String, past: String)] = []
@@ -241,6 +572,8 @@ public final class CodeSaverView: ScreenSaverView {
         animationTimeInterval = 1.0 / 30.0
         loadResources()
         startCycle(freshVerb: true)
+        configureIntroFromEnv()
+        Self.warmBoomPipelines()
     }
 
     required init?(coder: NSCoder) {
@@ -248,9 +581,27 @@ public final class CodeSaverView: ScreenSaverView {
         animationTimeInterval = 1.0 / 30.0
         loadResources()
         startCycle(freshVerb: true)
+        configureIntroFromEnv()
+        Self.warmBoomPipelines()
     }
 
-    public override var isOpaque: Bool { true }
+    /// Shader compilation (~100 ms) off the main thread at launch, so the
+    /// pipelines are ready before the intro asks for them — activation is
+    /// already a burst of main-thread work.
+    private static var warmedPipelines = false
+    private static func warmBoomPipelines() {
+        guard !metalDisabled, !warmedPipelines else { return }
+        warmedPipelines = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = BoomMetalContext.shared
+        }
+    }
+
+    // Non-opaque: the CAMetalLayer subview is the opaque surface. A view
+    // whose frame clock has died hides that layer and becomes fully
+    // transparent — so a zombie window stacked above a live one on the same
+    // display can never black it out.
+    public override var isOpaque: Bool { false }
     public override var isFlipped: Bool { true }
 
     // MARK: Resources
@@ -410,22 +761,662 @@ public final class CodeSaverView: ScreenSaverView {
 
     // MARK: Animation
 
-    private var fallbackTimer: Timer?
-    private var frameworkDriven = false
+    // The frame clock is a CADisplayLink pinned to 30 Hz — the display's
+    // own beat, not a runloop timer. 30 divides the panel's refresh evenly,
+    // so every displayed frame is exactly two vsyncs AND exactly two 60 Hz
+    // sim ticks: perfectly even cell motion. (Runloop timers drift a few ms
+    // per frame; floor'd against the 60 Hz sim grid that yielded 1/2/3-tick
+    // frames — the jitter the eye catches on quantized motion.)
+    private var displayLinkBox: Any?   // CADisplayLink (macOS 14+ class)
+    private var legacyTimer: Timer?
 
     public override func animateOneFrame() {
-        frameworkDriven = true
-        stopFallbackTimer()
-        tick()
+        // The saver framework's own timer is one of the jittery clocks; its
+        // callback is ignored — the display link drives.
     }
 
     /// Advances by wall-clock time and requests a redraw. Safe to call from
     /// multiple drivers: overlapping calls produce dt ≈ 0, not double speed.
+    private var dtStats = (lo: 1.0, hi: 0.0, sum: 0.0, n: 0)
+    /// The current frame's vsync-aligned timestamp (host time), so the sim
+    /// clock steps on the display grid, not on jittery callback wall time.
+    private var frameNow: Double = 0
+
     private func tick() {
-        let t = CACurrentMediaTime()
-        let dt = lastWall == 0 ? animationTimeInterval : clampd(t - lastWall, 0, 0.25)
+        tick(at: CACurrentMediaTime())
+    }
+
+    private func tick(at t: Double) {
+        frameNow = t
+        let raw = lastWall == 0 ? 0 : t - lastWall
+        let dt = lastWall == 0 ? animationTimeInterval : clampd(raw, 0, 0.25)
         lastWall = t
+        // Cadence proof for the diag: a perfect 30 Hz shows ~33.3/33.3/33.3.
+        if raw > 0 {
+            dtStats.lo = min(dtStats.lo, raw)
+            dtStats.hi = max(dtStats.hi, raw)
+            dtStats.sum += raw
+            dtStats.n += 1
+            if dtStats.n >= 150 {
+                BoomDiag.log(diagID + String(
+                    format: " frame dt: avg %.2f ms, min %.2f, max %.2f (150 frames)",
+                    dtStats.sum / Double(dtStats.n) * 1000,
+                    dtStats.lo * 1000, dtStats.hi * 1000))
+                dtStats = (1.0, 0.0, 0.0, 0)
+            }
+        }
         advance(by: dt)
+        ensureMetalSurfaces()
+        invalidateForFrame()
+        renderMetalFrame()
+    }
+
+    // MARK: Metal intro surfaces
+
+    /// The whole saver renders on Metal — boom AND steady state — so there
+    /// is no renderer handoff (and no handoff hitch) when the intro ends:
+    /// the same pipeline just stops drawing the field and keeps drawing the
+    /// rows. Surfaces come up once per window and stay. The CG draw path
+    /// remains intact underneath as the no-Metal fallback and the snapshot
+    /// harness's reference.
+    private func ensureMetalSurfaces() {
+        guard window != nil, !Self.metalDisabled else { return }
+        if boomMetal == nil {
+            guard let ctx = BoomMetalContext.shared,
+                  let renderer = BoomMetalRenderer(context: ctx) else {
+                Self.metalDisabled = true
+                viewLog.error("Metal unavailable — falling back to the CG renderer")
+                return
+            }
+            boomMetal = renderer
+            renderer.diagTag = diagID
+        }
+        if metalHost == nil {
+            let host = BoomMetalHostView(frame: bounds)
+            addSubview(host)
+            metalHost = host
+            setNeedsDisplay(bounds)   // the view itself paints black once
+            BoomDiag.log("\(diagID) metal surfaces up (field \(boomFieldIndex))")
+        }
+    }
+
+    /// Keeps the renderer bound to this view's current field — cheap identity
+    /// checks per frame; real work only at attach and window migration.
+    private func syncMetalContent() {
+        guard let metal = boomMetal else { return }
+        let scale = window?.backingScaleFactor ?? 2
+        if let core = boomCore {
+            metal.bindFieldIfNeeded(core.fields[boomFieldIndex],
+                                    backdrop: backdropSource,
+                                    buffer: boomSession?.backdropBuffers[boomFieldIndex],
+                                    scale: scale)
+        } else if intro == .armed, let img = backdropSource {
+            metal.bindBackdropOnly(img)
+        }
+    }
+
+    private func renderMetalFrame() {
+        guard let metal = boomMetal, let host = metalHost, let layer = host.metalLayer,
+              bounds.width > 8, !rows.isEmpty else { return }
+        syncMetalContent()
+        let scale = window?.backingScaleFactor ?? 2
+        // Only the field's owner renders it; a sibling stuck pre-migration
+        // on the same field presents black — unless its display link is dead
+        // (occluded window = invisible locally, yet still a real display's
+        // compositor source), in which case it ADOPTS the unclaimed field:
+        // the built-in gets its own content even though the host never told
+        // us which display we are.
+        var owns = boomSession?.claimField(boomFieldIndex, by: ObjectIdentifier(self)) ?? true
+        if !owns, CACurrentMediaTime() - lastLinkFire > 0.7,
+           CACurrentMediaTime() - viewBirth > 1.2,   // let migration/screens win first
+           let session = boomSession, let core = boomCore,
+           let free = session.unclaimedField(count: core.fields.count) {
+            adoptField(free, session: session)
+            owns = session.claimField(free, by: ObjectIdentifier(self))
+            BoomDiag.log("\(diagID) adopted field \(free) by elimination (occluded window)")
+            // syncMetalContent above bound the OLD field's textures; rebind
+            // now or this frame paints the wrong display's content.
+            syncMetalContent()
+        }
+        guard var frame = owns ? buildFrameInput(scale: scale)
+                               : BoomMetalRenderer.FrameInput() else { return }
+        if !owns { frame.holdBlack = true }
+        metal.renderFrame(frame, core: intro != .none ? boomCore : nil,
+                          fieldIndex: boomFieldIndex,
+                          viewSize: bounds.size, scale: scale, into: layer)
+        // Staged: our (post-migration) field is bound, textures live, frames
+        // flowing. The session clock starts once every display says so.
+        if owns, let session = boomSession, let core = boomCore,
+           metal.isBound(to: core.fields[boomFieldIndex]) {
+            session.markReady(boomFieldIndex)
+        }
+    }
+
+    /// One frame of everything, as Metal inputs: the same decisions the CG
+    /// path makes, emitted as glyph instances, fills, and UI-raster quads.
+    private func buildFrameInput(scale: CGFloat) -> BoomMetalRenderer.FrameInput? {
+        guard let metal = boomMetal else { return nil }
+        metal.configureText(fontBase: font?.pointSize ?? 12, charW: charW,
+                            lineH: lineH, scale: scale)
+        // The pressure pulse — the "contained blowout" halo around the
+        // statusline, fed into the glow field's a-channel. Origin display
+        // only. Exponential ember tail: the 5-step shader quantization
+        // makes the halo shrink inward through discrete brightness bands
+        // instead of winking out.
+        metal.blastPulse = nil
+        if boomOriginOnThisDisplay, let core = boomCore {
+            let g = core.fields[boomFieldIndex].grid
+            let c = armedLineCenter
+            let cell = (cx: Int((c.x - g.leftInset) / g.charW),
+                        cy: Int((c.y - g.topInset) / g.lineH))
+            if intro == .boom {
+                let t = now - boomStart
+                if t >= 0, t < 1.1 {
+                    metal.blastPulse = (cell.cx, cell.cy,
+                                        Float(3.2 * exp(-t / 0.35)), 14)
+                }
+            } else if intro == .armed, boomSession?.kind != .corner {
+                // Phosphor for the cursor-glitch: the materializing glyph
+                // glows, and the glow LINGERS faintly between reps —
+                // phosphor doesn't know the glyph left.
+                let a = armTotal - (armEndsAt - now)
+                let slot = a < 1.3 ? -1 : Int((a - 1.3) * 30)
+                var lvl: Float = 0
+                if slot >= 3, slot < 14 {
+                    let inRep = slot == 3 || slot == 4 || slot == 7
+                        || slot == 8 || slot == 11 || slot == 12
+                    lvl = inRep ? 1.0 : 0.45
+                } else if slot >= 14 {
+                    lvl = max(0, 0.9 - Float(slot - 14) * 0.12)
+                }
+                // Radius 3: a tight LED corona around the glyph, not a flood.
+                if lvl > 0 { metal.blastPulse = (cell.cx, cell.cy, lvl, 3) }
+            }
+        }
+        var frame = BoomMetalRenderer.FrameInput()
+        frame.holdBlack = introHoldingCurtain
+        frame.reveal = armedRevealProgress
+        frame.vignetteMax = Double(vignetteMax)
+        switch intro {
+        case .none:
+            frame.vignetteFactor = 1
+        case .boom:
+            if let core = boomCore {
+                let t = now - boomStart - core.params.gap - core.params.wave2 * 0.6
+                frame.vignetteFactor = clampd(t / 0.8, 0, 1)
+            }
+        case .armed:
+            frame.vignetteFactor = 0
+        }
+        if frame.holdBlack { return frame }
+        buildRowGlyphs(&frame, metal: metal, scale: scale)
+        buildUIQuads(&frame, metal: metal, scale: scale)
+        return frame
+    }
+
+    /// Metal twin of the snapshot harness's CPU reference frames.
+    public func metalDebugSnapshot() -> CGImage? {
+        guard let ctx = BoomMetalContext.shared else { return nil }
+        if boomMetal == nil { boomMetal = BoomMetalRenderer(context: ctx) }
+        guard let metal = boomMetal else { return nil }
+        // Scale 1: the harness's bitmaps are point-sized.
+        if let core = boomCore {
+            metal.bindFieldIfNeeded(core.fields[boomFieldIndex],
+                                    backdrop: backdropSource,
+                                    buffer: boomSession?.backdropBuffers[boomFieldIndex],
+                                    scale: 1)
+        } else if intro == .armed, let img = backdropSource {
+            metal.bindBackdropOnly(img)
+        }
+        guard let frame = buildFrameInput(scale: 1) else { return nil }
+        return metal.snapshot(frame, core: intro != .none ? boomCore : nil,
+                              fieldIndex: boomFieldIndex,
+                              viewSize: bounds.size, scale: 1)
+    }
+
+    // MARK: Metal frame builders
+
+    @inline(__always) private func mix3(_ a: SIMD3<Float>, _ b: SIMD3<Float>,
+                                        _ t: Float) -> SIMD3<Float> {
+        a + (b - a) * min(max(t, 0), 1)
+    }
+
+    /// The typed rows (and fading boom debris) as glyph instances — the
+    /// exact per-character color math of segmentString, no CoreText.
+    private func buildRowGlyphs(_ frame: inout BoomMetalRenderer.FrameInput,
+                                metal: BoomMetalRenderer, scale: CGFloat) {
+        guard intro != .armed else { return }   // rows are cleared while armed
+        let s = Float(scale)
+        let cw = Float(charW) * s
+        let lh = Float(lineH) * s
+        let x0 = Float(leftInset) * s
+        let maxY = bounds.height - lineH
+        let codeBaseV = SIMD3<Float>(0.58, 0.65, 0.72)
+        let glowTextV = SIMD3<Float>(0.93, 0.98, 1.0)
+        let glowHaloV = SIMD3<Float>(0.50, 0.83, 1.0)
+        let cursorV = SIMD3<Float>(0.66, 0.90, 1.0)
+
+        func emit(_ ch: Character, cells: Int, x: Float, y: Float,
+                  color: SIMD4<Float>, halo: SIMD4<Float>? = nil) {
+            guard let slot = metal.glyphSlot(for: ch, cells: cells) else { return }
+            let size = SIMD2(cw * Float(cells), lh)
+            if let halo {
+                frame.glyphs.append(.init(origin: SIMD2(x, y), size: size,
+                                          color: halo, uvRect: slot.uv,
+                                          flags: SIMD4(0, 1, 0, 0)))
+            }
+            var c = color
+            var flags = SIMD4<UInt32>(0, 0, 0, 0)
+            if slot.isColor {
+                c = SIMD4(1, 1, 1, color.w)
+                flags.x = 1
+            }
+            frame.glyphs.append(.init(origin: SIMD2(x, y), size: size,
+                                      color: c, uvRect: slot.uv, flags: flags))
+        }
+
+        for (i, segs) in rows.enumerated() {
+            let yPt = topInset + CGFloat(i) * lineH
+            if yPt > maxY { break }
+            let y = Float(yPt) * s
+            for seg in segs {
+                guard !seg.chars.isEmpty, seg.typed > 0 || seg.isActive else { continue }
+                if seg.fading {
+                    let f = Float(BoomCore.settledFade(age: now - seg.settledAt))
+                    guard f > 0.01 else { continue }
+                    let color = SIMD4(mix3(codeBaseV, glowTextV, 0.85 * f), 0.95 * f)
+                    var xCells = seg.xCol
+                    for ch in seg.chars {
+                        let cells = cellWidth(ch)
+                        if ch != " " {
+                            emit(ch, cells: cells, x: x0 + Float(xCells) * cw, y: y,
+                                 color: color)
+                        }
+                        xCells += cells
+                    }
+                    continue
+                }
+
+                let age = max(0, now - seg.settledAt)
+                var baseAlpha = seg.isActive
+                    ? Float(codeActiveAlpha)
+                    : Float(codeSettledFloor) + Float(codeSettledBoost)
+                        * Float(exp(-age / Double(codeFadeTau)))
+                if seg.isComment { baseAlpha *= Float(codeCommentDim) }
+                let tint = Float(seg.tint)
+                let tinted = SIMD3<Float>(min(1, 0.58 + tint * 0.3), 0.65,
+                                          min(1, 0.72 - tint))
+                let heat = seg.isActive ? 1.0
+                    : exp(-max(0, now - seg.typingDoneAt) / 0.55)
+                let visible = seg.typed
+                let cutoff = heat > 0.03 ? max(0, visible - 8) : visible
+                var xCells = seg.xCol
+                for k in 0..<visible {
+                    let ch = seg.chars[k]
+                    let cells = cellWidth(ch)
+                    let x = x0 + Float(xCells) * cw
+                    xCells += cells
+                    guard ch != " " else { continue }
+                    if k < cutoff {
+                        emit(ch, cells: cells, x: x, y: y,
+                             color: SIMD4(tinted, baseAlpha))
+                    } else {
+                        let d = visible - 1 - k
+                        let b = Float(min(1, pow(0.70, Double(d)) * heat
+                            * Double(codeGlowStrength)))
+                        let color = SIMD4(mix3(tinted, glowTextV, 0.85 * b),
+                                          baseAlpha + (1 - baseAlpha) * b)
+                        let halo: SIMD4<Float>? = b > 0.12
+                            ? SIMD4(glowHaloV, 0.85 * b) : nil
+                        emit(ch, cells: cells, x: x, y: y, color: color, halo: halo)
+                    }
+                }
+                if seg.isActive || now - seg.typingDoneAt < 0.3 {
+                    emit("\u{258A}", cells: 1, x: x0 + Float(xCells) * cw, y: y,
+                         color: SIMD4(cursorV, 0.85),
+                         halo: SIMD4(glowHaloV, 0.9))
+                }
+            }
+        }
+    }
+
+    /// The UI above the vignette: clock, spinner panel / teleport, idle line.
+    private func buildUIQuads(_ frame: inout BoomMetalRenderer.FrameInput,
+                              metal: BoomMetalRenderer, scale: CGFloat) {
+        if intro == .armed {
+            guard boomOriginOnThisDisplay else { return }
+            if boomSession?.kind == .corner {
+                // Corner runs: the user just hit the corner and is watching
+                // it — the finished line appears as soon as the reveal lands.
+                guard armedRevealProgress >= 1 else { return }
+                buildIdleLineQuad(&frame, metal: metal, scale: scale)
+            } else {
+                buildArmedIntro(&frame, metal: metal, scale: scale)
+            }
+            return
+        }
+        if clockVisible { buildClockQuad(&frame, metal: metal) }
+        buildPanelQuads(&frame, metal: metal, scale: scale)
+    }
+
+    /// Rasterizes a flipped-coordinates drawing block for upload as a quad.
+    private func rasterUI(size: NSSize, scale: CGFloat,
+                          _ body: () -> Void) -> CGImage? {
+        let pw = max(1, Int(size.width * scale))
+        let ph = max(1, Int(size.height * scale))
+        guard let cg = Self.makeBGRAContext(pw: pw, ph: ph) else { return nil }
+        let ctx = NSGraphicsContext(cgContext: cg, flipped: true)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = ctx
+        cg.saveGState()
+        cg.translateBy(x: 0, y: CGFloat(ph))
+        cg.scaleBy(x: scale, y: -scale)
+        body()
+        cg.restoreGState()
+        NSGraphicsContext.restoreGraphicsState()
+        return cg.makeImage()
+    }
+
+    /// The cursor's visual center — the anchor everything organizes around:
+    /// the glyph materializes HERE, the growing line stays centered HERE,
+    /// and the boom detonates (within a few px) HERE. That coincidence is
+    /// what makes the blast read as the statusline's own energy escaping.
+    private var armedLineCenter: NSPoint {
+        let o = resolvedBoomOrigin
+        return NSPoint(x: o.x + 6.5, y: o.y + 10)
+    }
+
+    /// Idle runs center the line on the cursor (clamped on-screen, whole
+    /// points — reflow happens in per-character jumps, never a glide);
+    /// corner runs keep the tooltip placement beside the corner.
+    private func idleLineOrigin(for size: NSSize) -> NSPoint {
+        guard boomSession?.kind != .corner else { return armedTextOrigin() }
+        let c = armedLineCenter
+        let x = min(max((c.x - size.width / 2).rounded(), 24),
+                    bounds.width - size.width - 24)
+        let y = min(max((c.y - size.height / 2).rounded(), 24),
+                    bounds.height - size.height - 24)
+        return NSPoint(x: x, y: y)
+    }
+
+    /// The armed intro for idle runs: the desktop reveals with the cursor
+    /// exactly where the user left it; the cursor and the spinner glyph
+    /// then TRADE PLACES in quantized frame-blocks (same visual center, no
+    /// tween — a display deciding what it's showing) with an electric
+    /// shimmer; the verb types out around the fixed center; the finished
+    /// line shimmers until detonation. No countdown — the wait is the show.
+    private func buildArmedIntro(_ frame: inout BoomMetalRenderer.FrameInput,
+                                 metal: BoomMetalRenderer, scale: CGFloat) {
+        let a = armTotal - (armEndsAt - now)
+        let morphStart = 1.3, morphLen = 0.55, perChar = 0.055
+        let o = resolvedBoomOrigin
+
+        // 30 Hz flicker slots; three reps — {3,4}, {7,8}, {11,12} show the
+        // glyph — then 14 locks it in. (The phosphor pulse in
+        // buildFrameInput follows the same slots.)
+        let slot = a < morphStart ? -1 : Int((a - morphStart) * 30)
+        let showGlyph = slot >= 14 || slot == 3 || slot == 4 || slot == 7
+            || slot == 8 || slot == 11 || slot == 12
+        if !showGlyph {
+            if cursorRaster == nil || cursorRasterScale != scale {
+                cursorRaster = makeCursorRaster(scale: scale)
+                cursorRasterScale = scale
+            }
+            if let raster = cursorRaster {
+                metal.setUITexture("cursor", image: raster)
+                // Tip = hotspot at (1,1); the recorded mouse point is the tip.
+                frame.quads.append(.init(
+                    key: "cursor",
+                    rect: CGRect(x: o.x - 1, y: o.y - 1,
+                                 width: Self.cursorSize.width,
+                                 height: Self.cursorSize.height),
+                    alpha: Double(armedRevealProgress)))
+            }
+            return
+        }
+
+        let chars = (armedVerb + "\u{2026}").count
+        let typeStart = morphStart + morphLen
+        let typed = a < typeStart ? 0
+            : min(chars, Int((a - typeStart) / perChar) + 1)
+        // Materialization shimmer: bright through the flicker, one dimmer
+        // step after lock-in, then off. Steps, not a fade.
+        let shimmer: Double = slot < 14 ? 0.4 : (slot < 20 ? 0.18 : 0)
+        buildIdleLineQuad(&frame, typed: typed, shimmer: shimmer,
+                          metal: metal, scale: scale)
+    }
+
+    private static let cursorSize = NSSize(width: 15, height: 22)
+
+    /// The macOS arrow pointer, drawn by hand — NSCursor.arrow.image is
+    /// EMPTY outside a real UI session (verified: 0×0, no reps, both in the
+    /// headless harness and remote-view hosts), so the fake cursor is a
+    /// vector twin: black fill, white outline, tip at (1,1).
+    private func makeCursorRaster(scale: CGFloat) -> CGImage? {
+        rasterUI(size: Self.cursorSize, scale: scale) {
+            let pts: [(CGFloat, CGFloat)] = [
+                (1, 1), (1, 18.5), (5.2, 14.6), (7.8, 20.9), (10.7, 19.7),
+                (8.1, 13.5), (13.7, 13.5),
+            ]
+            let p = NSBezierPath()
+            p.move(to: NSPoint(x: pts[0].0, y: pts[0].1))
+            for pt in pts.dropFirst() { p.line(to: NSPoint(x: pt.0, y: pt.1)) }
+            p.close()
+            p.lineWidth = 2.2
+            p.lineJoinStyle = .round
+            NSColor.white.setStroke()
+            p.stroke()
+            NSColor.black.setFill()
+            p.fill()
+        }
+    }
+
+    private func buildIdleLineQuad(_ frame: inout BoomMetalRenderer.FrameInput,
+                                   typed: Int? = nil, shimmer: Double = 0,
+                                   metal: BoomMetalRenderer, scale: CGFloat) {
+        let text = idleLineString(typed: typed)
+        let size = text.size()
+        let origin = idleLineOrigin(for: size)
+        // Detonation kinetics: a two-frame surge flash through the box and
+        // a BLAST of ejecta out of it (below). The box itself stays put —
+        // a shake on something this small read as a timid shudder.
+        var surge: Float = 0
+        if intro == .boom {
+            let t = now - boomStart
+            if t >= 0, t < 2.0 / 30 { surge = t < 1.0 / 30 ? 0.6 : 0.28 }
+        }
+        // The tooltip panel extends 14/8 past the text; +2 for the stroke.
+        let pad = NSSize(width: 16, height: 10)
+        let full = NSSize(width: size.width + pad.width * 2,
+                          height: size.height + pad.height * 2)
+        guard let img = rasterUI(size: full, scale: scale, {
+            drawIdleLine(text, at: NSPoint(x: pad.width, y: pad.height))
+        }) else { return }
+        metal.setUITexture("idleline", image: img, always: true)
+        let panelRect = CGRect(x: origin.x - pad.width, y: origin.y - pad.height,
+                               width: full.width, height: full.height)
+        frame.quads.append(.init(key: "idleline", rect: panelRect))
+        if shimmer > 0 {
+            // Electric block over the materializing glyph — steps with the
+            // flicker slots.
+            let gw = idleLineString(typed: 0).size().width
+            frame.lateFills.append(BoomMetalRenderer.fill(
+                NSRect(x: origin.x - 6, y: origin.y - 6,
+                       width: gw + 12, height: size.height + 12),
+                scale: scale, color: SIMD4(0.75, 0.64, 1.0, Float(shimmer))))
+        }
+        if surge > 0 {
+            frame.lateFills.append(BoomMetalRenderer.fill(
+                panelRect.insetBy(dx: -2, dy: -2),
+                scale: scale, color: SIMD4(0.75, 0.64, 1.0, surge)))
+        }
+        // The blast: cell-blocks in the accent palette ejected from the
+        // panel's perimeter, decelerating outward like debris. Everything
+        // quantized — positions re-rolled per 30 Hz step, snapped to the
+        // terminal lattice, a quarter of the blocks sitting out each step
+        // (sparkle, not smear). White-hot for the first two frames.
+        if intro == .boom, let core = boomCore {
+            let t = now - boomStart
+            if t >= 0, t < 0.7 {
+                let g = core.fields[boomFieldIndex].grid
+                let cw = g.charW, lh = g.lineH
+                let step = (t * 30).rounded(.down) / 30
+                let stepIx = Int(t * 30)
+                let c = armedLineCenter
+                let rx = Double(panelRect.width) / 2, ry = Double(panelRect.height) / 2
+                for i in 0..<56 {
+                    if boomCellNoise(i, stepIx, 0xE1A6) < 0.25 { continue }
+                    let ang = boomCellNoise(i, 11, 0xE1A5) * 2 * .pi
+                    // Contained blowout: short reach, full intensity — the
+                    // violence is in the brightness, not the distance.
+                    let reach = 40.0 + boomCellNoise(i, 23, 0xE1A5) * 90.0
+                    let r0 = sqrt(pow(rx * cos(ang), 2) + pow(ry * sin(ang), 2))
+                    let r = r0 + reach * (1 - exp(-step / 0.13))
+                    let px = Double(c.x) + cos(ang) * r
+                    let py = Double(c.y) + sin(ang) * r
+                    let col = ((CGFloat(px) - g.leftInset) / cw).rounded(.down)
+                    let row = ((CGFloat(py) - g.topInset) / lh).rounded(.down)
+                    let fade = Float(max(0, 1 - step / 0.7))
+                    let color: SIMD4<Float> = t < 4.0 / 30
+                        ? SIMD4(1.0, 0.97, 1.0, 1.0)
+                        : SIMD4(0.80, 0.70, 1.0, 0.95 * fade)
+                    frame.lateFills.append(BoomMetalRenderer.fill(
+                        NSRect(x: g.leftInset + col * cw, y: g.topInset + row * lh,
+                               width: cw, height: lh),
+                        scale: scale, color: color))
+                }
+            }
+        }
+    }
+
+    private func buildClockQuad(_ frame: inout BoomMetalRenderer.FrameInput,
+                                metal: BoomMetalRenderer) {
+        guard let cache = ensureClockCache() else { return }
+        metal.setUITexture("clock", image: cache.image)   // 1 Hz re-upload
+        frame.quads.append(.init(key: "clock", rect: cache.blitRect,
+                                 maskToWipedCells: intro == .boom))
+        clockBottom = cache.bottom
+    }
+
+    private func appendTeleportFlash(_ fills: inout [BoomMetalRenderer.CellInstance],
+                                     rect: NSRect, alpha: CGFloat, scale: CGFloat) {
+        guard alpha > 0.02 else { return }
+        fills.append(BoomMetalRenderer.fill(rect.insetBy(dx: -7, dy: -5), scale: scale,
+                                            color: SIMD4(0.93, 0.96, 1.0, Float(alpha * 0.22))))
+        fills.append(BoomMetalRenderer.fill(rect, scale: scale,
+                                            color: SIMD4(0.93, 0.96, 1.0, Float(alpha))))
+    }
+
+    private func appendBlip(_ fills: inout [BoomMetalRenderer.CellInstance],
+                            cell: NSRect, scale: CGFloat) {
+        fills.append(BoomMetalRenderer.fill(cell, scale: scale,
+                                            color: SIMD4(0.93, 0.96, 1.0, 0.9)))
+        let ring = cell.insetBy(dx: -4, dy: -4)
+        let c = SIMD4<Float>(0.93, 0.96, 1.0, 0.65)
+        let w: CGFloat = 1
+        fills.append(BoomMetalRenderer.fill(NSRect(x: ring.minX, y: ring.minY,
+                                                   width: ring.width, height: w),
+                                            scale: scale, color: c))
+        fills.append(BoomMetalRenderer.fill(NSRect(x: ring.minX, y: ring.maxY - w,
+                                                   width: ring.width, height: w),
+                                            scale: scale, color: c))
+        fills.append(BoomMetalRenderer.fill(NSRect(x: ring.minX, y: ring.minY,
+                                                   width: w, height: ring.height),
+                                            scale: scale, color: c))
+        fills.append(BoomMetalRenderer.fill(NSRect(x: ring.maxX - w, y: ring.minY,
+                                                   width: w, height: ring.height),
+                                            scale: scale, color: c))
+    }
+
+    /// The spinner panel — including the full teleport choreography — as
+    /// fills and a per-frame raster quad. Mirrors drawSpinnerPanel exactly.
+    private func buildPanelQuads(_ frame: inout BoomMetalRenderer.FrameInput,
+                                 metal: BoomMetalRenderer, scale: CGFloat) {
+        let text = spinnerAttributedString()
+        let size = text.size()
+        let padH: CGFloat = uiFont.pointSize * 1.7
+        let padV: CGFloat = uiFont.pointSize * 1.05
+        let textOrigin = spinnerTextOrigin(for: size)
+        var backdropAlpha: CGFloat = 1
+        var arrivalFlash: CGFloat = 0
+        if intro == .boom, let core = boomCore {
+            let grid = core.fields[boomFieldIndex].grid
+            let t = now - boomStart
+            let start = idleLineOrigin(for: idleLineString().size())
+            let zapStart = core.duration + 0.35
+            let tz = t - zapStart
+            if tz < 0 {
+                if boomOriginOnThisDisplay {
+                    buildIdleLineQuad(&frame, metal: metal, scale: scale)
+                }
+                return
+            }
+            if tz < 0.23, boomOriginOnThisDisplay {
+                let a = CGFloat(1 - tz / 0.23)
+                let idleSize = idleLineString().size()
+                appendTeleportFlash(&frame.fills,
+                                    rect: NSRect(x: start.x - 6, y: start.y - 3,
+                                                 width: idleSize.width + 12,
+                                                 height: idleSize.height + 6),
+                                    alpha: 0.85 * a * a, scale: scale)
+            }
+            if tz < 0.07 { return }
+            if tz < 0.13 {
+                appendBlip(&frame.fills,
+                           cell: NSRect(x: (bounds.width - grid.charW) / 2,
+                                        y: textOrigin.y,
+                                        width: grid.charW, height: grid.lineH),
+                           scale: scale)
+                return
+            }
+            if tz < 0.22 { return }
+            backdropAlpha = CGFloat(clampd((tz - 0.30) / 0.15, 0, 1))
+            if tz < 0.36 { arrivalFlash = CGFloat((0.36 - tz) / 0.14) * 0.55 }
+        }
+        let shadowPad: CGFloat = 40
+        let panel = NSRect(x: textOrigin.x - padH, y: textOrigin.y - padV,
+                           width: size.width + padH * 2, height: size.height + padV * 2)
+        ensurePanelBackdropImage(panel)
+        let full = NSSize(width: panel.width + shadowPad * 2,
+                          height: panel.height + shadowPad * 2)
+        let bAlpha = backdropAlpha
+        guard let img = rasterUI(size: full, scale: scale, {
+            if bAlpha > 0.02, let pimg = panelCacheImage,
+               let cg = NSGraphicsContext.current?.cgContext {
+                cg.saveGState()
+                if bAlpha < 1 { cg.setAlpha(bAlpha) }
+                cg.translateBy(x: 0, y: full.height)
+                cg.scaleBy(x: 1, y: -1)
+                cg.draw(pimg, in: CGRect(origin: .zero, size: full))
+                cg.restoreGState()
+            }
+            text.draw(at: NSPoint(x: shadowPad + padH, y: shadowPad + padV))
+        }) else { return }
+        metal.setUITexture("panel", image: img, always: true)
+        frame.quads.append(.init(key: "panel",
+                                 rect: NSRect(x: panel.minX - shadowPad,
+                                              y: panel.minY - shadowPad,
+                                              width: full.width, height: full.height)))
+        if arrivalFlash > 0 {
+            appendTeleportFlash(&frame.lateFills,
+                                rect: NSRect(x: textOrigin.x - 4, y: textOrigin.y - 2,
+                                             width: size.width + 8, height: size.height + 4),
+                                alpha: arrivalFlash, scale: scale)
+        }
+    }
+
+    private var boomFreshCells: [Int] = []
+    private var introNeedsFullRedraw = true
+    private var lastIntroUIRect = NSRect.zero
+
+    /// During the intro, invalidate only what changed — full-frame redraws
+    /// at 5K × N displays are what made the boom a slideshow (~33 ms/frame
+    /// just to re-composite a static backdrop). AppKit clips draw(_:) to the
+    /// union of these rects.
+    private func invalidateForFrame() {
+        // Metal renders every pixel imperatively per tick; the view's own
+        // backing is a black rectangle that never needs repainting.
+        guard !metalActive else { return }
         setNeedsDisplay(bounds)
     }
 
@@ -438,16 +1429,165 @@ public final class CodeSaverView: ScreenSaverView {
         if let win = window {
             viewLog.notice("viewDidMoveToWindow — window frame \(Double(win.frame.width), privacy: .public)×\(Double(win.frame.height), privacy: .public), view bounds \(Double(self.bounds.width), privacy: .public)×\(Double(self.bounds.height), privacy: .public)")
             rescueZeroSizedWindow()
+            // Tick once right now: session attach and Metal staging start
+            // immediately instead of waiting out the first framework frame
+            // (or the 1 s fallback probe). Overlapping drivers are safe —
+            // an extra tick just advances by dt ≈ 0.
+            tick()
+            startFrameClock()
+            startWatchdog()
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                guard let self, self.window != nil else { return }
-                self.rescueZeroSizedWindow()
-                if !self.frameworkDriven { self.startFallbackTimer() }
+                self?.rescueZeroSizedWindow()
             }
         } else {
-            stopFallbackTimer()
-            // Re-arm for a possible next window whose host doesn't drive frames.
-            frameworkDriven = false
+            stopFrameClock()
+            stopWatchdog()
         }
+    }
+
+    /// Fires even when the display link doesn't — the runloop is kept alive
+    /// by the sibling views. A dead link means our window sits on a display
+    /// that isn't compositing: hide the surface (transparent window) and
+    /// release any field claim so the live sibling takes over.
+    private var watchdog: Timer?
+
+    private func startWatchdog() {
+        guard watchdog == nil else { return }
+        let t = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            // A dead display link = our window is occluded (macOS suspends
+            // links for covered windows — the fate of a never-migrated
+            // window stacked under its sibling). The view is still the
+            // compositor's source for a real display, so keep it ALIVE:
+            // drive ticks from a timer, which occlusion can't suspend.
+            guard self.displayLinkBox != nil, self.fallbackSource == nil,
+                  CACurrentMediaTime() - self.lastLinkFire > 0.35,
+                  self.lastLinkFire > 0 || CACurrentMediaTime() - self.lastWall > 0.35
+            else { return }
+            self.engageStrictFallback()
+        }
+        RunLoop.main.add(t, forMode: .common)
+        watchdog = t
+    }
+
+    /// The occlusion fallback clock: a strict DispatchSourceTimer ticking on
+    /// absolute 1/30 s boundaries, feeding boundary timestamps into the sim
+    /// clock — so even a link-less view gets metronome cadence and exactly
+    /// two sim ticks per frame (a plain NSTimer here measured 40 ms avg with
+    /// a 1 s stall: the built-in's "still laggy").
+    private var fallbackSource: DispatchSourceTimer?
+    private var fallbackBase: Double = 0
+    private var fallbackLastSlot: Double = -1
+
+    private var usingScreenLink = false
+
+    private func engageStrictFallback() {
+        // First choice: a SCREEN-bound display link for our field's true
+        // panel — vsync-locked and immune to window occlusion (it's scoped
+        // to the display, not to our covered window). The dispatch grid
+        // timer below is the last resort; it can't phase-lock to the panel
+        // and measurably skips a slot every few seconds.
+        if #available(macOS 14.0, *), let session = boomSession {
+            let target = session.core.fields[boomFieldIndex].originCG
+            if let screen = NSScreen.screens.first(where: {
+                guard let num = $0.deviceDescription[
+                    NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID
+                else { return false }
+                let b = CGDisplayBounds(num)
+                return abs(b.origin.x - target.x) < 0.5 && abs(b.origin.y - target.y) < 0.5
+            }) {
+                (displayLinkBox as? CADisplayLink)?.invalidate()
+                let link = screen.displayLink(target: self,
+                                              selector: #selector(displayTick(_:)))
+                link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 30,
+                                                                preferred: 30)
+                link.add(to: .main, forMode: .common)
+                displayLinkBox = link
+                usingScreenLink = true
+                lastLinkFire = CACurrentMediaTime()
+                nextTickBoundary = 0
+                BoomDiag.log("\(diagID) view link suspended — SCREEN link engaged for field \(boomFieldIndex)")
+                return
+            }
+        }
+        lastWall = CACurrentMediaTime()   // don't count the dead gap as a frame
+        fallbackBase = CACurrentMediaTime()
+        fallbackLastSlot = -1
+        let period = 1.0 / 30.0
+        let src = DispatchSource.makeTimerSource(flags: .strict, queue: .main)
+        src.schedule(deadline: .now() + period, repeating: period,
+                     leeway: .milliseconds(1))
+        src.setEventHandler { [weak self] in
+            guard let self else { return }
+            // Quantize to the absolute grid; tolerate coalesced fires.
+            let k = ((CACurrentMediaTime() - self.fallbackBase) / period).rounded()
+            guard k > self.fallbackLastSlot else { return }
+            self.fallbackLastSlot = k
+            self.tick(at: self.fallbackBase + k * period)
+        }
+        src.resume()
+        fallbackSource = src
+        BoomDiag.log("\(diagID) display link suspended (occluded window) — strict grid timer engaged")
+    }
+
+    private func stopWatchdog() {
+        watchdog?.invalidate()
+        watchdog = nil
+    }
+
+    private func startFrameClock() {
+        guard displayLinkBox == nil, legacyTimer == nil else { return }
+        if #available(macOS 14.0, *) {
+            let link = displayLink(target: self, selector: #selector(displayTick(_:)))
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 30,
+                                                            preferred: 30)
+            link.add(to: .main, forMode: .common)
+            displayLinkBox = link
+        } else {
+            let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+                self?.tick()
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            legacyTimer = timer
+        }
+    }
+
+    private func stopFrameClock() {
+        if #available(macOS 14.0, *) {
+            (displayLinkBox as? CADisplayLink)?.invalidate()
+        }
+        displayLinkBox = nil
+        legacyTimer?.invalidate()
+        legacyTimer = nil
+        fallbackSource?.cancel()
+        fallbackSource = nil
+    }
+
+    private var nextTickBoundary: Double = 0
+    /// Last CADisplayLink fire — dies when our window is occluded (e.g. a
+    /// never-migrated window stacked under a sibling). Ticks then fall back
+    /// to a timer, which occlusion cannot suspend.
+    private var lastLinkFire: Double = 0
+
+    @available(macOS 14.0, *)
+    @objc private func displayTick(_ link: CADisplayLink) {
+        lastLinkFire = CACurrentMediaTime()
+        // Tick every N vsyncs where N·period is closest to 1/30 s — the
+        // panel's own grid decides: 2nd vsync at 60 Hz (33.3 ms), 4th at
+        // 120 (33.3), 3rd at 100 (30 ms, ~33 fps). Steady cadence beats
+        // exact rate: forcing absolute 33.3 ms boundaries on a 100 Hz grid
+        // produced a 40/30 ms wobble, which reads worse than a slightly
+        // fast metronome. (Rate ranges are advisory; callbacks arrive at
+        // panel rate, so decimation is ours.)
+        let vsync = max(0.001, link.targetTimestamp - link.timestamp)
+        let period = max(1, (1.0 / 30.0 / vsync).rounded()) * vsync
+        if nextTickBoundary == 0 { nextTickBoundary = link.timestamp }
+        guard link.timestamp >= nextTickBoundary - vsync * 0.25 else { return }
+        nextTickBoundary += period
+        if link.timestamp > nextTickBoundary + 0.1 {   // resync after a stall
+            nextTickBoundary = link.timestamp + period
+        }
+        tick(at: link.timestamp)
     }
 
     /// On macOS 26 the ViewBridge sizing handshake from the host can fail to
@@ -464,22 +1604,8 @@ public final class CodeSaverView: ScreenSaverView {
         win.setFrame(f, display: true)
     }
 
-    private func startFallbackTimer() {
-        guard fallbackTimer == nil else { return }
-        let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
-            self?.tick()
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        fallbackTimer = timer
-    }
-
-    private func stopFallbackTimer() {
-        fallbackTimer?.invalidate()
-        fallbackTimer = nil
-    }
-
     deinit {
-        stopFallbackTimer()
+        stopFrameClock()
     }
 
     /// Advances the simulation clock. Exposed for the preview/snapshot harness.
@@ -491,6 +1617,60 @@ public final class CodeSaverView: ScreenSaverView {
             readPrefs()
             nextPrefsRead = now + 2
         }
+        if !handoffChecked, window != nil { attachBoomSession() }
+        // Session runs re-derive their clock from the shared monotonic anchor
+        // every frame — all displays in lockstep even across dropped frames.
+        // (Pre-anchor the clock holds still, so the scene freezes until every
+        // display has staged; see BoomSession.markReady.)
+        if let session = boomSession, intro != .none {
+            rebindFieldIfNeeded(session)
+            session.pollReadiness()
+            let t = session.simTime(at: frameNow > 0 ? frameNow : CACurrentMediaTime())
+            if intro == .armed { armEndsAt = now - t } else { boomStart = now - t }
+        }
+        switch intro {
+        case .armed:
+            // The captured desktop + the idle line; the scene holds its breath.
+            if now >= armEndsAt { detonate() } else { return }
+        case .boom:
+            if let core = boomCore {
+                // Local runs (preview click / env): dilate by drifting the
+                // epoch so (now - boomStart) grows at 1/scale. Session runs
+                // dilate at the source (BoomSession.simTime).
+                if boomSession == nil, Self.boomTimeScale != 1 {
+                    boomStart += dt * (1 - 1 / Self.boomTimeScale)
+                }
+                // Cap the catch-up target: past duration+6 the field is fully
+                // transitioned and finishIntro (below) fires off the wall
+                // clock anyway. Without the cap, a frame clock that stalls
+                // mid-boom (display sleep) and resumes minutes later would
+                // replay every missed tick — thousands of full-grid steps in
+                // one frame.
+                core.advance(to: min(now - boomStart, core.duration + 6))
+                _ = core.drainPaints(boomFieldIndex)
+                // Preview runs own every field; in a session each display's
+                // view drains its own.
+                if boomSession == nil {
+                    for i in core.fields.indices where i != boomFieldIndex {
+                        _ = core.drainPaints(i)
+                    }
+                }
+                // The handoff waits for the debris: every flung glyph gets
+                // its own bright-block → settled → fade lifecycle. Ending on
+                // the fixed clock guillotined whichever heads were still
+                // drifting — they all blipped out in one frame.
+                let boomT = now - boomStart
+                if boomT > core.duration + 1.0,
+                   !core.particles.contains(where: { !$0.settled })
+                       || boomT > core.duration + 5.0 {
+                    finishIntro()
+                }
+            } else {
+                intro = .none
+            }
+        case .none:
+            break
+        }
         // ↑ means upload — data streaming to the model — so everything runs a
         // touch hotter while it's active. Idle at the slowest speed while the
         // spinner rests AND while a new request waits on the API: typing only
@@ -500,7 +1680,16 @@ public final class CodeSaverView: ScreenSaverView {
         speedMul += (targetMul - speedMul) * min(1, dt * 1.5)
         for w in writers { update(w, dt: dt) }
         updateSpinner(dt: dt)
+        // Boom debris that has faded out is done for good.
+        if now >= nextFadePurge {
+            nextFadePurge = now + 3
+            for i in rows.indices {
+                rows[i].removeAll { $0.fading && now - $0.settledAt > BoomCore.settledFadeLife + 1 }
+            }
+        }
     }
+
+    private var nextFadePurge: Double = 0
 
     // MARK: Background writers
 
@@ -755,6 +1944,315 @@ public final class CodeSaverView: ScreenSaverView {
         return "almost done coding with xhigh effort"
     }
 
+    // MARK: Boom intro mechanics
+
+    /// Arms the intro: the scene clears to black and the idle line ticks down
+    /// at `p` (fractions of bounds) until detonation.
+    public func armIntro(atNormalized p: CGPoint, countdown: Double) {
+        boomOriginNorm = p
+        intro = .armed
+        armEndsAt = now + countdown
+        armTotal = countdown
+        armedVerb = verbs.randomElement()?.ing ?? "Idling"
+        boomSession = nil
+        boomCore = nil
+        viewOriginCG = .zero
+        for i in rows.indices { rows[i] = [] }
+    }
+
+    /// Re-runs the boom from the last origin (tuning-panel button).
+    public func replayBoom() {
+        armIntro(atNormalized: boomOriginNorm, countdown: 1.2)
+    }
+
+    /// Preview-window convenience: a click detonates at that point. The real
+    /// saver never receives events (input ends the session first).
+    public override func mouseDown(with event: NSEvent) {
+        guard bounds.width > 8 else { return }
+        let p = convert(event.locationInWindow, from: nil)
+        armIntro(atNormalized: CGPoint(x: p.x / bounds.width, y: p.y / bounds.height),
+                 countdown: 1.2)
+    }
+
+    /// CODESAVER_BOOM="x,y[,armSeconds]" (x/y as fractions) arms the intro at
+    /// launch — the snapshot harness's deterministic trigger.
+    private func configureIntroFromEnv() {
+        guard let spec = ProcessInfo.processInfo.environment["CODESAVER_BOOM"] else { return }
+        let parts = spec.split(separator: ",").compactMap { Double($0) }
+        guard parts.count >= 2 else { return }
+        armIntro(atNormalized: CGPoint(x: parts[0], y: parts[1]),
+                 countdown: parts.count >= 3 ? parts[2] : 2.0)
+    }
+
+    /// Production path: the igniter left a capture manifest (screenshots +
+    /// mouse position + trigger kind); the shared BoomSession loads it once
+    /// and every display's view attaches. Idle triggers play a 5-second
+    /// armed pre-animation over the captured desktop; hot-corner triggers
+    /// detonate immediately. No manifest (or a stale one) → normal start.
+    private func attachBoomSession() {
+        handoffChecked = true
+        guard intro == .none, let win = window, bounds.width > 8 else { return }
+        guard let session = BoomSession.loadIfNeeded(codeLines: { self.boomCodeLines() },
+                                                     verbs: verbs.map(\.ing)) else { return }
+        // Which field is ours: appex service windows sit at their display's
+        // CG origin (see clockVisible).
+        let wo = win.frame.origin
+        boomFieldIndex = session.core.fields.firstIndex {
+            abs($0.originCG.x - wo.x) < 0.5 && abs($0.originCG.y - wo.y) < 0.5
+        } ?? 0
+        boomSession = session
+        boomCore = session.core
+        BoomDiag.log(String(format: "%@ attach: window origin (%.0f, %.0f) → field %d, simTime %.2f",
+                            diagID, wo.x, wo.y, boomFieldIndex, session.simTime))
+        viewOriginCG = session.core.fields[boomFieldIndex].originCG
+        let fieldSize = session.core.fields[boomFieldIndex].grid.size
+        boomOriginNorm = CGPoint(
+            x: (session.core.params.originCG.x - viewOriginCG.x) / fieldSize.width,
+            y: (session.core.params.originCG.y - viewOriginCG.y) / fieldSize.height)
+        armedVerb = session.verb
+        for i in rows.indices { rows[i] = [] }
+        let t = session.simTime
+        if t < 0 {
+            intro = .armed
+            armEndsAt = now - t
+            armTotal = session.armDuration
+        } else {
+            detonate(start: now - t)
+        }
+    }
+
+    /// The host parks every window on the main display first and migrates it
+    /// to its real display moments later (see clockVisible) — so the field
+    /// binding must follow the window rather than latch on first sight.
+    private func rebindFieldIfNeeded(_ session: BoomSession) {
+        guard let win = window else { return }
+        // Primary identity: the window's SCREEN — what the display link
+        // follows. In the wedged host state the frame origin stays parked at
+        // (0,0) forever while the screen association is already correct
+        // (proven live: a stuck-origin view ticking on its true panel's
+        // vsync grid). Trust it only while the link is actually firing.
+        var target: Int?
+        if CACurrentMediaTime() - lastLinkFire < 0.7,
+           let screen = win.screen,
+           let num = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID {
+            let b = CGDisplayBounds(num)
+            target = session.core.fields.firstIndex {
+                abs($0.originCG.x - b.origin.x) < 0.5 && abs($0.originCG.y - b.origin.y) < 0.5
+            }
+        }
+        if target == nil {
+            let wo = win.frame.origin
+            target = session.core.fields.firstIndex {
+                abs($0.originCG.x - wo.x) < 0.5 && abs($0.originCG.y - wo.y) < 0.5
+            }
+        }
+        guard let idx = target, idx != boomFieldIndex else { return }
+        // Never rebind INTO a field another live view is rendering (e.g. an
+        // adopted view's stale (0,0) origin matching the main field).
+        guard session.claimField(idx, by: ObjectIdentifier(self)) else { return }
+        session.releaseField(boomFieldIndex, by: ObjectIdentifier(self))
+        boomFieldIndex = idx
+        BoomDiag.log(String(format: "%@ rebound → field %d (window origin (%.0f, %.0f))",
+                            diagID, idx, win.frame.origin.x, win.frame.origin.y))
+        reengageFallbackIfNeeded()
+        let field = session.core.fields[idx]
+        viewOriginCG = field.originCG
+        boomOriginNorm = CGPoint(
+            x: (session.core.params.originCG.x - viewOriginCG.x) / field.grid.size.width,
+            y: (session.core.params.originCG.y - viewOriginCG.y) / field.grid.size.height)
+        if intro == .boom {
+            // Ignition times belong to the display we actually live on.
+            for w in writers {
+                let p = NSPoint(x: leftInset + CGFloat(w.col) * charW,
+                                y: topInset + CGFloat(w.row) * lineH)
+                w.pauseUntil = min(w.pauseUntil,
+                                   boomStart + boomSecondHit(ofLocal: p) * Self.boomTimeScale
+                                       + rand(0.05, 0.4))
+            }
+        }
+        setNeedsDisplay(bounds)
+    }
+
+    /// A fallback clock serves a specific panel; if our field changes after
+    /// engagement, re-engage for the new one.
+    private func reengageFallbackIfNeeded() {
+        guard usingScreenLink || fallbackSource != nil else { return }
+        if usingScreenLink {
+            if #available(macOS 14.0, *) {
+                (displayLinkBox as? CADisplayLink)?.invalidate()
+            }
+            displayLinkBox = nil
+            usingScreenLink = false
+        }
+        fallbackSource?.cancel()
+        fallbackSource = nil
+        engageStrictFallback()
+    }
+
+    /// Binds this view to a field chosen by elimination (its window's
+    /// origin lies). Mirrors rebindFieldIfNeeded's bookkeeping.
+    private func adoptField(_ idx: Int, session: BoomSession) {
+        session.releaseField(boomFieldIndex, by: ObjectIdentifier(self))
+        boomFieldIndex = idx
+        let field = session.core.fields[idx]
+        viewOriginCG = field.originCG
+        boomOriginNorm = CGPoint(
+            x: (session.core.params.originCG.x - viewOriginCG.x) / field.grid.size.width,
+            y: (session.core.params.originCG.y - viewOriginCG.y) / field.grid.size.height)
+        if intro == .boom {
+            for w in writers {
+                let p = NSPoint(x: leftInset + CGFloat(w.col) * charW,
+                                y: topInset + CGFloat(w.row) * lineH)
+                w.pauseUntil = min(w.pauseUntil,
+                                   boomStart + boomSecondHit(ofLocal: p) * Self.boomTimeScale
+                                       + rand(0.05, 0.4))
+            }
+        }
+        reengageFallbackIfNeeded()
+        setNeedsDisplay(bounds)
+    }
+
+    private func detonate(start: Double? = nil) {
+        intro = .boom
+        boomStart = start ?? now
+        BoomDiag.log(String(format: "detonate (field %d, t=%.2f)", boomFieldIndex, now - boomStart))
+        if boomCore == nil {
+            // Local arming (preview click / env): one field over this view,
+            // asciified from a stand-in capture when provided. Fixed seed:
+            // snapshot runs must be reproducible.
+            let grid = BoomGrid(size: bounds.size)
+            var color = [UInt32](repeating: 0, count: grid.cols * grid.rows)
+            if let img = Self.standInCapture() {
+                color = BoomCore.colorize(img, grid: grid)
+            }
+            let o = resolvedBoomOrigin
+            boomCore = BoomCore(
+                params: BoomCore.Params(originCG: o,
+                                        radius: maxCornerDistance(from: o),
+                                        seed: 0xC0DE_5AFE,
+                                        wave1: boomWave1, gap: boomGap,
+                                        wave2: boomWave2,
+                                        debrisDensity: boomDebrisDensity,
+                                        idleVerb: armedVerb,
+                                        codeLines: boomCodeLines()),
+                fields: [BoomField(grid: grid, originCG: .zero, color: color)])
+            boomFieldIndex = 0
+            viewOriginCG = .zero
+        }
+        guard let core = boomCore else { return }
+        core.advance(to: max(0, now - boomStart))
+        for i in core.fields.indices { _ = core.drainPaints(i) }
+        // The boom opens a fresh request; its latency window covers the whole
+        // show — parens only after the zap has landed.
+        startCycle(freshVerb: true)
+        phaseStart = boomStart
+        // Parens only after the zap has landed: the line flies bare. (The
+        // zap fires at (duration + 0.35) dilated; at scale 1 this is the
+        // original duration + 0.9.)
+        parenDelay = max(parenDelay, (core.duration + 0.35) * Self.boomTimeScale + 0.55)
+        // The explosion's energy carries into the typing, then decays toward
+        // the request-latency lull on speedMul's own ease.
+        speedMul = 1.35
+        for i in rows.indices { rows[i] = [] }
+        for w in writers {
+            respawn(w)
+            let p = NSPoint(x: leftInset + CGFloat(w.col) * charW,
+                            y: topInset + CGFloat(w.row) * lineH)
+            w.pauseUntil = boomStart + boomSecondHit(ofLocal: p) * Self.boomTimeScale
+                + rand(0.05, 0.4)
+        }
+    }
+
+    /// The boom's end: settled flung glyphs become ordinary one-character
+    /// segments — the normal pipeline owns them, ages them, and eventually
+    /// types over them — and the whole boom apparatus is released.
+    private func finishIntro() {
+        if let core = boomCore {
+            // Backstop stragglers (the +5 s cap fired): park them in place so
+            // they continue their own decay as settled glyphs — never a mass
+            // vanish. Shared core: the first view to finish parks for all.
+            core.parkRemainingParticles()
+            let f = core.fields[boomFieldIndex]
+            // The boom grid extends past the screen edges; the typing grid is
+            // inset. Same lattice, shifted by a whole number of cells.
+            let colShift = Int(((leftInset - f.grid.leftInset) / charW).rounded())
+            let rowShift = Int(((topInset - f.grid.topInset) / lineH).rounded())
+            for row in 0..<f.grid.rows {
+                for col in 0..<f.grid.cols {
+                    let saverCol = col - colShift
+                    let saverRow = row - rowShift
+                    guard saverCol >= 0, saverCol < cols,
+                          saverRow >= 0, saverRow < rowCount else { continue }
+                    let i = f.index(col, row)
+                    guard f.state[i] == BoomField.stateSettled,
+                          let scalar = Unicode.Scalar(Int(f.ascii[i])), f.ascii[i] >= 33
+                    else { continue }
+                    // The fade started at the actual settle moment; carry
+                    // that clock over so the curve never jumps. Already-faded
+                    // glyphs don't come back. Anchored backwards from `now`:
+                    // a glyph that settled (t − s) sim-seconds ago settled
+                    // scale× that many wall-seconds ago — anchoring forward
+                    // from boomStart under dilation put settle moments in
+                    // the future and every glyph flashed back to white.
+                    let settleTime = now - ((now - boomStart)
+                        - Double(f.hitTick[i]) / BoomCore.tickHz) * Self.boomTimeScale
+                    guard BoomCore.settledFade(age: now - settleTime) > 0.01 else { continue }
+                    let seg = Segment()
+                    seg.xCol = saverCol
+                    seg.chars = [Character(scalar)]
+                    seg.cells = 1
+                    seg.typed = 1
+                    seg.fading = true
+                    seg.typingDoneAt = now - 10
+                    seg.settledAt = settleTime
+                    rows[saverRow].append(seg)
+                }
+            }
+        }
+        intro = .none
+        boomCore = nil
+        // The Metal pipeline persists — same renderer, next frame just has
+        // no field pass. No teardown, no cache rebuilds, no hitch.
+        setNeedsDisplay(bounds)
+        BoomDiag.log("finishIntro (field \(boomFieldIndex))")
+    }
+
+    /// Real code for the boom's spots, straight from the session corpus.
+    private func boomCodeLines() -> [String] {
+        var lines: [String] = []
+        for _ in 0..<6 {
+            lines += randomChunk().map { String($0) }
+        }
+        lines = lines.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        return lines.isEmpty ? BoomCore.fallbackCodeLines : lines
+    }
+
+    private static func standInCapture() -> CGImage? {
+        guard let path = ProcessInfo.processInfo.environment["CODESAVER_CAPTURE"],
+              let img = NSImage(contentsOfFile: path) else { return nil }
+        var rect = CGRect(origin: .zero, size: img.size)
+        return img.cgImage(forProposedRect: &rect, context: nil, hints: nil)
+    }
+
+    private static let standInCaptureImage: CGImage? = standInCapture()
+
+    /// The desktop the boom destroys: in production, this display's captured
+    /// screenshot from the session; in the harness, the stand-in image. The
+    /// saver's opening frame IS the desktop, so the system's activation
+    /// transition lands on a picture of what it left.
+    private var backdropSource: CGImage? {
+        if let session = boomSession { return session.backdrops[boomFieldIndex] }
+        return Self.standInCaptureImage
+    }
+
+
+    private func maxCornerDistance(from o: NSPoint) -> CGFloat {
+        let corners = [NSPoint(x: 0, y: 0), NSPoint(x: bounds.width, y: 0),
+                       NSPoint(x: 0, y: bounds.height),
+                       NSPoint(x: bounds.width, y: bounds.height)]
+        return corners.map { hypot($0.x - o.x, $0.y - o.y) }.max() ?? bounds.width
+    }
+
     // MARK: Drawing
 
     private var loggedFirstDraw = false
@@ -763,16 +2261,25 @@ public final class CodeSaverView: ScreenSaverView {
         if !loggedFirstDraw {
             loggedFirstDraw = true
             viewLog.notice("first draw — bounds \(Double(self.bounds.width), privacy: .public)×\(Double(self.bounds.height), privacy: .public)")
+            BoomDiag.log(String(format: "%@ first draw — bounds %.0f×%.0f, window origin (%.0f, %.0f), scale %.1f",
+                                diagID, bounds.width, bounds.height,
+                                window?.frame.origin.x ?? -1, window?.frame.origin.y ?? -1,
+                                window?.backingScaleFactor ?? -1))
         }
         ensureSetup()
-        bgColor.setFill()
-        bounds.fill()
+        if !metalActive {
+            bgColor.setFill()
+            bounds.fill()
+        }
         guard !rows.isEmpty else { return }
 
-        drawRows()
-        drawVignette()
-        if clockVisible { drawClock() }
-        drawSpinnerPanel()
+        // The first draw beats the first animation tick — without this, the
+        // normal saver (spinner and all) flashes on every display for a few
+        // frames before the boom session attaches and drops the curtain.
+        if !handoffChecked, window != nil { attachBoomSession() }
+
+        // Everything renders on the CAMetalLayer subview; this view's own
+        // content is the black base (and the whole story if Metal ever dies).
     }
 
     // MARK: Clock
@@ -780,6 +2287,15 @@ public final class CodeSaverView: ScreenSaverView {
     /// Bottom edge of the clock as last drawn; the spinner panel's safe area
     /// is measured from this.
     private var clockBottom: CGFloat = 0
+
+    /// Where the clock's bottom will land before it has ever been drawn:
+    /// mirrors buildClockCache's row count and step math.
+    private func predictedClockBottom() -> CGFloat {
+        let f = monoFont(bounds.height * clockScale, .regular)
+        let step = (f.ascender - f.descender) * 0.9
+        let rowCount = CGFloat(5 + 2 * clockVPadRows)
+        return bounds.height * clockTopFrac + rowCount * step
+    }
 
     private static func dateFmt(_ pattern: String) -> DateFormatter {
         let f = DateFormatter()
@@ -819,26 +2335,10 @@ public final class CodeSaverView: ScreenSaverView {
                   bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
     }
 
-    /// Blits a cached CGImage under a positive y-scale — a flipped CTM knocks
-    /// CG off its fast path (measured 10x slower). The rect is snapped to
-    /// device pixels and sized exactly to the image: a fractional origin or
-    /// any scaling forces per-pixel resampling (measured ~8x slower).
-    private func blit(_ image: CGImage, in rect: NSRect) {
-        guard let cg = NSGraphicsContext.current?.cgContext else { return }
-        let scale = window?.backingScaleFactor ?? 2
-        let w = CGFloat(image.width) / scale
-        let h = CGFloat(image.height) / scale
-        let x = (rect.origin.x * scale).rounded() / scale
-        let yTop = (rect.origin.y * scale).rounded() / scale
-        cg.saveGState()
-        cg.interpolationQuality = .none
-        cg.translateBy(x: 0, y: bounds.height)
-        cg.scaleBy(x: 1, y: -1)
-        cg.draw(image, in: NSRect(x: x, y: bounds.height - yTop - h, width: w, height: h))
-        cg.restoreGState()
-    }
 
-    private func drawClock() {
+    /// Refreshes the 1 Hz clock raster; shared by the CG path and the Metal
+    /// quad builder.
+    private func ensureClockCache() -> ClockCache? {
         let date = Date()
         // Gregorian explicitly: day/year numerics must match the POSIX-locale
         // month/weekday names (a Buddhist-calendar system yields year 2569).
@@ -856,10 +2356,9 @@ public final class CodeSaverView: ScreenSaverView {
             clockCache = buildClockCache(key: key, date: date, components: c,
                                          hourStr: hourStr, minStr: minStr, secStr: secStr, scale: scale)
         }
-        guard let cache = clockCache else { return }
-        blit(cache.image, in: cache.blitRect)
-        clockBottom = cache.bottom
+        return clockCache
     }
+
 
     private func buildClockCache(key: String, date: Date, components c: DateComponents,
                                  hourStr: String, minStr: String, secStr: String,
@@ -1037,124 +2536,14 @@ public final class CodeSaverView: ScreenSaverView {
         ":": ["0", "1", "0", "1", "0"],
     ]
 
-    private func drawRows() {
-        let maxY = bounds.height - lineH
-        for (i, segs) in rows.enumerated() {
-            let y = topInset + CGFloat(i) * lineH
-            if y > maxY { break }
-            for seg in segs {
-                guard !seg.chars.isEmpty, seg.typed > 0 || seg.isActive else { continue }
-                segmentString(seg).draw(at: NSPoint(x: leftInset + CGFloat(seg.xCol) * charW, y: y))
-            }
-        }
-    }
 
-    private func segmentString(_ slot: Segment) -> NSAttributedString {
-        let visible = slot.typed
-        let result = NSMutableAttributedString()
-
-        let age = max(0, now - slot.settledAt)
-        var baseAlpha: CGFloat = slot.isActive
-            ? codeActiveAlpha
-            : codeSettledFloor + codeSettledBoost * CGFloat(exp(-age / Double(codeFadeTau)))
-        if slot.isComment { baseAlpha *= codeCommentDim }
-        let tinted = NSColor(
-            deviceRed: min(1, 0.58 + slot.tint * 0.3),
-            green: 0.65,
-            blue: min(1, 0.72 - slot.tint),
-            alpha: 1
-        )
-        let settledColor = tinted.withAlphaComponent(baseAlpha)
-
-        // Heat: 1 while typing, cools quickly after the line completes.
-        let heat = slot.isActive ? 1.0 : exp(-max(0, now - slot.typingDoneAt) / 0.55)
-        let trailLen = 8
-        let cutoff = heat > 0.03 ? max(0, visible - trailLen) : visible
-
-        if cutoff > 0 {
-            result.append(NSAttributedString(
-                string: String(slot.chars[0..<cutoff]),
-                attributes: [.font: font!, .foregroundColor: settledColor]
-            ))
-        }
-        if cutoff < visible {
-            for k in cutoff..<visible {
-                let d = visible - 1 - k
-                let b = min(1, pow(0.70, CGFloat(d)) * CGFloat(heat) * codeGlowStrength)
-                var attrs: [NSAttributedString.Key: Any] = [
-                    .font: font!,
-                    .foregroundColor: settledColor.mixed(with: glowText, 0.85 * b)
-                        .withAlphaComponent(baseAlpha + (1 - baseAlpha) * b),
-                ]
-                if b > 0.12 {
-                    let shadow = NSShadow()
-                    shadow.shadowColor = glowHalo.withAlphaComponent(0.85 * b)
-                    shadow.shadowBlurRadius = font.pointSize * 0.6 * b
-                    shadow.shadowOffset = .zero
-                    attrs[.shadow] = shadow
-                }
-                result.append(NSAttributedString(string: String(slot.chars[k]), attributes: attrs))
-            }
-        }
-
-        if slot.isActive || now - slot.typingDoneAt < 0.3 {
-            let shadow = NSShadow()
-            shadow.shadowColor = glowHalo.withAlphaComponent(0.9)
-            shadow.shadowBlurRadius = font.pointSize * 0.7
-            shadow.shadowOffset = .zero
-            result.append(NSAttributedString(string: "\u{258A}", attributes: [
-                .font: font!,
-                .foregroundColor: cursorColor.withAlphaComponent(0.85),
-                .shadow: shadow,
-            ]))
-        }
-        return result
-    }
 
     // The radial gradient rasterizes every pixel per frame (~72ms at 5K —
     // measured as 72% of total frame cost), so it's cached as an exact
     // backing-pixel CGImage and blitted. The image is radially symmetric, so
     // the flipped context doesn't matter.
-    private var vignetteImage: CGImage?
-    private var vignetteKey = ""
 
-    private func drawVignette() {
-        guard vignetteMax > 0.01 else { return }
-        let scale = window?.backingScaleFactor ?? 2
-        let pw = Int(bounds.width * scale), ph = Int(bounds.height * scale)
-        guard pw > 0, ph > 0 else { return }
-        let key = "\(pw)x\(ph)@\(vignetteMax)"
-        if key != vignetteKey || vignetteImage == nil {
-            vignetteImage = Self.renderVignette(pw: pw, ph: ph, maxAlpha: vignetteMax)
-            vignetteKey = key
-        }
-        guard let img = vignetteImage else { return }
-        blit(img, in: bounds)
-    }
 
-    private static func renderVignette(pw: Int, ph: Int, maxAlpha: CGFloat) -> CGImage? {
-        let cs = CGColorSpaceCreateDeviceRGB()
-        // BGRA little-endian: the backing store's native layout, so the
-        // per-frame blit is a copy, not a 15-megapixel format conversion.
-        let bitmapInfo = CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
-        guard let ctx = CGContext(data: nil, width: pw, height: ph, bitsPerComponent: 8,
-                                  bytesPerRow: 0, space: cs,
-                                  bitmapInfo: bitmapInfo),
-              let gradient = CGGradient(colorsSpace: cs, colors: [
-                  CGColor(red: 0, green: 0, blue: 0, alpha: 0),
-                  CGColor(red: 0, green: 0, blue: 0, alpha: maxAlpha * 0.12),
-                  CGColor(red: 0, green: 0, blue: 0, alpha: maxAlpha),
-              ] as CFArray, locations: [0, 0.55, 1])
-        else { return nil }
-        let center = CGPoint(x: CGFloat(pw) / 2, y: CGFloat(ph) / 2)
-        // Matches NSGradient's radial draw(in:relativeCenterPosition: .zero):
-        // the end color lands exactly at the corners.
-        let radius = hypot(CGFloat(pw), CGFloat(ph)) / 2
-        ctx.drawRadialGradient(gradient, startCenter: center, startRadius: 0,
-                               endCenter: center, endRadius: radius,
-                               options: [.drawsAfterEndLocation])
-        return ctx.makeImage()
-    }
 
     // MARK: Spinner rendering
 
@@ -1192,12 +2581,8 @@ public final class CodeSaverView: ScreenSaverView {
         }
     }
 
-    private func workingString() -> NSAttributedString {
-        let result = NSMutableAttributedString()
-        let elapsed = now - phaseStart
-        let verb = verbs[verbIndex]
-
-        // Animated glyph: cosine phase, period 2000 ms, eased at both ends.
+    /// Animated glyph: cosine phase, period 2000 ms, eased at both ends.
+    private func appendSpinnerGlyph(to result: NSMutableAttributedString) {
         let spinnerPhase = (1 - cos(2 * Double.pi * now / 2.0)) / 2
         let frame = Self.spinnerFrames[Int((spinnerPhase * 5).rounded())]
         let glyphShadow = NSShadow()
@@ -1209,7 +2594,14 @@ public final class CodeSaverView: ScreenSaverView {
             .foregroundColor: accent.mixed(with: accentHot, 0.3),
             .shadow: glyphShadow,
         ]))
+    }
 
+    private func workingString() -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        let elapsed = now - phaseStart
+        let verb = verbs[verbIndex]
+
+        appendSpinnerGlyph(to: result)
         appendGlowingVerb(verb.ing + "\u{2026}", to: result, intensity: 1.0)
 
         // API latency: nothing but the spinner and the verb until the first
@@ -1244,22 +2636,21 @@ public final class CodeSaverView: ScreenSaverView {
         ])
     }
 
-    private func drawSpinnerPanel() {
-        let text = spinnerAttributedString()
-        let size = text.size()
-        let padH: CGFloat = uiFont.pointSize * 1.7
-        let padV: CGFloat = uiFont.pointSize * 1.05
-        // Who owns the top of the screen decides where the panel centers:
-        // our clock here → center in what remains below it; our clock enabled
-        // but on another display → nothing owns the top (enabling our clock
-        // implies the user disabled the system one), so center exactly; clock
-        // disabled → the system lock-screen clock owns the top, center in
-        // what remains. The 17% is not the clock's measured extent (it spans
-        // roughly 22% of screen height) but its visual weight: reserving 17%
-        // is what makes the panel *feel* centered under it.
+    /// Where the panel's text sits: who owns the top of the screen decides
+    /// where it centers — our clock here → center in what remains below it;
+    /// our clock enabled but on another display → nothing owns the top, so
+    /// center exactly; clock disabled → the system lock-screen clock owns
+    /// the top (its 17% reservation is visual weight, not measured extent).
+    /// Shared by the CG path and the Metal panel builder.
+    private func spinnerTextOrigin(for size: NSSize) -> NSPoint {
         let textY: CGFloat
         if clockVisible {
-            let safeTop = clockBottom + lineH * panelGapMult
+            // Until the clock has drawn once (it fades in late during the
+            // boom), clockBottom is unset — predict it from the same metrics
+            // buildClockCache uses, so the teleport blip and landing agree
+            // with where the panel will actually live.
+            let effectiveClockBottom = clockBottom > 0 ? clockBottom : predictedClockBottom()
+            let safeTop = effectiveClockBottom + lineH * panelGapMult
             // Bias is expressed in clock-cell units so it scales with the clock.
             textY = safeTop + (bounds.height - safeTop - size.height) / 2
                 + bounds.height * clockScale * panelBias
@@ -1270,24 +2661,70 @@ public final class CodeSaverView: ScreenSaverView {
             textY = safeTop + (bounds.height - safeTop - size.height) / 2
                 + bounds.height * clockScale * panelBias
         }
-        let panel = NSRect(
-            x: (bounds.width - size.width) / 2 - padH,
-            y: textY - padV,
-            width: size.width + padH * 2,
-            height: size.height + padV * 2
-        )
-
-        drawPanelBackdrop(panel)
-
-        text.draw(at: NSPoint(x: (bounds.width - size.width) / 2, y: textY))
+        return NSPoint(x: (bounds.width - size.width) / 2, y: textY)
     }
+
+
+    /// Where the armed idle line sits: tooltip-style, right and below the
+    /// detonation origin (the mouse's resting spot) — flipping left or up
+    /// when the panel would run off the screen. Measures the finished line
+    /// (there is no countdown anymore), so the anchor never moves while the
+    /// verb types out.
+    private func armedTextOrigin() -> NSPoint {
+        let o = resolvedBoomOrigin
+        let size = idleLineString().size()
+        var x = o.x + 18
+        if x + size.width + 14 > bounds.width { x = o.x - 18 - size.width }
+        var y = o.y + 16
+        if y + size.height + 8 > bounds.height { y = o.y - 16 - size.height }
+        return NSPoint(x: x, y: y)
+    }
+
+    /// The verb the idle line shows — a real spinner verb, shared with the
+    /// helper through the handoff so the crossfade is invisible.
+    private var armedVerb = "Idling"
+
+    /// The idle line: glyph + glowing verb. `typed` truncates the verb for
+    /// the armed intro's type-out (nil = the finished line).
+    private func idleLineString(typed: Int? = nil) -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        appendSpinnerGlyph(to: result)
+        let full = armedVerb + "\u{2026}"
+        let text = typed.map { String(full.prefix(max(0, $0))) } ?? full
+        if !text.isEmpty {
+            appendGlowingVerb(text, to: result, intensity: 1.0)
+        }
+        return result
+    }
+
+    /// The idle line with its tooltip panel — black, bordered, exactly what
+    /// the helper draws over the desktop.
+    private func drawIdleLine(_ text: NSAttributedString, at origin: NSPoint) {
+        let size = text.size()
+        let path = NSBezierPath(roundedRect: NSRect(x: origin.x - 14, y: origin.y - 8,
+                                                    width: size.width + 28,
+                                                    height: size.height + 16),
+                                xRadius: 8, yRadius: 8)
+        NSColor.black.withAlphaComponent(0.75).setFill()
+        path.fill()
+        NSColor.white.withAlphaComponent(0.12).setStroke()
+        path.lineWidth = 1
+        path.stroke()
+        text.draw(at: origin)
+    }
+
+
+
 
     // The panel's fill + stroke + 26px drop shadow depend only on its size,
     // which changes about once a second — cache the raster, blit per frame.
     private var panelCacheImage: CGImage?
     private var panelCacheKey = ""
 
-    private func drawPanelBackdrop(_ panel: NSRect) {
+
+    /// Refreshes the size-keyed panel raster (fill + stroke + drop shadow);
+    /// shared by the CG path and the Metal panel builder.
+    private func ensurePanelBackdropImage(_ panel: NSRect) {
         let shadowPad: CGFloat = 40
         let scale = window?.backingScaleFactor ?? 2
         let key = "\(Int(panel.width))x\(Int(panel.height))@\(scale)"
@@ -1320,7 +2757,6 @@ public final class CodeSaverView: ScreenSaverView {
             }
             panelCacheKey = key
         }
-        guard let img = panelCacheImage else { return }
-        blit(img, in: panel.insetBy(dx: -shadowPad, dy: -shadowPad))
     }
 }
+

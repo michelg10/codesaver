@@ -71,10 +71,25 @@ rm -rf "$APP" "$(dirname "$APP")/CodeSaverExtension.appex"
 
 # Reinstalling breaks the active screen-saver selection (the wallpaper store's
 # binding goes stale with the new bundle), so re-activate unless told not to.
+# Activation races pluginkit registration right after install — an unbound
+# selection makes the saver launch as pure black — so retry with the
+# registration nudged in between.
 if [[ ${NO_ACTIVATE:-0} != 1 ]]; then
-  /Applications/CodeSaver.app/Contents/MacOS/CodeSaver --activate 2>/dev/null \
-    && echo "── re-activated as the current screensaver" \
-    || echo "── auto-activation failed — click “Enable as Screensaver” in the app"
+  ACTIVATED=0
+  for attempt in 1 2 3; do
+    if /Applications/CodeSaver.app/Contents/MacOS/CodeSaver --activate 2>/dev/null; then
+      ACTIVATED=1
+      break
+    fi
+    pluginkit -a /Applications/CodeSaver.app/Contents/PlugIns/CodeSaverExtension.appex 2>/dev/null || true
+    sleep 2
+  done
+  if [[ $ACTIVATED == 1 ]]; then
+    echo "── re-activated as the current screensaver"
+  else
+    echo "── auto-activation failed — click “Enable as Screensaver” in the app"
+    echo "   (until then the system saver selection is unbound and shows BLACK)"
+  fi
 fi
 
 echo "── installed /Applications/CodeSaver.app"

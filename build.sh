@@ -5,7 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-SRC=(appex/CodeSaverExtension/CodeSaverView.swift appex/CodeSaver/Helpers/Logger.swift)
+SRC=(appex/CodeSaverExtension/CodeSaverView.swift appex/CodeSaverExtension/BoomCore.swift appex/CodeSaverExtension/BoomMetal.swift appex/CodeSaver/Helpers/Logger.swift)
 BUILD=build
 BUNDLE=$BUILD/CodeSaver.saver
 SDK=$(xcrun --show-sdk-path)
@@ -29,7 +29,7 @@ for ARCH in arm64 x86_64; do
     -c "${SRC[@]}" -o "$BUILD/CodeSaverView-$ARCH.o"
   xcrun clang -bundle -target "$ARCH-apple-macos13.0" -isysroot "$SDK" \
     "$BUILD/CodeSaverView-$ARCH.o" \
-    -framework ScreenSaver -framework AppKit -framework QuartzCore \
+    -framework ScreenSaver -framework AppKit -framework QuartzCore -framework Metal \
     -L "$SDK/usr/lib/swift" -L /usr/lib/swift \
     -Xlinker -rpath -Xlinker /usr/lib/swift \
     -o "$BUILD/CodeSaver-$ARCH"
@@ -49,9 +49,16 @@ echo "── built $BUNDLE"
 echo "── compiling preview harness…"
 swiftc -O -parse-as-library -module-name CodeSaverPreview \
   "${SRC[@]}" Sources/PreviewMain.swift \
-  -framework ScreenSaver -framework AppKit -framework QuartzCore \
+  -framework ScreenSaver -framework AppKit -framework QuartzCore -framework Metal \
   -o "$BUILD/preview"
 echo "── built $BUILD/preview  (run it for a live window)"
+
+# --- Igniter helper (idle watcher → boom → screensaver) ----------------------
+echo "── compiling igniter helper…"
+swiftc -O -parse-as-library helper/Igniter.swift \
+  -framework AppKit -framework IOKit -framework ScreenCaptureKit \
+  -o "$BUILD/codesaver-igniter"
+echo "── built $BUILD/codesaver-igniter  (helper/install.sh installs the LaunchAgent)"
 
 # --- Install -----------------------------------------------------------------
 if [[ ${1:-} == install ]]; then

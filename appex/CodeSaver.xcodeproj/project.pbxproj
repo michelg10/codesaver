@@ -14,6 +14,10 @@
 		1A000005000000000000000A /* CodeSaverView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A000005000000000000000B /* CodeSaverView.swift */; };
 		1A0000B0000000000000000A /* CodeSaverConfigurationViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000B1000000000000000B /* CodeSaverConfigurationViewController.swift */; };
 		1A0000A1000000000000000A /* CodeSaverView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A000005000000000000000B /* CodeSaverView.swift */; };
+		1A0000E1000000000000000A /* BoomCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000E0000000000000000B /* BoomCore.swift */; };
+		1A0000E2000000000000000A /* BoomCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000E0000000000000000B /* BoomCore.swift */; };
+		1A0000F1000000000000000A /* BoomMetal.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000F0000000000000000B /* BoomMetal.swift */; };
+		1A0000F2000000000000000A /* BoomMetal.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000F0000000000000000B /* BoomMetal.swift */; };
 		1A0000D1000000000000000A /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 1A0000D0000000000000000B /* Assets.xcassets */; };
 		1A0000A4000000000000000A /* corpus.bin in Resources */ = {isa = PBXBuildFile; fileRef = 1A0000A2000000000000000B /* corpus.bin */; };
 		1A0000C1000000000000000A /* corpus-index.json in Resources */ = {isa = PBXBuildFile; fileRef = 1A0000C0000000000000000B /* corpus-index.json */; };
@@ -63,6 +67,8 @@
 		1A000003000000000000000B /* CodeSaverExtension.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodeSaverExtension.swift; sourceTree = "<group>"; };
 		1A000004000000000000000B /* CodeSaverViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodeSaverViewController.swift; sourceTree = "<group>"; };
 		1A000005000000000000000B /* CodeSaverView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodeSaverView.swift; sourceTree = "<group>"; };
+		1A0000E0000000000000000B /* BoomCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BoomCore.swift; sourceTree = "<group>"; };
+		1A0000F0000000000000000B /* BoomMetal.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BoomMetal.swift; sourceTree = "<group>"; };
 		1A0000B1000000000000000B /* CodeSaverConfigurationViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodeSaverConfigurationViewController.swift; sourceTree = "<group>"; };
 		1A0000A2000000000000000B /* corpus.bin */ = {isa = PBXFileReference; lastKnownFileType = text; path = Resources/corpus.bin; sourceTree = "<group>"; };
 		1A0000C0000000000000000B /* corpus-index.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "Resources/corpus-index.json"; sourceTree = "<group>"; };
@@ -146,6 +152,8 @@
 				1A000003000000000000000B /* CodeSaverExtension.swift */,
 				1A000004000000000000000B /* CodeSaverViewController.swift */,
 				1A000005000000000000000B /* CodeSaverView.swift */,
+				1A0000E0000000000000000B /* BoomCore.swift */,
+				1A0000F0000000000000000B /* BoomMetal.swift */,
 				1A0000B1000000000000000B /* CodeSaverConfigurationViewController.swift */,
 				1A0000A2000000000000000B /* corpus.bin */,
 				1A0000C0000000000000000B /* corpus-index.json */,
@@ -324,6 +332,8 @@
 				1A000062000000000000000A /* PreviewView.swift in Sources */,
 				1A000063000000000000000A /* PreviewViewRepresentable.swift in Sources */,
 				1A0000A1000000000000000A /* CodeSaverView.swift in Sources */,
+				1A0000E2000000000000000A /* BoomCore.swift in Sources */,
+				1A0000F2000000000000000A /* BoomMetal.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -334,6 +344,8 @@
 				1A000003000000000000000A /* CodeSaverExtension.swift in Sources */,
 				1A000004000000000000000A /* CodeSaverViewController.swift in Sources */,
 				1A000005000000000000000A /* CodeSaverView.swift in Sources */,
+				1A0000E1000000000000000A /* BoomCore.swift in Sources */,
+				1A0000F1000000000000000A /* BoomMetal.swift in Sources */,
 				1A0000B0000000000000000A /* CodeSaverConfigurationViewController.swift in Sources */,
 				1A000067000000000000000A /* Logger.swift in Sources */,
 			);
