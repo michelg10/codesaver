@@ -372,6 +372,13 @@ final class Igniter {
     private var cornerArmed = true
     private var lastLaunch = Date.distantPast
     private var pendingLaunch = false
+    private var saverWasRunning = false
+    /// Stamped when the saver leaves the screen. A dismissal can leave no
+    /// HID trace (Touch ID unlock; the secure-input lock screen swallows
+    /// the wake event), so by the raw HID clock the user still looks
+    /// "away" — and a corner-launched saver watched past idleTimeout
+    /// would relaunch on the very next tick.
+    private var lastSaverExit = Date.distantPast
     /// After a failed capture (permission denied), don't keep re-triggering
     /// the TCC prompt — retry occasionally.
     private var captureBackoffUntil = Date.distantPast
@@ -387,7 +394,13 @@ final class Igniter {
         // After a permission-denied capture, captures back off — but corner
         // HITS keep working (the saver just starts without a boom).
         let captureOK = Date() >= captureBackoffUntil
-        let idle = idleSeconds()
+        let saverUp = saverIsRunning()
+        if saverWasRunning, !saverUp { lastSaverExit = Date() }
+        saverWasRunning = saverUp
+        // Idle as this agent scores it: a saver dismissal ends the idle
+        // episode even when it left no HID trace, so every launch decision
+        // starts a fresh clock from the moment the saver went away.
+        let idle = min(idleSeconds(), Date().timeIntervalSince(lastSaverExit))
 
         // The user is here: no captures should exist. Corner captures get a
         // grace window (the saver may be about to consume them), then go too.
@@ -409,7 +422,7 @@ final class Igniter {
             // the moment of launch (fresh by construction) — no proactive
             // scouting at all in this mode. One shot per idle episode.
             if idle >= timeout, !idleLaunched, !capturing,
-               !displayKeptAwake(), !saverIsRunning() {
+               !displayKeptAwake(), !saverUp {
                 idleLaunched = true
                 triggerSaver(kind: "idle")
                 return
@@ -418,7 +431,7 @@ final class Igniter {
                   !displayKeptAwake(),
                   !idleCaptured
                       || Date().timeIntervalSince(lastIdleCapture) > idleRefreshEvery,
-                  !saverIsRunning() {
+                  !saverUp {
             // Proactive scout (macOS owns the trigger): capture once the
             // user has settled, then refresh every few minutes while they
             // stay away — never once the saver itself is on the glass.
