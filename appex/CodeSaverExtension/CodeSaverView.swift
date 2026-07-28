@@ -7,8 +7,25 @@ private let viewLog = AppexLog.logger("View")
 
 // MARK: - Helpers
 
+/// The scene's random stream (SplitMix64), seeded from system entropy at
+/// launch — so the saver is as random as it ever was — but *reseedable*, so
+/// the preview harness can replay a run frame-for-frame. Scrubbing a
+/// timeline is only useful if the two frames you compare differ by the knob
+/// you moved and nothing else. Main thread only, like the rest of the view.
+private struct SaverRNG: RandomNumberGenerator {
+    var state: UInt64
+    mutating func next() -> UInt64 {
+        state = state &+ 0x9E37_79B9_7F4A_7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        return z ^ (z >> 31)
+    }
+}
+private var saverRNG = SaverRNG(state: UInt64.random(in: 0...UInt64.max))
+
 @inline(__always) private func rand(_ a: Double, _ b: Double) -> Double {
-    a < b ? Double.random(in: a...b) : a
+    a < b ? Double.random(in: a...b, using: &saverRNG) : a
 }
 
 @inline(__always) private func clampd(_ v: Double, _ a: Double, _ b: Double) -> Double {
@@ -17,14 +34,14 @@ private let viewLog = AppexLog.logger("View")
 
 /// Box-Muller normal sample.
 private func gaussRand(mean: Double, sigma: Double) -> Double {
-    let u1 = Double.random(in: 1e-9...1)
-    let u2 = Double.random(in: 0...1)
+    let u1 = Double.random(in: 1e-9...1, using: &saverRNG)
+    let u2 = Double.random(in: 0...1, using: &saverRNG)
     return mean + sigma * sqrt(-2 * log(u1)) * cos(2 * .pi * u2)
 }
 
 /// base + Exp(mean), capped: most samples land near base + mean, with a long tail.
 private func expTail(base: Double, mean: Double, cap: Double) -> Double {
-    min(cap, base - log(Double.random(in: 1e-9..<1)) * mean)
+    min(cap, base - log(Double.random(in: 1e-9..<1, using: &saverRNG)) * mean)
 }
 
 private extension NSColor {
@@ -291,7 +308,7 @@ final class BoomSession {
             fields: fields)
         let session = BoomSession(core: core, backdrops: backdrops,
                                   backdropBuffers: buffers, kind: kind,
-                                  verb: verbs.randomElement() ?? "Idling")
+                                  verb: verbs.randomElement(using: &saverRNG) ?? "Idling")
         shared = session
         BoomDiag.log(String(format: "session load: kind=%@ displays=%d mapped-raw=%d took %.1f ms",
                             kind.rawValue, fields.count, buffers.count,
@@ -414,6 +431,15 @@ public final class CodeSaverView: ScreenSaverView {
     public var boomGap = BoomCore.gapBase * BoomCore.tempo     // detonation → second front, s
     public var boomWave2 = BoomCore.wave2Base * BoomCore.tempo // second front's sweep, s
     public var boomDebrisDensity: Double = 0.065 // fling chance per revealed cell
+
+    /// How far the first front knocks the desktop down as it pixelates it:
+    /// the mosaic is painted at this fraction of the captured color (1 = raw
+    /// desktop, 0 = black), code spots dimming in step. 0.82 — an 18% cut —
+    /// sits the mosaic just under the sharp desktop still ahead of the front,
+    /// so the boundary reads as a conversion rather than a lighting change.
+    /// CODESAVER_MOSAIC_DIM overrides it for snapshot sweeps.
+    public var boomMosaicDim: Double =
+        ProcessInfo.processInfo.environment["CODESAVER_MOSAIC_DIM"].flatMap(Double.init) ?? 0.82
 
     /// Slow-motion INSPECTION lever only — dilating the clock spreads the
     /// 60 Hz sim ticks over more wall time, so cell-quantized motion drops
@@ -685,12 +711,12 @@ public final class CodeSaverView: ScreenSaverView {
         for (i, (_, blocks)) in repos.enumerated() {
             let ideal = Int((Double(budget) * weights[i] / totalW).rounded())
             let quota = min(blocks.count, min(cap, max(1, ideal)))
-            for pair in blocks.shuffled().prefix(quota)
+            for pair in blocks.shuffled(using: &saverRNG).prefix(quota)
             where pair.count == 2 && pair[0] >= 0 && pair[1] > 0 {
                 result.append(pair[0]..<(pair[0] + pair[1]))
             }
         }
-        return result.shuffled()
+        return result.shuffled(using: &saverRNG)
     }
 
     /// Swaps part of the session subset for freshly drawn blocks. Slots are
@@ -698,7 +724,7 @@ public final class CodeSaverView: ScreenSaverView {
     private func rotateSubset(fraction: Double) {
         guard corpusData != nil, !fullIndex.isEmpty, blockRefs.count >= 8 else { return }
         let fresh = chooseSubset(budget: max(8, Int(Double(blockRefs.count) * fraction)))
-        let slots = Array(0..<blockRefs.count).shuffled().prefix(fresh.count)
+        let slots = Array(0..<blockRefs.count).shuffled(using: &saverRNG).prefix(fresh.count)
         for (slot, r) in zip(slots, fresh) {
             blockRefs[slot] = r
             decodedBlocks[slot] = nil
@@ -936,6 +962,7 @@ public final class CodeSaverView: ScreenSaverView {
         var frame = BoomMetalRenderer.FrameInput()
         frame.holdBlack = introHoldingCurtain
         frame.reveal = armedRevealProgress
+        frame.mosaicDim = boomMosaicDim
         frame.vignetteMax = Double(vignetteMax)
         switch intro {
         case .none:
@@ -1123,7 +1150,8 @@ public final class CodeSaverView: ScreenSaverView {
     /// what makes the blast read as the statusline's own energy escaping.
     private var armedLineCenter: NSPoint {
         let o = resolvedBoomOrigin
-        return NSPoint(x: o.x + 6.5, y: o.y + 10)
+        // Centre of the arrow's silhouette, tip-relative (11.5 × 18.9).
+        return NSPoint(x: o.x + 5.75, y: o.y + 9.5)
     }
 
     /// Idle runs center the line on the cursor (clamped on-screen, whole
@@ -1164,10 +1192,12 @@ public final class CodeSaverView: ScreenSaverView {
             }
             if let raster = cursorRaster {
                 metal.setUITexture("cursor", image: raster)
-                // Tip = hotspot at (1,1); the recorded mouse point is the tip.
+                // The recorded mouse point is the tip, so the raster hangs off
+                // it by wherever the tip sits inside the image.
                 frame.quads.append(.init(
                     key: "cursor",
-                    rect: CGRect(x: o.x - 1, y: o.y - 1,
+                    rect: CGRect(x: o.x - Self.cursorTip.x,
+                                 y: o.y - Self.cursorTip.y,
                                  width: Self.cursorSize.width,
                                  height: Self.cursorSize.height),
                     alpha: Double(armedRevealProgress)))
@@ -1186,24 +1216,42 @@ public final class CodeSaverView: ScreenSaverView {
                           metal: metal, scale: scale)
     }
 
-    private static let cursorSize = NSSize(width: 15, height: 22)
+    private static let cursorSize = NSSize(width: 16, height: 24)
+
+    /// Where the arrow's point sits inside the raster. Not (0,0): the tip is
+    /// a MITERED corner, and its spike runs ~2.2 px up and left of the point
+    /// itself — start at the edge and the sharp end gets clipped off. Whole
+    /// pixels, so the arrow's vertical left edge lands ON a pixel column
+    /// instead of straddling two and smearing the whole glyph.
+    private static let cursorTip = NSPoint(x: 3, y: 3)
 
     /// The macOS arrow pointer, drawn by hand — NSCursor.arrow.image is
     /// EMPTY outside a real UI session (verified: 0×0, no reps, both in the
     /// headless harness and remote-view hosts), so the fake cursor is a
-    /// vector twin: black fill, white outline, tip at (1,1).
+    /// vector twin: black fill, white outline, tip at `cursorTip`.
     private func makeCursorRaster(scale: CGFloat) -> CGImage? {
         rasterUI(size: Self.cursorSize, scale: scale) {
+            // System-pointer proportions, measured off a screenshot: the head
+            // is a 45° wedge out to the shoulder at (11.5, 11.4), then the
+            // notch and the leg down to (6.8, 18.9). Tip-relative, y down.
             let pts: [(CGFloat, CGFloat)] = [
-                (1, 1), (1, 18.5), (5.2, 14.6), (7.8, 20.9), (10.7, 19.7),
-                (8.1, 13.5), (13.7, 13.5),
+                (0, 0), (0, 16.5), (4.2, 12.4), (6.8, 18.9),
+                (9.4, 17.8), (6.8, 11.4), (11.5, 11.4),
             ]
+            let t = Self.cursorTip
             let p = NSBezierPath()
-            p.move(to: NSPoint(x: pts[0].0, y: pts[0].1))
-            for pt in pts.dropFirst() { p.line(to: NSPoint(x: pt.0, y: pt.1)) }
+            p.move(to: NSPoint(x: t.x + pts[0].0, y: t.y + pts[0].1))
+            for pt in pts.dropFirst() {
+                p.line(to: NSPoint(x: t.x + pt.0, y: t.y + pt.1))
+            }
             p.close()
-            p.lineWidth = 2.2
-            p.lineJoinStyle = .round
+            // Miter, not round: a pointer's tip is a POINT. Rounding it (and
+            // the shoulder, and the leg) sanded every corner into a nub —
+            // the silhouette was right and it still read as not-the-cursor.
+            // 1.8 wide leaves 0.9 of white outside the black, like the real
+            // one; 2.2 wore a fat halo.
+            p.lineWidth = 1.8
+            p.lineJoinStyle = .miter
             NSColor.white.setStroke()
             p.stroke()
             NSColor.black.setFill()
@@ -1432,8 +1480,9 @@ public final class CodeSaverView: ScreenSaverView {
             // Tick once right now: session attach and Metal staging start
             // immediately instead of waiting out the first framework frame
             // (or the 1 s fallback probe). Overlapping drivers are safe —
-            // an extra tick just advances by dt ≈ 0.
-            tick()
+            // an extra tick just advances by dt ≈ 0. Not under the harness:
+            // there, frame N of the timeline must be exactly N driven steps.
+            if !externallyDriven { tick() }
             startFrameClock()
             startWatchdog()
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
@@ -1452,7 +1501,7 @@ public final class CodeSaverView: ScreenSaverView {
     private var watchdog: Timer?
 
     private func startWatchdog() {
-        guard watchdog == nil else { return }
+        guard !externallyDriven, watchdog == nil else { return }
         let t = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
             guard let self else { return }
             // A dead display link = our window is occluded (macOS suspends
@@ -1536,6 +1585,7 @@ public final class CodeSaverView: ScreenSaverView {
     }
 
     private func startFrameClock() {
+        guard !externallyDriven else { return }
         guard displayLinkBox == nil, legacyTimer == nil else { return }
         if #available(macOS 14.0, *) {
             let link = displayLink(target: self, selector: #selector(displayTick(_:)))
@@ -1696,15 +1746,15 @@ public final class CodeSaverView: ScreenSaverView {
     private func randomChunk() -> [[Character]] {
         let block: [String]
         if !blockRefs.isEmpty {
-            block = blockLines(at: Int.random(in: 0..<blockRefs.count))
+            block = blockLines(at: Int.random(in: 0..<blockRefs.count, using: &saverRNG))
         } else {
-            block = fallbackBlocks.randomElement() ?? []
+            block = fallbackBlocks.randomElement(using: &saverRNG) ?? []
         }
         guard !block.isEmpty else { return [] }
         var slice: [String]
         let want = Int(rand(8, 24))
         if block.count > want {
-            let start = Int.random(in: 0...(block.count - want))
+            let start = Int.random(in: 0...(block.count - want), using: &saverRNG)
             slice = Array(block[start..<(start + want)])
         } else {
             slice = block
@@ -1765,7 +1815,7 @@ public final class CodeSaverView: ScreenSaverView {
         w.carry = 0
         w.current = nil
         w.pauseUntil = now + rand(0.4, 2.0)
-        w.band = Int.random(in: 0..<bandCount)
+        w.band = Int.random(in: 0..<bandCount, using: &saverRNG)
         // Gaussian placement around the band anchor: most chunks sit near it,
         // but the tails push writers well outside their "column" so the layout
         // never reads as a grid.
@@ -1774,7 +1824,7 @@ public final class CodeSaverView: ScreenSaverView {
         w.col = max(0, min(cols - 36, Int(gaussRand(mean: anchor, sigma: spread))))
         var attempt = 0
         repeat {
-            w.row = Int.random(in: 0..<rowCount)
+            w.row = Int.random(in: 0..<rowCount, using: &saverRNG)
             attempt += 1
         } while attempt < 8 && writers.contains(where: { $0 !== w && $0.band == w.band && abs($0.row - w.row) < 6 })
     }
@@ -1866,7 +1916,7 @@ public final class CodeSaverView: ScreenSaverView {
             ?? expTail(base: 50, mean: 70, cap: 600)
         doneDuration = rand(7, 14)
         if freshVerb, !verbs.isEmpty {
-            var next = Int.random(in: 0..<verbs.count)
+            var next = Int.random(in: 0..<verbs.count, using: &saverRNG)
             if verbs.count > 1 && next == verbIndex { next = (next + 1) % verbs.count }
             verbIndex = next
         }
@@ -1904,7 +1954,7 @@ public final class CodeSaverView: ScreenSaverView {
                     : expTail(base: 2, mean: 2, cap: 20))
             }
             if now >= nextStatusRoll {
-                statusVisible = Double.random(in: 0...1) < 0.78
+                statusVisible = Double.random(in: 0...1, using: &saverRNG) < 0.78
                 nextStatusRoll = now + rand(3, 7)
             }
             // Entering the "coding…" state restarts its escalation clock.
@@ -1953,7 +2003,7 @@ public final class CodeSaverView: ScreenSaverView {
         intro = .armed
         armEndsAt = now + countdown
         armTotal = countdown
-        armedVerb = verbs.randomElement()?.ing ?? "Idling"
+        armedVerb = verbs.randomElement(using: &saverRNG)?.ing ?? "Idling"
         boomSession = nil
         boomCore = nil
         viewOriginCG = .zero
@@ -1965,10 +2015,105 @@ public final class CodeSaverView: ScreenSaverView {
         armIntro(atNormalized: boomOriginNorm, countdown: 1.2)
     }
 
+    // MARK: Preview harness driving
+    //
+    // The scrubbing previewer (Sources/PreviewMain.swift) owns the clock: it
+    // steps the sim one 1/30 s frame at a time, so "timeline position N" is
+    // exactly N runs of the same advance() the display link would have made,
+    // and a rewind is a reset plus N steps. Nothing below is compiled out of
+    // the shipping saver — it simply never sets `externallyDriven`.
+
+    /// Silences the view's own clocks (display link, occlusion fallback,
+    /// watchdog) and the click-to-detonate shortcut, so the harness can drive
+    /// every frame itself.
+    public var externallyDriven = false
+
+    /// The captured desktop this view stands in front of. Production reads it
+    /// off the session; the harness hands each display its own screenshot.
+    public var previewBackdrop: CGImage?
+
+    /// Rewinds to a fresh armed intro on `core`'s field `fieldIndex`: same
+    /// seed and same knobs in, same frames out. Re-lays the row/writer grid
+    /// too, so a resized window rebuilds cleanly.
+    ///
+    /// Every display's view shares ONE core, exactly as a session run does —
+    /// that's what makes the fronts sweep continuously across the wall
+    /// instead of each screen detonating its own private boom. Ticking it
+    /// from each view is safe: advance(to:) is absolute, so the second view
+    /// through a frame finds the work already done.
+    public func previewReset(core: BoomCore, fieldIndex: Int,
+                             arm: Double, seed: UInt64) {
+        saverRNG = SaverRNG(state: seed)
+        setupSize = .zero          // makes ensureSetup rebuild rows + writers
+        ensureSetup()
+        startCycle(freshVerb: true)
+        let field = core.fields[fieldIndex]
+        let size = field.grid.size
+        // Off-display origins land outside 0…1 — which is the point: only the
+        // display holding the cursor draws the armed line and the flash.
+        armIntro(atNormalized: CGPoint(
+            x: (core.params.originCG.x - field.originCG.x) / size.width,
+            y: (core.params.originCG.y - field.originCG.y) / size.height),
+                 countdown: arm)
+        boomCore = core
+        boomFieldIndex = fieldIndex
+        viewOriginCG = field.originCG
+    }
+
+    /// One driven frame: advance the sim, then paint it.
+    public func previewStep(by dt: Double) {
+        advance(by: dt)
+        previewRepaint()
+    }
+
+    /// Repaints the sim state as it stands — all a paint-only knob needs, and
+    /// the reason those knobs feel instant while sim knobs cost a replay.
+    public func previewRepaint() {
+        ensureMetalSurfaces()
+        invalidateForFrame()
+        renderMetalFrame()
+    }
+
+    /// Corpus lines for a harness-built core — the debris is made of these,
+    /// so a multi-display preview should scatter real code like production
+    /// rather than BoomCore's built-in fallback snippet.
+    public func previewCodeLines() -> [String] { boomCodeLines() }
+
+    /// Where the show stands, for the previewer's timeline readout.
+    public struct PreviewState {
+        public var beat: String        // armed / wave 1 / wave 2 / settling / steady
+        public var sinceDetonation: Double
+        public var front1: Double      // first front's sweep, 0…1
+        public var front2: Double      // second front's, 0…1
+        public var debris: Int         // particles still in flight
+    }
+
+    public var previewState: PreviewState {
+        guard intro != .none, let core = boomCore else {
+            let armLeft = intro == .armed ? armEndsAt - now : 0
+            return PreviewState(beat: intro == .armed
+                                    ? String(format: "armed  T−%.2f s", max(0, armLeft))
+                                    : "steady state",
+                                sinceDetonation: 0, front1: 0, front2: 0, debris: 0)
+        }
+        let t = now - boomStart
+        let f1 = clampd(t / core.params.wave1, 0, 1)
+        let f2 = clampd((t - core.params.gap) / core.params.wave2, 0, 1)
+        let flying = core.particles.reduce(0) { $0 + ($1.settled ? 0 : 1) }
+        let beat: String
+        if f1 < 1 { beat = "wave 1 — pixelating" }
+        else if f2 < 1 { beat = "wave 2 — wiping to black" }
+        else if flying > 0 { beat = "debris settling" }
+        else { beat = "steady state" }
+        return PreviewState(beat: beat, sinceDetonation: t,
+                            front1: f1, front2: f2, debris: flying)
+    }
+
     /// Preview-window convenience: a click detonates at that point. The real
-    /// saver never receives events (input ends the session first).
+    /// saver never receives events (input ends the session first), and the
+    /// scrubbing previewer routes clicks through its own rebuild instead.
     public override func mouseDown(with event: NSEvent) {
-        guard bounds.width > 8 else { return }
+        guard bounds.width > 8, !externallyDriven else { return }
         let p = convert(event.locationInWindow, from: nil)
         armIntro(atNormalized: CGPoint(x: p.x / bounds.width, y: p.y / bounds.height),
                  countdown: 1.2)
@@ -2242,6 +2387,7 @@ public final class CodeSaverView: ScreenSaverView {
     /// transition lands on a picture of what it left.
     private var backdropSource: CGImage? {
         if let session = boomSession { return session.backdrops[boomFieldIndex] }
+        if let previewBackdrop { return previewBackdrop }
         return Self.standInCaptureImage
     }
 

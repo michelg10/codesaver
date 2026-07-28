@@ -50,6 +50,7 @@ echo "── compiling preview harness…"
 swiftc -O -parse-as-library -module-name CodeSaverPreview \
   "${SRC[@]}" Sources/PreviewMain.swift \
   -framework ScreenSaver -framework AppKit -framework QuartzCore -framework Metal \
+  -framework ScreenCaptureKit \
   -o "$BUILD/preview"
 echo "── built $BUILD/preview  (run it for a live window)"
 

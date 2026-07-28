@@ -101,7 +101,8 @@ final class BoomMetalContext {
         float2 cellSize;   // px
         float2 inset;      // grid origin, px (at or below zero: the grid
                            // extends past every screen edge)
-        float2 pad;
+        float2 mosaic;     // x = wave-1 mosaic dim (1 = raw desktop, 0 = black),
+                           // y = unused (keeps timing float4-aligned)
         float4 timing;     // x = tick, y = vignette factor, z = vignette max,
                            // w = reveal (armed fade-in: backdrop × w)
         float4 atlas;      // xy = glyph slot px, zw = atlas px
@@ -176,10 +177,13 @@ final class BoomMetalContext {
             // itself (sharp desktop → mosaic) is the event; decorating it
             // was tacky and made wave 2's flip edge read as a rerun. The
             // flip beat is the show's only boundary flourish.
-            col = colorTex.read(uint2(c)).rgb * 0.82;
+            // The dim is one knob for the whole mosaic layer: the code spots
+            // ride it too (mix weight × dim), so they stay a fixed step above
+            // their cell instead of floating toward white as it darkens.
+            col = colorTex.read(uint2(c)).rgb * u.mosaic.x;
             if (code >= 33u) {
                 col = mix(col, kGlyphWhite,
-                          glyphMask(atlasTex, code, local, u) * (0.95 * 0.82));
+                          glyphMask(atlasTex, code, local, u) * (0.95 * u.mosaic.x));
             }
             // Burn glitches riding the front: sparse cells strobe pure
             // black ↔ pure white in the wake — damage the wave leaves
@@ -516,7 +520,7 @@ final class BoomMetalRenderer {
         var viewSize: SIMD2<Float>
         var cellSize: SIMD2<Float>
         var inset: SIMD2<Float>
-        var pad: SIMD2<Float> = .zero
+        var mosaic: SIMD2<Float> = .zero
         var timing: SIMD4<Float>
         var atlas: SIMD4<Float>
         var grid: SIMD4<UInt32>
@@ -579,6 +583,8 @@ final class BoomMetalRenderer {
     struct FrameInput {
         var holdBlack = false
         var reveal = 1.0
+        /// Wave-1 mosaic brightness (see CodeSaverView.boomMosaicDim).
+        var mosaicDim = 1.0
         var vignetteFactor = 0.0
         var vignetteMax = 0.0
         var glyphs: [GlyphInstance] = []
@@ -840,7 +846,8 @@ final class BoomMetalRenderer {
         var u = uniforms(target: target, core: core,
                          vignetteFactor: frame.vignetteFactor,
                          vignetteMax: frame.vignetteMax,
-                         scale: scale, reveal: frame.reveal)
+                         scale: scale, reveal: frame.reveal,
+                         mosaicDim: frame.mosaicDim)
         let rp = MTLRenderPassDescriptor()
         rp.colorAttachments[0].texture = target
         rp.colorAttachments[0].loadAction = .clear
@@ -945,10 +952,12 @@ final class BoomMetalRenderer {
 
     private func uniforms(target: MTLTexture, core: BoomCore?,
                           vignetteFactor: Double, vignetteMax: Double,
-                          scale: CGFloat, reveal: Double = 1) -> FieldUniforms {
+                          scale: CGFloat, reveal: Double = 1,
+                          mosaicDim: Double = 1) -> FieldUniforms {
         var u = FieldUniforms(
             viewSize: SIMD2(Float(target.width), Float(target.height)),
             cellSize: SIMD2(1, 1), inset: .zero,
+            mosaic: SIMD2(Float(mosaicDim), 0),
             timing: SIMD4(Float(core?.tickCount ?? 0), Float(vignetteFactor),
                           Float(vignetteMax), Float(reveal)),
             atlas: .zero, grid: SIMD4(1, 1, 0, 0))
