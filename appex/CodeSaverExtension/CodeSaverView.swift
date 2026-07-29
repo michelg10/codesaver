@@ -44,6 +44,12 @@ private func expTail(base: Double, mean: Double, cap: Double) -> Double {
     min(cap, base - log(Double.random(in: 1e-9..<1, using: &saverRNG)) * mean)
 }
 
+/// Clamped smoothstep on 0…1.
+@inline(__always) private func smooth01(_ x: Double) -> Double {
+    let t = clampd(x, 0, 1)
+    return t * t * (3 - 2 * t)
+}
+
 private extension NSColor {
     /// Linear blend toward `other` in device RGB.
     func mixed(with other: NSColor, _ f: CGFloat) -> NSColor {
@@ -572,10 +578,24 @@ public final class CodeSaverView: ScreenSaverView {
     private var verbIndex = 0
 
     private var tokens: Double = 0
-    private var tokensCeil: Double = 2000
-    private var tokensTau: Double = 32
+    /// One API request = prefill → decode; a turn chains requests with a
+    /// tool-use wait between them (the ↑ stretch where the number freezes).
+    private enum Step { case prefill, decode, toolWait }
+    private var step = Step.prefill
+    /// Session decode tok/s mean. Every request drifts it in a clamped
+    /// mean-reverting walk — server jitter — and each decode samples its own
+    /// rate around it.
+    private var decodeRateMean: Double = 72
+    private var segRate: Double = 0      // decode: mean tok/s of this step
+    private var prefillBase: Double = 0  // counter at prefill start…
+    private var prefillCount: Double = 0 // …lerping to base + count by step end
+    private var segStart: Double = 0
+    private var segEndsAt: Double = -1 // < 0 → no step started this turn
+    private var prefillSurge: Double = 1.35 // typing mult while this prefill runs
+    /// Mean-reverting wobble around the decode mean, continuous across steps —
+    /// the moment-to-moment server load riding on top of each step's rate.
+    private var rateJitter: Double = 1
     private var arrowIsDown = true
-    private var nextArrowFlip: Double = 8
     private var statusVisible = true
     private var nextStatusRoll: Double = 5
     /// Whether the status text is actually on screen this tick, and since when.
@@ -1721,12 +1741,14 @@ public final class CodeSaverView: ScreenSaverView {
         case .none:
             break
         }
-        // ↑ means upload — data streaming to the model — so everything runs a
-        // touch hotter while it's active. Idle at the slowest speed while the
-        // spinner rests AND while a new request waits on the API: typing only
-        // ramps up when the first response chunk arrives.
+        // ↑ prefill — data streaming to the model — surges the typing, scaled
+        // by how hard the counter is climbing. Tool runs slow to a visible
+        // 0.5× — not the full crawl, which is reserved for the spinner's rest
+        // and a new turn waiting on the API.
         let streaming = phase == .working && now - phaseStart >= parenDelay
-        let targetMul: Double = streaming ? (arrowIsDown ? 1.0 : 1.18) : 0.22
+        let targetMul: Double = !streaming ? 0.22
+            : step == .toolWait ? 0.5
+            : arrowIsDown ? 1.0 : prefillSurge
         speedMul += (targetMul - speedMul) * min(1, dt * 1.5)
         for w in writers { update(w, dt: dt) }
         updateSpinner(dt: dt)
@@ -1911,9 +1933,13 @@ public final class CodeSaverView: ScreenSaverView {
     private func startCycle(freshVerb: Bool) {
         phase = .working
         phaseStart = now
-        // Exponential tail: median ~100s, but the occasional marathon run.
+        // Exponential tail (median ~100s) mixed with a rare marathon arm —
+        // an exponential alone would essentially never produce a 20-minute
+        // turn, so the long tail has to be its own distribution.
         workDuration = ProcessInfo.processInfo.environment["CODESAVER_WORKDUR"].flatMap(Double.init)
-            ?? expTail(base: 50, mean: 70, cap: 600)
+            ?? (Double.random(in: 0...1, using: &saverRNG) < 0.05
+                ? rand(360, 1500)
+                : expTail(base: 50, mean: 70, cap: 600))
         doneDuration = rand(7, 14)
         if freshVerb, !verbs.isEmpty {
             var next = Int.random(in: 0..<verbs.count, using: &saverRNG)
@@ -1921,10 +1947,8 @@ public final class CodeSaverView: ScreenSaverView {
             verbIndex = next
         }
         tokens = 0
-        tokensCeil = rand(900, 5200)
-        tokensTau = rand(24, 42)
+        segEndsAt = -1
         arrowIsDown = true
-        nextArrowFlip = now + expTail(base: 6, mean: 9, cap: 90)
         statusVisible = true
         nextStatusRoll = now + rand(3, 7)
         statusShowing = false
@@ -1934,24 +1958,53 @@ public final class CodeSaverView: ScreenSaverView {
     private func updateSpinner(dt: Double) {
         switch phase {
         case .working:
-            // The counter holds at zero until the first "response chunk" arrives.
+            // The counter holds at zero until the first request streams up.
+            // From there a turn is `while t < workDuration { prefill();
+            // decode(); toolWait() }`. The deadline is only checked when a
+            // decode completes, so a turn always ends on a finished reply —
+            // never mid-upload, never mid-tool.
             if now - phaseStart >= parenDelay {
-                // Asymptotic growth: fast at first, flattening toward a ceiling
-                // that itself creeps so the number never fully stalls. Upload
-                // bursts (↑) surge — the ceiling races ahead and the counter
-                // chases it hard, permanently raising the trajectory.
-                let upload = !arrowIsDown
-                tokensCeil += (upload ? 26.0 : 2.5) * dt
-                tokens += (tokensCeil - tokens) * dt / tokensTau * (upload ? 3.0 : 1.0)
-            }
-            if now >= nextArrowFlip {
-                arrowIsDown.toggle()
-                // Long-tailed dwells, still ~1:3 time ↑ vs ↓ on average. The
-                // tail is what lets a ↓ stretch occasionally run past 30s and
-                // reach "almost done coding".
-                nextArrowFlip = now + (arrowIsDown
-                    ? expTail(base: 6, mean: 9, cap: 90)
-                    : expTail(base: 2, mean: 2, cap: 20))
+                if segEndsAt < 0 { beginRequest() }
+                switch step {
+                case .prefill:
+                    // Straight lerp between the endpoints. Real prefill runs
+                    // ~30k tok/s — negligible — so the ~3s window is network
+                    // and scheduling overhead, and the real spinner smooths
+                    // the climb into a ramp anyway.
+                    let frac = clampd((now - segStart) / (segEndsAt - segStart), 0, 1)
+                    tokens = prefillBase + prefillCount * frac
+                case .decode:
+                    // Ornstein-Uhlenbeck wobble: relax toward 1, kick with
+                    // frame-rate-independent noise. Instantaneous rate = step
+                    // mean × smoothstep ramps at both tail ends × this wobble.
+                    rateJitter += (1 - rateJitter) * min(1, dt / 1.2)
+                    rateJitter = clampd(rateJitter + gaussRand(mean: 0, sigma: 0.28 * dt.squareRoot()), 0.55, 1.6)
+                    let edge = min(1.2, (segEndsAt - segStart) * 0.35)
+                    let ease = smooth01((now - segStart) / edge) * smooth01((segEndsAt - now) / edge)
+                    tokens += segRate * ease * rateJitter * dt
+                case .toolWait:
+                    break // tool running: number frozen, arrow ↑
+                }
+                if now >= segEndsAt {
+                    switch step {
+                    case .prefill:
+                        beginStep(.decode)
+                    case .decode:
+                        if now - phaseStart >= workDuration {
+                            frozenDoneText = "\u{273B} \(verbs[verbIndex].past) for \(timeString(now - phaseStart))"
+                            phase = .done
+                            phaseStart = now
+                            // Turn finished: most of the corpus subset
+                            // refreshes — the next task arrives with mostly
+                            // new context, a little carryover.
+                            rotateSubset(fraction: 0.7)
+                            return
+                        }
+                        beginStep(.toolWait)
+                    case .toolWait:
+                        beginRequest()
+                    }
+                }
             }
             if now >= nextStatusRoll {
                 statusVisible = Double.random(in: 0...1, using: &saverRNG) < 0.78
@@ -1961,18 +2014,60 @@ public final class CodeSaverView: ScreenSaverView {
             let showing = statusVisible && arrowIsDown && now - phaseStart >= parenDelay
             if showing && !statusShowing { statusEnteredAt = now }
             statusShowing = showing
-            if now - phaseStart >= workDuration {
-                frozenDoneText = "\u{273B} \(verbs[verbIndex].past) for \(timeString(workDuration))"
-                phase = .done
-                phaseStart = now
-                // Request finished: most of the corpus subset refreshes — the
-                // next task arrives with mostly new context, a little carryover.
-                rotateSubset(fraction: 0.7)
-            }
         case .done:
             if now - phaseStart >= doneDuration {
                 startCycle(freshVerb: true)
             }
+        }
+    }
+
+    /// Opens a new API request: the server-jitter walk advances once per
+    /// request, then the request starts with its prefill.
+    private func beginRequest() {
+        decodeRateMean = clampd(decodeRateMean + gaussRand(mean: 0, sigma: 2.5)
+            + (72 - decodeRateMean) * 0.06, 45, 110)
+        beginStep(.prefill)
+    }
+
+    /// Starts the next step of a request. ↑ prefill lerps the tool result's
+    /// tokens up over a few seconds of mostly network overhead; ↓ decode
+    /// trickles the reply at a rate sampled around the session mean; the
+    /// tool-use wait freezes the counter while the "tool" runs.
+    private func beginStep(_ next: Step) {
+        step = next
+        arrowIsDown = next == .decode
+        segStart = now
+        switch next {
+        case .prefill:
+            prefillBase = tokens
+            // Tool returns are two populations, not one curve: mostly small
+            // (bash status, greps, small edits), with every ~fifth a big one
+            // (file reads, test suites, page fetches) that gives the surge
+            // its real dynamic range.
+            prefillCount = Double.random(in: 0...1, using: &saverRNG) < 0.2
+                ? rand(2000, 9000)
+                : expTail(base: 100, mean: 450, cap: 2000)
+            let dur = max(1.0, gaussRand(mean: 3.0, sigma: 1.0))
+            segEndsAt = now + dur
+            // Bigger uploads slam the screen harder: the typing surge scales
+            // with the counter's climb rate, log-mapped 100→5k tok/s onto
+            // 1.35×–2×, so even a small prefill visibly surges and a monster
+            // tool result properly floors it.
+            prefillSurge = 1.35 + 0.65 * smooth01(log(prefillCount / dur / 100) / log(50))
+        case .decode:
+            segRate = max(15, gaussRand(mean: decodeRateMean, sigma: decodeRateMean * 0.10))
+            // Long-tailed dwells let a ↓ stretch run past 30s and reach
+            // "almost done coding". The rare extended-thinking arm is what
+            // makes multi-minute decodes possible at all — an exponential
+            // tail alone never gets there.
+            segEndsAt = now + (Double.random(in: 0...1, using: &saverRNG) < 0.08
+                ? expTail(base: 30, mean: 150, cap: .infinity)
+                : expTail(base: 5, mean: 9, cap: .infinity))
+        case .toolWait:
+            // Average ~3s, with ~5% stragglers — builds, tests, slow curls.
+            segEndsAt = now + (Double.random(in: 0...1, using: &saverRNG) < 0.05
+                ? rand(8, 30)
+                : max(0.3, gaussRand(mean: 2.5, sigma: 0.8)))
         }
     }
 
