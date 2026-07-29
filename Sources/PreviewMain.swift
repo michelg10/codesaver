@@ -870,9 +870,11 @@ final class Tuner: NSObject {
 // MARK: - Screen capture
 
 /// One-shot screenshots of every display at NATIVE pixel resolution — the
-/// igniter's capture, verbatim, so the preview's backdrops are the same
-/// pixels production would have handed the saver. Needs Screen Recording;
-/// without it the caller falls back to the stand-in desktop.
+/// igniter's capture, verbatim (including the rect form that keeps window
+/// shadows; see captureDisplays in helper/Igniter.swift), so the preview's
+/// backdrops are the same pixels production would have handed the saver.
+/// Needs Screen Recording; without it the caller falls back to the stand-in
+/// desktop.
 private func captureDisplays(_ completion: @escaping ([CGDirectDisplayID: CGImage]) -> Void) {
     guard #available(macOS 14.0, *) else { completion([:]); return }
     SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, err in
@@ -886,19 +888,26 @@ private func captureDisplays(_ completion: @escaping ([CGDirectDisplayID: CGImag
         let group = DispatchGroup()
         for display in content.displays {
             group.enter()
-            let config = SCStreamConfiguration()
-            let mode = CGDisplayCopyDisplayMode(display.displayID)
-            config.width = mode.map(\.pixelWidth) ?? display.width
-            config.height = mode.map(\.pixelHeight) ?? display.height
-            config.showsCursor = false
-            SCScreenshotManager.captureImage(
-                contentFilter: SCContentFilter(display: display, excludingWindows: []),
-                configuration: config
-            ) { image, _ in
+            let store: (CGImage?) -> Void = { image in
                 if let image {
                     lock.lock(); result[display.displayID] = image; lock.unlock()
                 }
                 group.leave()
+            }
+            if #available(macOS 15.2, *) {
+                SCScreenshotManager.captureImage(in: CGDisplayBounds(display.displayID)) {
+                    image, _ in store(image)
+                }
+            } else {
+                let config = SCStreamConfiguration()
+                let mode = CGDisplayCopyDisplayMode(display.displayID)
+                config.width = mode.map(\.pixelWidth) ?? display.width
+                config.height = mode.map(\.pixelHeight) ?? display.height
+                config.showsCursor = false
+                SCScreenshotManager.captureImage(
+                    contentFilter: SCContentFilter(display: display, excludingWindows: []),
+                    configuration: config
+                ) { image, _ in store(image) }
             }
         }
         group.notify(queue: .main) { completion(result) }

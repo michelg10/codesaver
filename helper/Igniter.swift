@@ -187,6 +187,17 @@ func saverIsRunning() -> Bool {
 /// capture — fine when it only fed the per-cell color averaging, visibly
 /// soft now that the capture is the desktop the user stares at during the
 /// armed settle. The retina pixel dimensions come from the display mode.
+///
+/// The RECT form of captureImage is the one that keeps window shadows. Its
+/// filter sibling composites each window's own surface into the display rect
+/// and leaves the WindowServer's framing behind it, so every window comes
+/// back a flat cutout and the desktop reads as paper — measurably so: across
+/// a window edge the framebuffer ramps 245→229 and the filter capture is a
+/// dead-flat 247. `ignoreShadowsDisplay` is already false on that path and
+/// toggling it changes nothing (nor does `capturesShadowsOnly`); the shadows
+/// never enter it at all. captureImage(in:) takes global display POINTS, and
+/// hands back native retina pixels with no cursor on its own — which is why
+/// the display-mode lookup and showsCursor live only in the fallback.
 func captureDisplays(completion: @escaping ([CGDirectDisplayID: CGImage]) -> Void) {
     SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, _ in
         guard let content else { DispatchQueue.main.async { completion([:]) }; return }
@@ -195,21 +206,28 @@ func captureDisplays(completion: @escaping ([CGDirectDisplayID: CGImage]) -> Voi
         let group = DispatchGroup()
         for display in content.displays {
             group.enter()
-            let config = SCStreamConfiguration()
-            let mode = CGDisplayCopyDisplayMode(display.displayID)
-            config.width = mode.map(\.pixelWidth) ?? display.width
-            config.height = mode.map(\.pixelHeight) ?? display.height
-            config.showsCursor = false
-            SCScreenshotManager.captureImage(
-                contentFilter: SCContentFilter(display: display, excludingWindows: []),
-                configuration: config
-            ) { image, _ in
+            let store: (CGImage?) -> Void = { image in
                 if let image {
                     lock.lock()
                     result[display.displayID] = image
                     lock.unlock()
                 }
                 group.leave()
+            }
+            if #available(macOS 15.2, *) {
+                SCScreenshotManager.captureImage(in: CGDisplayBounds(display.displayID)) {
+                    image, _ in store(image)
+                }
+            } else {
+                let config = SCStreamConfiguration()
+                let mode = CGDisplayCopyDisplayMode(display.displayID)
+                config.width = mode.map(\.pixelWidth) ?? display.width
+                config.height = mode.map(\.pixelHeight) ?? display.height
+                config.showsCursor = false
+                SCScreenshotManager.captureImage(
+                    contentFilter: SCContentFilter(display: display, excludingWindows: []),
+                    configuration: config
+                ) { image, _ in store(image) }
             }
         }
         group.notify(queue: .main) { completion(result) }
