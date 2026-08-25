@@ -596,12 +596,14 @@ public final class CodeSaverView: ScreenSaverView {
     /// the moment-to-moment server load riding on top of each step's rate.
     private var rateJitter: Double = 1
     private var arrowIsDown = true
-    private var statusVisible = true
     private var nextStatusRoll: Double = 5
-    /// Whether the status text is actually on screen this tick, and since when.
-    /// Each visible stretch escalates coding → still → almost done on a fixed
-    /// clock, and always restarts at "coding" when the text comes back.
+    /// The status suffix shows in continuous stints, decode-only. Starting a
+    /// stint restarts the escalation ladder and rolls the stint's whole length
+    /// up front — long-tailed, so the 45s "almost done coding" rung stays a
+    /// rare event — capped to end at least a second before the decode segment
+    /// does: a reply never completes on "still coding".
     private var statusShowing = false
+    private var statusShowUntil: Double = 0
     private var statusEnteredAt: Double = 0
     private var frozenDoneText = ""
     /// Seconds at the start of a cycle where only the glyph + verb show,
@@ -656,6 +658,11 @@ public final class CodeSaverView: ScreenSaverView {
         var resourceDirs: [URL] = []
         if let env = ProcessInfo.processInfo.environment["CODESAVER_RESOURCES"] {
             resourceDirs.append(URL(fileURLWithPath: env))
+        }
+        // The corpus CodeSaver.app fetches at runtime beats anything bundled;
+        // the sandboxed appex reaches it through the shared app-group container.
+        if let dir = CorpusStore.corpusDirectory {
+            resourceDirs.append(dir)
         }
         if let url = Bundle(for: CodeSaverView.self).resourceURL {
             resourceDirs.append(url)
@@ -1949,7 +1956,6 @@ public final class CodeSaverView: ScreenSaverView {
         tokens = 0
         segEndsAt = -1
         arrowIsDown = true
-        statusVisible = true
         nextStatusRoll = now + rand(3, 7)
         statusShowing = false
         parenDelay = rand(1.2, 4.0)
@@ -2006,14 +2012,26 @@ public final class CodeSaverView: ScreenSaverView {
                     }
                 }
             }
-            if now >= nextStatusRoll {
-                statusVisible = Double.random(in: 0...1, using: &saverRNG) < 0.78
-                nextStatusRoll = now + rand(3, 7)
+            if statusShowing {
+                // The stint's end was decided when it started; the step guards
+                // only matter if the cycle was reset out from under it.
+                if step != .decode || segEndsAt < 0 || now >= statusShowUntil {
+                    statusShowing = false
+                    nextStatusRoll = now + rand(3, 7)
+                }
+            } else if step == .decode, segEndsAt > 0, now >= nextStatusRoll {
+                // Roll the stint's whole think time up front, capped to end
+                // at least a second before the decode does — a reply never
+                // lands on "still coding".
+                let room = segEndsAt - now - 1
+                if room >= 2 {
+                    statusEnteredAt = now
+                    statusShowUntil = now + min(expTail(base: 6, mean: 9, cap: 90), room)
+                    statusShowing = true
+                } else {
+                    nextStatusRoll = now + rand(3, 7)
+                }
             }
-            // Entering the "coding…" state restarts its escalation clock.
-            let showing = statusVisible && arrowIsDown && now - phaseStart >= parenDelay
-            if showing && !statusShowing { statusEnteredAt = now }
-            statusShowing = showing
         case .done:
             if now - phaseStart >= doneDuration {
                 startCycle(freshVerb: true)
@@ -2056,10 +2074,11 @@ public final class CodeSaverView: ScreenSaverView {
             prefillSurge = 1.35 + 0.65 * smooth01(log(prefillCount / dur / 100) / log(50))
         case .decode:
             segRate = max(15, gaussRand(mean: decodeRateMean, sigma: decodeRateMean * 0.10))
-            // Long-tailed dwells let a ↓ stretch run past 30s and reach
-            // "almost done coding". The rare extended-thinking arm is what
-            // makes multi-minute decodes possible at all — an exponential
-            // tail alone never gets there.
+            // Long-tailed dwells give status stints room to climb the ladder —
+            // "almost done coding" needs 45s+ of decode still ahead of the
+            // stint. The rare extended-thinking arm is what makes multi-minute
+            // decodes possible at all — an exponential tail alone never gets
+            // there.
             segEndsAt = now + (Double.random(in: 0...1, using: &saverRNG) < 0.08
                 ? expTail(base: 30, mean: 150, cap: .infinity)
                 : expTail(base: 5, mean: 9, cap: .infinity))
@@ -2083,9 +2102,14 @@ public final class CodeSaverView: ScreenSaverView {
         return String(format: "%.1fk", v / 1000)
     }
 
+    /// Claude Code's real escalation ladder and thresholds, verb swapped for
+    /// the saver's own: thinking → still thinking → thinking more → thinking
+    /// some more → almost done thinking, at 10/20/30/45s.
     private func statusText(since: Double) -> String {
-        if since < 12 { return "coding with xhigh effort" }
-        if since < 30 { return "still coding with xhigh effort" }
+        if since < 10 { return "coding with xhigh effort" }
+        if since < 20 { return "still coding with xhigh effort" }
+        if since < 30 { return "coding more with xhigh effort" }
+        if since < 45 { return "coding some more with xhigh effort" }
         return "almost done coding with xhigh effort"
     }
 

@@ -120,3 +120,4 @@ Embedding spyware	Embedded spyware
 Agentically creating	Agentically created
 Crashing out	Crashed out
 eXecuting, Yielding, and Committing	eXecuted, Yielded, and Committed
+Larping	Larped

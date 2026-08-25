@@ -1,33 +1,19 @@
 #!/bin/zsh
 # Build CodeSaver.app (+ embedded CodeSaverExtension.appex) and install to
-# /Applications, registering the appex with pluginkit.
-#
-#   ./install.sh                  build + install
-#   REFRESH_CORPUS=1 ./install.sh   also resample code from your repos
+# /Applications, registering the appex with pluginkit. The code corpus is no
+# longer baked at build time — the installed app fetches it from GitHub into
+# the app-group container (connect GitHub once in the app).
 set -euo pipefail
 cd "$(dirname "$0")"
 
-[[ -f ../setup.conf ]] && source ../setup.conf
 SIGN_ID="${SIGN_ID:-Apple Development}"
-# Team ID: setup.conf/env, else detect from the signing certificate. The
+# Team ID: env override, else detect from the signing certificate. The
 # `|| true` matters: without it, pipefail+errexit silently kills the script
 # on machines with no certificate — before the friendly error below.
 TEAM_ID="${TEAM_ID:-$(security find-certificate -c "$SIGN_ID" -p 2>/dev/null \
   | openssl x509 -noout -subject 2>/dev/null \
   | sed -n 's/.*OU *= *\([A-Z0-9]*\).*/\1/p' || true)}"
-[[ -n $TEAM_ID ]] || { echo "no signing team — run ../setup.sh first"; exit 1; }
-
-# Refresh verbs from the user's own list when configured; otherwise the
-# bundled Resources copy is used as-is. Content-gated so identical lists
-# never touch (or dirty) the tracked file.
-if [[ -n ${VERBS:-} && -f ${VERBS:-} ]] && ! cmp -s "$VERBS" CodeSaverExtension/Resources/spinner-verbs.txt; then
-  cp "$VERBS" CodeSaverExtension/Resources/spinner-verbs.txt
-fi
-
-if [[ ! -f CodeSaverExtension/Resources/corpus.bin || ! -f CodeSaverExtension/Resources/corpus-index.json || ${REFRESH_CORPUS:-0} == 1 ]]; then
-  echo "── regenerating corpus…"
-  python3 ../make_corpus.py CodeSaverExtension/Resources/corpus.bin
-fi
+[[ -n $TEAM_ID ]] || { echo "no signing team — need an 'Apple Development' certificate (a free Apple ID via Xcode → Settings → Accounts works)"; exit 1; }
 
 echo "── building…"
 mkdir -p build  # tee opens its log before xcodebuild creates the directory
@@ -91,6 +77,12 @@ if [[ ${NO_ACTIVATE:-0} != 1 ]]; then
     echo "   (until then the system saver selection is unbound and shows BLACK)"
   fi
 fi
+
+# (Re-)register the corpus-refresh LaunchAgent now that the app sits at its
+# stable /Applications path; a no-op when already enabled. RunAtLoad gives a
+# first fetch right away once a GitHub token is present.
+/Applications/CodeSaver.app/Contents/MacOS/CodeSaver --register-agent 2>/dev/null \
+  || echo "── agent registration failed — toggle “Refresh automatically” in the app"
 
 echo "── installed /Applications/CodeSaver.app"
 pluginkit -m -v -p com.apple.screensaver 2>/dev/null | grep -i codesaver || echo "   (not yet visible to pluginkit — System Settings usually picks it up shortly)"

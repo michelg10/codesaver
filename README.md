@@ -13,7 +13,7 @@ CodeSaver fills the screen with code sampled from your own GitHub repos, typed o
 ## What it does
 
 - **Background**: chunks of real code from your repos type in across the screen — glowing typing head, block cursor, whitespace skipped so the stream never stutters, settled lines dimming with age. Chunks place around loose band anchors with gaussian jitter, and new lines clip whatever they land on, terminal-style, so the layout never reads as a grid.
-- **Spinner**: cycles verbs from a tab-delimited `Gerund<TAB>Past` list through a full request lifecycle — a latency window with just the glyph and glowing verb, then a streaming phase with elapsed time, an asymptotic line counter, ↓/↑ arrows with long-tailed dwell times (↑ = upload bursts: rarer, counter surges, typing speeds up), and a status that escalates `coding → still coding → almost done coding with xhigh effort` on a fixed clock each time it appears. Eventually:
+- **Spinner**: cycles verbs from a tab-delimited `Gerund<TAB>Past` list through a full request lifecycle — a latency window with just the glyph and glowing verb, then a streaming phase with elapsed time, an asymptotic line counter, ↓/↑ arrows with long-tailed dwell times (↑ = upload bursts: rarer, counter surges, typing speeds up), and a status that climbs Claude Code's real escalation ladder — `coding → still coding → coding more → coding some more → almost done coding with xhigh effort` at the real 10/20/30/45s thresholds. The status shows in continuous stints: each stint restarts the ladder and rolls its think time up front (long-tailed, so the last rung takes the same rare 45-second think it does in the terminal), capped to end at least a second before its decode segment — a reply never lands mid-"still coding". Eventually:
 
   ```
   ✻ Sprokbooked for 2m 7s
@@ -28,41 +28,43 @@ CodeSaver fills the screen with code sampled from your own GitHub repos, typed o
 
 - macOS 14 (Sonoma) or later — the screensaver is a modern ExtensionKit `.appex`
 - Xcode 15+
-- An authenticated [`gh`](https://cli.github.com) CLI (for corpus ingestion)
+- A GitHub token for fetching your repos: one click imports it from an authenticated [`gh`](https://cli.github.com) CLI, or paste a PAT with repo read access
 
 ## Build & install
 
 ```bash
-./setup.sh                  # interactive: GitHub username, verbs list, signing team
-./ingest.py                 # mirror source from your GitHub repos into ingest/cache/
-./appex/install.sh          # sample a corpus, build, install to /Applications, register
-./build.sh && ./helper/install.sh   # optional: the ignition LaunchAgent
+./appex/install.sh                # build, sign, install to /Applications
+open /Applications/CodeSaver.app  # the app walks you through the rest
+./build.sh && ./helper/install.sh # optional: the ignition LaunchAgent
 ```
+
+`install.sh` auto-detects your Apple Development team from the keychain (`TEAM_ID=…` overrides; a free Apple ID via Xcode → Accounts works) — no other configuration exists outside the app. Everything after the build is the app's job: the window is a three-step checklist — enable the screensaver, connect GitHub, switch on auto-refresh. A prebuilt `CodeSaver.app` needs no repo at all: drag it into /Applications, open it, same three steps.
 
 With the igniter installed, use **macOS's own trigger**: set System Settings → Lock Screen → "Start Screen Saver when inactive" to taste, and/or bind a hot corner to Start Screen Saver. The agent only scouts: after ~20 s of inactivity (tunable: `defaults write com.michelg10.CodeSaver.Igniter captureAfterIdle -float 20`) it captures each display once and records the mouse — the screen is static precisely because you're idle, so one capture suffices and costs nothing. It also watches the cursor approach saver-bound hot corners and captures pre-emptively, so corner launches detonate instantly. Captures are deleted the moment you return. Grant the igniter **Screen Recording** permission for the pixelated-desktop act — without it (or without a fresh capture, e.g. a surprise activation) the saver simply starts normally. `build/codesaver-igniter --capture` writes a one-off manifest for testing.
 
-Then pick **CodeSaver** in System Settings → Screen Saver. `open /Applications/CodeSaver.app` gives you a host app with install status and a live preview window.
+## The corpus feeds itself
 
-`setup.sh` writes a gitignored `setup.conf` with your GitHub username (non-fork repos only; a manifest makes ingest re-runs incremental), your Apple team ID (auto-detected from your signing certificate when possible), and optionally the path to your own spinner-verbs list — tab-delimited lines of `Gerund<TAB>Past`. If you don't supply one, the bundled list is used.
+The app owns its data — nothing is baked in at build time. It lists your non-fork repos (private ones included when the token is yours), downloads each changed repo's tarball, filters out non-source files (extension allowlist, size windows, `node_modules`-style dirs, generated-file patterns, bulk directories), and packs every cleaned file **whole** into `corpus.bin` with a repo-keyed byte index — deduplicating by content hash and dropping secret-looking lines. A `pushed_at` manifest makes re-runs incremental. Everything lives in the shared app-group container (`~/Library/Group Containers/<TeamID>.com.michelg10.CodeSaver/`), which is the only place your code exists — the app and saver bundles embed none of it. Spinner verbs follow the same rule: import your own tab-delimited `Gerund<TAB>Past` list under **Advanced** in the app and the saver prefers it over the bundled one.
 
-`ingest.py` filters out non-source files (extension allowlist, size windows, `node_modules`-style dirs, generated-file patterns, bulk directories). `make_corpus.py` packs every cleaned file **whole** into `corpus.bin` with a repo-keyed byte index (`corpus-index.json`), deduplicating by content hash and dropping secret-looking lines. At runtime the saver memory-maps the corpus and draws a fresh ~400-file subset each launch — repos weighted by √(file count) with a per-repo share cap, so big projects dominate only within reason — decoding files lazily and refreshing half the subset every time a spinner "request" completes. **The corpus files are gitignored on purpose** — they embed your actual code, private repos included, and so does the built app.
+At runtime the saver memory-maps the corpus from the container and draws a fresh ~400-file subset each launch — repos weighted by √(file count) with a per-repo share cap, so big projects dominate only within reason — decoding files lazily and refreshing half the subset every time a spinner "request" completes. Corpus swaps are atomic renames and the reader validates the index against the bin, so a refresh can never torn-read a running saver.
+
+**Staying fresh**: the "Refresh automatically" toggle registers a LaunchAgent via `SMAppService` (it appears under CodeSaver in System Settings → Login Items; `install.sh` registers it too). It ticks hourly at the lowest QoS launchd offers — `ProcessType Background`, `Nice 20`, low-priority I/O — and the process gates itself: work happens at most once per ~day and **only on AC power**, except that a missing corpus is fetched immediately. Dissenters can flip the one-line predicate `RefreshService.powerGateSatisfied()`. Headless CLI, mostly for scripts: `CodeSaver --refresh [--force]`, `--import-gh-token`, `--register-agent`; `CODESAVER_GITHUB_TOKEN` overrides the Keychain.
 
 ## Repo layout
 
 ```
-ingest.py                      stage 1: GitHub → ingest/cache/ (run occasionally)
-make_corpus.py                 stage 2: cache → corpus.txt (runs at build)
 appex/                         the screensaver (ExtensionKit appex + host app)
 ├── CodeSaverExtension/        the .appex — CodeSaverView.swift is the whole show
-├── CodeSaver/                 SwiftUI host app (install / preview UI)
+├── CodeSaver/                 SwiftUI host app: install / preview UI, GitHub
+│                              fetch + corpus build (GitHubCorpusFetcher.swift),
+│                              refresh gates + LaunchAgent (RefreshService.swift)
 ├── install.sh                 build + install to /Applications + pluginkit
 └── BACKGROUND.md              appex screensaver architecture notes (upstream)
 helper/                        ignition scout: idle/corner watcher → desktop capture
 ├── Igniter.swift              the codesaver-igniter agent (single file)
 └── install.sh                 install/uninstall the LaunchAgent
-build.sh                       legacy .saver build + offscreen snapshot harness
+build.sh                       builds the windowed preview / snapshot harness
 Sources/PreviewMain.swift      windowed preview / PNG snapshot renderer
-harness/loadtest.swift         bundle load smoke test
 ```
 
 The snapshot harness is how the aesthetics were tuned: `./build.sh && ./build/preview --snapshot <dir> <t1> <t2>…` renders deterministic frames offscreen (`CODESAVER_WORKDUR` pins the cycle length).

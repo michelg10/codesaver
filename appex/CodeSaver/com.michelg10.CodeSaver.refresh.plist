@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- LaunchAgent registered by SMAppService (see RefreshService.swift).
+     Fires hourly at the lowest QoS launchd offers; the process itself decides
+     whether it's actually time to work (on AC power + ≥23h since last
+     success, or no corpus at all). -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.michelg10.CodeSaver.refresh</string>
+	<key>BundleProgram</key>
+	<string>Contents/MacOS/CodeSaver</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>CodeSaver</string>
+		<string>--refresh</string>
+	</array>
+	<key>StartInterval</key>
+	<integer>3600</integer>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>LowPriorityBackgroundIO</key>
+	<true/>
+	<key>Nice</key>
+	<integer>20</integer>
+	<key>AssociatedBundleIdentifiers</key>
+	<array>
+		<string>com.michelg10.CodeSaver</string>
+	</array>
+</dict>
+</plist>

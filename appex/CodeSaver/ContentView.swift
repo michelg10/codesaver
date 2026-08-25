@@ -2,24 +2,62 @@
 //  ContentView.swift
 //  CodeSaver
 //
-//  Copyright © 2026 Guillaume Louel. Licensed under the MIT License.
-//
-//  Main view for the host application. Shows extension registration status
-//  and provides install / uninstall and "set as active screensaver" actions.
+//  The host app window: a live render of the saver on top, a three-step
+//  setup checklist below, corpus status at the bottom. The palette and the
+//  ✽/✻ glyph vocabulary are the saver's own (CodeSaverView's constants): the
+//  current setup step glows like a working spinner, finished steps rest grey.
 //
 
 import SwiftUI
+import UniformTypeIdentifiers
 
 private let logger = AppexLog.logger("HostApp")
 
-/// The igniter LaunchAgent's defaults domain — the app writes hot-corner
-/// config there; the agent re-reads it within seconds.
+/// The igniter LaunchAgent's defaults domain — the app writes hot-corner and
+/// idle-trigger config there; the agent re-reads it within seconds.
 private let igniterDefaults = UserDefaults(suiteName: "com.michelg10.CodeSaver.Igniter")
+
+private enum Theme {
+    static let ink = Color(red: 0.93, green: 0.98, blue: 1.0)
+    static let slate = Color(red: 0.58, green: 0.65, blue: 0.72)
+    static let dim = Color.white.opacity(0.30)
+    static let violet = Color(.displayP3, red: 0.494, green: 0.357, blue: 0.937)
+    static let violetHot = Color(.displayP3, red: 0.75, green: 0.64, blue: 1.0)
+    static let hairline = Color.white.opacity(0.08)
+    static let alert = Color(red: 0.94, green: 0.45, blue: 0.45)
+
+    static func mono(_ size: CGFloat, _ weight: Font.Weight = .regular) -> Font {
+        .system(size: size, weight: weight, design: .monospaced)
+    }
+}
+
+/// The saver itself, live at half scale — the hero is the product, not a mockup.
+private struct HeroSaver: NSViewRepresentable {
+    final class Host: NSView {
+        override init(frame frameRect: NSRect) {
+            super.init(frame: frameRect)
+            scaleUnitSquare(to: NSSize(width: 0.5, height: 0.5))
+            if let saver = CodeSaverView(frame: NSRect(x: 0, y: 0, width: 960, height: 460),
+                                         isPreview: false) {
+                saver.autoresizingMask = [.width, .height]
+                addSubview(saver)
+            }
+        }
+        required init?(coder: NSCoder) { nil }
+    }
+
+    func makeNSView(context: Context) -> NSView { Host(frame: .zero) }
+    func updateNSView(_ nsView: NSView, context: Context) {}
+}
 
 struct ContentView: View {
     @Environment(\.openWindow) private var openWindow
     @StateObject private var pluginManager = PluginManager()
-    @State private var statusMessage = "Ready"
+    @StateObject private var refreshManager = RefreshManager()
+    @State private var pastedToken = ""
+    @State private var showAdvanced = false
+    @State private var showVerbsImporter = false
+    @State private var igniterState = IgniterState.missing
     @State private var cornerTL = igniterDefaults?.integer(forKey: "cornerTL") ?? 0
     @State private var cornerTR = igniterDefaults?.integer(forKey: "cornerTR") ?? 0
     @State private var cornerBL = igniterDefaults?.integer(forKey: "cornerBL") ?? 0
@@ -27,357 +65,442 @@ struct ContentView: View {
     @State private var idleTimeout = igniterDefaults?.integer(forKey: "idleTimeout") ?? 0
 
     var body: some View {
-        VStack(spacing: 20) {
-            // MARK: - Header
-            Image(systemName: "tv")
-                .font(.system(size: 60))
-                .foregroundColor(.accentColor)
-
-            Text("CodeSaver")
-                .font(.largeTitle)
-                .fontWeight(.bold)
-
-            Text("Screensaver Extension")
-                .font(.title2)
-                .foregroundColor(.secondary)
-
-            Divider()
-                .padding(.horizontal, 40)
-
-            // MARK: - Extension Status
-            Text("Extension Status")
-                .font(.headline)
-
-            extensionStatusView
-                .padding(.horizontal, 20)
-
-            Divider()
-                .padding(.horizontal, 40)
-
-            // MARK: - Screensaver Activation
-            Text("Screensaver Activation")
-                .font(.headline)
-
-            screensaverActivationView
-                .padding(.horizontal, 20)
-
-            Divider()
-                .padding(.horizontal, 40)
-
-            // MARK: - Hot Corners
-            Text("Hot Corners")
-                .font(.headline)
-
-            hotCornersView
-                .padding(.horizontal, 20)
-
-            Divider()
-                .padding(.horizontal, 40)
-
-            // MARK: - Idle Trigger
-            Text("Idle Trigger")
-                .font(.headline)
-
-            idleTriggerView
-                .padding(.horizontal, 20)
-
-            Divider()
-                .padding(.horizontal, 40)
-
-            // MARK: - Actions
-            HStack(spacing: 12) {
-                Button("Open Preview") {
-                    openWindow(id: "preview")
+        VStack(spacing: 0) {
+            hero
+            Rectangle().fill(Theme.hairline).frame(height: 1)
+            VStack(alignment: .leading, spacing: 16) {
+                eyebrow("SETUP")
+                setupRows
+                Rectangle().fill(Theme.hairline).frame(height: 1)
+                eyebrow("CORPUS")
+                corpusRow
+                Rectangle().fill(Theme.hairline).frame(height: 1)
+                eyebrow("IGNITION")
+                ignitionRows
+                if let error = firstError {
+                    Text(error)
+                        .font(Theme.mono(11))
+                        .foregroundStyle(Theme.alert)
+                        .textSelection(.enabled)
                 }
-                .buttonStyle(.borderedProminent)
-
-                Button("Open Screen Saver Settings") {
-                    openScreenSaverSettings()
-                }
-                .buttonStyle(.bordered)
+                advanced
             }
-
-            Text(statusMessage)
-                .font(.caption)
-                .foregroundColor(.secondary)
-                .padding(.top, 10)
-                .frame(maxWidth: .infinity)
-                .multilineTextAlignment(.center)
+            .padding(22)
         }
-        .padding(40)
-        .fixedSize()
+        .frame(width: 480)
+        .background(.black)
+        .preferredColorScheme(.dark)
+        .tint(Theme.violet)
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSApplication.didBecomeActiveNotification)) { _ in
+            pluginManager.checkInstallationStatus()
+            pluginManager.checkScreensaverStatus()
+            refreshManager.reload()
+            igniterState = Self.probeIgniter()
+        }
+        .onAppear { igniterState = Self.probeIgniter() }
+        .fileImporter(isPresented: $showVerbsImporter,
+                      allowedContentTypes: [.text, .tabSeparatedText]) { result in
+            if case .success(let url) = result {
+                refreshManager.importVerbs(from: url)
+            }
+        }
+    }
+
+    // MARK: Hero
+
+    private var hero: some View {
+        HeroSaver()
+            .frame(width: 480, height: 220)
+            .clipped()
+            .allowsHitTesting(false)
+            .ignoresSafeArea(edges: .top)  // bleed under the hidden title bar
+            .overlay(alignment: .bottom) {
+                LinearGradient(colors: [.clear, .black.opacity(0.9)],
+                               startPoint: .top, endPoint: .bottom)
+                    .frame(height: 90)
+            }
+            .overlay(alignment: .bottom) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("✽ CodeSaver")
+                        .font(Theme.mono(16, .semibold))
+                        .foregroundStyle(Theme.ink)
+                        .shadow(color: Theme.violet.opacity(0.9), radius: 8)
+                    Spacer()
+                    Text(extensionStatusLine)
+                        .font(Theme.mono(10))
+                        .foregroundStyle(Theme.slate)
+                }
+                .padding(.horizontal, 18)
+                .padding(.bottom, 12)
+            }
+    }
+
+    private var extensionStatusLine: String {
+        if pluginManager.isInstalled {
+            let version = pluginManager.installedVersion.map { " v\($0)" } ?? ""
+            return "appex\(version) registered"
+        }
+        return "appex not registered yet"
+    }
+
+    // MARK: Setup checklist
+
+    private enum StepState { case done, current, pending }
+
+    private var saverDone: Bool { pluginManager.isActiveScreensaver }
+    private var tokenDone: Bool { refreshManager.hasToken }
+    private var agentDone: Bool { refreshManager.agentEnabled }
+
+    private var currentStep: Int? {
+        if !saverDone { return 0 }
+        if !tokenDone { return 1 }
+        if !agentDone { return 2 }
+        return nil
+    }
+
+    private func state(of index: Int, done: Bool) -> StepState {
+        done ? .done : (currentStep == index ? .current : .pending)
     }
 
     @ViewBuilder
-    private var extensionStatusView: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack {
-                    Circle()
-                        .fill(pluginManager.isInstalled ? Color.green : Color.gray)
-                        .frame(width: 10, height: 10)
+    private func glyph(_ state: StepState) -> some View {
+        switch state {
+        case .done:
+            Text("✻").font(Theme.mono(13)).foregroundStyle(Theme.slate)
+        case .current:
+            Text("✽").font(Theme.mono(13)).foregroundStyle(Theme.violetHot)
+                .shadow(color: Theme.violet.opacity(0.9), radius: 5)
+        case .pending:
+            Text("·").font(Theme.mono(13)).foregroundStyle(Theme.dim)
+        }
+    }
 
-                    if pluginManager.isInstalled {
-                        Text("Installed")
-                            .fontWeight(.medium)
-                        if let version = pluginManager.installedVersion {
-                            Text("(v\(version))")
-                                .foregroundColor(.secondary)
-                        }
-                    } else {
-                        Text("Not Installed")
-                            .fontWeight(.medium)
-                            .foregroundColor(.secondary)
-                    }
+    private func stepTitle(_ text: String, _ state: StepState) -> some View {
+        Text(text)
+            .font(Theme.mono(13))
+            .foregroundStyle(state == .pending ? Theme.dim : Theme.ink)
+    }
 
-                    Spacer()
-
-                    if pluginManager.isLoading {
-                        ProgressView()
-                            .scaleEffect(0.7)
-                    } else {
-                        Button {
-                            pluginManager.checkInstallationStatus()
-                        } label: {
-                            Image(systemName: "arrow.clockwise")
-                        }
-                        .buttonStyle(.borderless)
-                        .help("Refresh status")
-                    }
-                }
-
-                if pluginManager.isInstalled {
-                    if let path = pluginManager.installedPath {
-                        HStack(alignment: .top) {
-                            Text("Path:")
-                                .foregroundColor(.secondary)
-                            Text(path)
-                                .lineLimit(2)
-                                .truncationMode(.middle)
-                                .textSelection(.enabled)
-                        }
-                        .font(.caption)
-                    }
+    private var setupRows: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            // 1 — the screensaver itself
+            let saverState = state(of: 0, done: saverDone)
+            HStack(spacing: 10) {
+                glyph(saverState)
+                stepTitle("Screensaver", saverState)
+                Spacer()
+                if saverDone {
+                    Text("active").font(Theme.mono(11)).foregroundStyle(Theme.slate)
+                } else if pluginManager.isCheckingScreensaver || pluginManager.isLoading {
+                    ProgressView().scaleEffect(0.5)
                 } else {
-                    if let embeddedVersion = pluginManager.embeddedVersion {
-                        Text("Embedded version: \(embeddedVersion)")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+                    Button("Enable") {
+                        Task { await pluginManager.activate() }
                     }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
                 }
+            }
 
-                if let error = pluginManager.lastError {
-                    Text(error)
-                        .font(.caption)
-                        .foregroundColor(.red)
+            // 2 — GitHub
+            let githubState = state(of: 1, done: tokenDone)
+            HStack(spacing: 10) {
+                glyph(githubState)
+                stepTitle("GitHub", githubState)
+                Spacer()
+                if tokenDone {
+                    Text(refreshManager.owner.isEmpty ? "connected" : "connected · \(refreshManager.owner)")
+                        .font(Theme.mono(11)).foregroundStyle(Theme.slate)
                 }
-
-                HStack {
-                    Spacer()
-                    if pluginManager.isInstalled {
-                        Button("Uninstall") {
-                            uninstallExtension()
+            }
+            if !tokenDone {
+                HStack(spacing: 8) {
+                    Button("Import from gh CLI") { refreshManager.importTokenFromGH() }
+                        .buttonStyle(githubState == .current ? AnyButtonStyle(.borderedProminent)
+                                                             : AnyButtonStyle(.bordered))
+                        .controlSize(.small)
+                    SecureField("or paste a token…", text: $pastedToken)
+                        .textFieldStyle(.roundedBorder)
+                        .font(Theme.mono(11))
+                        .onSubmit {
+                            refreshManager.saveToken(pastedToken)
+                            pastedToken = ""
                         }
+                }
+                .padding(.leading, 24)
+            }
+
+            // 3 — the refresh agent
+            let agentState = state(of: 2, done: agentDone)
+            HStack(spacing: 10) {
+                glyph(agentState)
+                stepTitle("Auto-refresh", agentState)
+                Text("daily · plugged in · lowest priority")
+                    .font(Theme.mono(10)).foregroundStyle(Theme.dim)
+                Spacer()
+                Toggle("", isOn: Binding(get: { refreshManager.agentEnabled },
+                                         set: { refreshManager.setAutoRefresh($0) }))
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                    .labelsHidden()
+                    .disabled(!tokenDone)
+            }
+            if refreshManager.agentNeedsApproval {
+                HStack(spacing: 8) {
+                    Text("waiting for approval in Login Items")
+                        .font(Theme.mono(11)).foregroundStyle(Theme.alert)
+                    Button("Open Login Items") { refreshManager.openLoginItems() }
                         .buttonStyle(.bordered)
-                        .disabled(pluginManager.isLoading)
-                    } else {
-                        Button("Install") {
-                            installExtension()
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(pluginManager.isLoading)
+                        .controlSize(.small)
+                }
+                .padding(.leading, 24)
+            }
+        }
+    }
+
+    // MARK: Corpus
+
+    private var corpusRow: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            if refreshManager.isRefreshing {
+                Text("✽").font(Theme.mono(13)).foregroundStyle(Theme.violetHot)
+                    .shadow(color: Theme.violet.opacity(0.9), radius: 5)
+                Text(refreshManager.progressText ?? "working…")
+                    .font(Theme.mono(12)).foregroundStyle(Theme.ink)
+            } else if refreshManager.state.lastSuccess != nil {
+                Text("✻").font(Theme.mono(13)).foregroundStyle(Theme.slate)
+                Text("\(refreshManager.state.fileCount.formatted()) files · \(refreshManager.state.repoCount) repos · \(refreshManager.corpusSizeDescription) · \(refreshManager.lastRefreshDescription)")
+                    .font(Theme.mono(12)).foregroundStyle(Theme.ink)
+            } else {
+                Text("·").font(Theme.mono(13)).foregroundStyle(Theme.dim)
+                Text("no corpus yet — the first refresh builds it")
+                    .font(Theme.mono(12)).foregroundStyle(Theme.slate)
+            }
+            Spacer()
+            Button("Refresh Now") { refreshManager.refreshNow() }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(refreshManager.isRefreshing || !tokenDone)
+        }
+    }
+
+    // MARK: Ignition
+    //
+    // Config for the igniter LaunchAgent (helper/install.sh) — it owns every
+    // saver trigger, so the boom always opens on a fresh desktop capture. The
+    // corner config int packs bit 0 = armed, bits 1–4 = required ⌘/⌥/⌃/⇧
+    // (decoded by the igniter's cornerFlags); the pickers cover single
+    // modifiers, combos work via `defaults write` on the same keys.
+
+    private enum IgniterState { case missing, stopped, running }
+
+    /// Missing = no LaunchAgent plist; stopped = bootstrapped but launchd
+    /// shows no running process (the failure mode that looks exactly like
+    /// "installed" from the filesystem alone).
+    private static func probeIgniter() -> IgniterState {
+        guard FileManager.default.fileExists(atPath: NSHomeDirectory()
+            + "/Library/LaunchAgents/com.michelg10.CodeSaver.Igniter.plist") else { return .missing }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = ["print", "gui/\(getuid())/com.michelg10.CodeSaver.Igniter"]
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = Pipe()
+        guard (try? p.run()) != nil else { return .stopped }
+        p.waitUntilExit()
+        let text = String(data: out.fileHandleForReading.readDataToEndOfFile(),
+                          encoding: .utf8) ?? ""
+        return text.contains("state = running") ? .running : .stopped
+    }
+
+    private var ignitionRows: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if igniterState != .running {
+                let (headline, command) = igniterState == .missing
+                    ? ("igniter not installed — these triggers are dormant",
+                       "./build.sh && ./helper/install.sh")
+                    : ("igniter installed but not running — these triggers are dormant",
+                       "launchctl kickstart gui/\(getuid())/com.michelg10.CodeSaver.Igniter")
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    Text("✽").font(Theme.mono(13)).foregroundStyle(Theme.alert)
+                        .shadow(color: Theme.alert.opacity(0.9), radius: 5)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(headline)
+                            .font(Theme.mono(12, .semibold)).foregroundStyle(Theme.alert)
+                        Text("\(command) — settings below stick either way")
+                            .font(Theme.mono(10)).foregroundStyle(Theme.slate)
+                            .textSelection(.enabled)
                     }
                     Spacer()
-                }
-                .padding(.top, 4)
-            }
-            .padding(8)
-        }
-    }
-
-    @ViewBuilder
-    private var screensaverActivationView: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack {
-                    Circle()
-                        .fill(pluginManager.isActiveScreensaver ? Color.green : Color.gray)
-                        .frame(width: 10, height: 10)
-
-                    if pluginManager.isActiveScreensaver {
-                        Text("Active")
-                            .fontWeight(.medium)
-                    } else {
-                        Text("Not Active")
-                            .fontWeight(.medium)
-                            .foregroundColor(.secondary)
+                    Button("Copy") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(command, forType: .string)
                     }
-
-                    Spacer()
-
-                    if pluginManager.isCheckingScreensaver {
-                        ProgressView()
-                            .scaleEffect(0.7)
-                    } else {
-                        Button {
-                            pluginManager.checkScreensaverStatus()
-                        } label: {
-                            Image(systemName: "arrow.clockwise")
-                        }
-                        .buttonStyle(.borderless)
-                        .help("Refresh status")
-                    }
-                }
-
-                if let error = pluginManager.screensaverError {
-                    Text(error)
-                        .font(.caption)
-                        .foregroundColor(.red)
-                }
-
-                if pluginManager.isInstalled && !pluginManager.isActiveScreensaver {
-                    HStack {
-                        Spacer()
-                        Button("Enable as Screensaver") {
-                            Task {
-                                await pluginManager.enableAsScreensaver()
-                            }
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(pluginManager.isCheckingScreensaver)
-                        Spacer()
-                    }
-                    .padding(.top, 4)
+                    .buttonStyle(.bordered).controlSize(.small)
                 }
             }
-            .padding(8)
-        }
-    }
-
-    // Corner config int: bit 0 = armed, bits 1–4 = required ⌘/⌥/⌃/⇧
-    // (decoded by the igniter's cornerFlags). The picker covers single
-    // modifiers; combos work via `defaults write` on the same keys.
-    @ViewBuilder
-    private var hotCornersView: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 10) {
-                Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 8) {
-                    GridRow {
-                        cornerPicker("Top Left", "cornerTL", $cornerTL)
-                        cornerPicker("Top Right", "cornerTR", $cornerTR)
-                    }
-                    GridRow {
-                        cornerPicker("Bottom Left", "cornerBL", $cornerBL)
-                        cornerPicker("Bottom Right", "cornerBR", $cornerBR)
-                    }
-                }
-                Text("""
-                CodeSaver detects these corners itself: the igniter captures \
-                your desktop at the moment of trigger, then starts the \
-                screensaver — the capture can never go stale. Turn off \
-                “Start Screen Saver” in System Settings → Desktop & Dock → \
-                Hot Corners so macOS doesn’t race it. On multi-display \
-                setups only corners that trap the cursor count; seams \
-                between displays never trigger.
-                """)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .frame(width: 380, alignment: .leading)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .padding(8)
-        }
-    }
-
-    @ViewBuilder
-    private var idleTriggerView: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 10) {
-                Picker("Start screensaver after", selection: Binding(
+            HStack(spacing: 8) {
+                Text("idle").font(Theme.mono(11)).foregroundStyle(Theme.slate)
+                Picker("", selection: Binding(
                     get: { idleTimeout },
-                    set: { v in
-                        idleTimeout = v
-                        igniterDefaults?.set(v, forKey: "idleTimeout")
-                    })) {
-                    Text("Use macOS setting").tag(0)
-                    Text("1 minute").tag(60)
-                    Text("2 minutes").tag(120)
-                    Text("5 minutes").tag(300)
-                    Text("10 minutes").tag(600)
-                    Text("15 minutes").tag(900)
-                    Text("30 minutes").tag(1800)
+                    set: { idleTimeout = $0; igniterDefaults?.set($0, forKey: "idleTimeout") })) {
+                    Text("use macOS setting").tag(0)
+                    Text("after 1 minute").tag(60)
+                    Text("after 2 minutes").tag(120)
+                    Text("after 5 minutes").tag(300)
+                    Text("after 10 minutes").tag(600)
+                    Text("after 15 minutes").tag(900)
+                    Text("after 30 minutes").tag(1800)
                 }
                 .pickerStyle(.menu)
-                .frame(width: 320, alignment: .leading)
-                Text(idleTimeout > 0
-                    ? """
-                    CodeSaver starts the screensaver itself after this much \
-                    inactivity, capturing the desktop at that exact moment — \
-                    proactive idle captures are off in this mode. Set macOS's \
-                    own screen saver to Never (System Settings → Lock Screen → \
-                    “Start Screen Saver when inactive”) so the two don't race, \
-                    and keep display sleep later than this timeout.
-                    """
-                    : """
-                    macOS's own timeout starts the screensaver; CodeSaver \
-                    pre-captures the desktop 20 seconds into idle and \
-                    refreshes it every 5 minutes so the boom always shows the \
-                    current screen.
-                    """)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .frame(width: 380, alignment: .leading)
-                    .fixedSize(horizontal: false, vertical: true)
+                .labelsHidden()
+                .controlSize(.small)
+                .frame(width: 180, alignment: .leading)
             }
-            .padding(8)
+            HStack(alignment: .top, spacing: 8) {
+                Text("corners").font(Theme.mono(11)).foregroundStyle(Theme.slate)
+                    .padding(.top, 3)
+                Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 6) {
+                    GridRow {
+                        cornerPicker("◸", "cornerTL", $cornerTL)
+                        cornerPicker("◹", "cornerTR", $cornerTR)
+                    }
+                    GridRow {
+                        cornerPicker("◺", "cornerBL", $cornerBL)
+                        cornerPicker("◿", "cornerBR", $cornerBR)
+                    }
+                }
+            }
+            Text(ignitionCaption)
+                .font(Theme.mono(10))
+                .foregroundStyle(Theme.dim)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
-    private func cornerPicker(_ label: String, _ key: String,
+    private func cornerPicker(_ glyph: String, _ key: String,
                               _ state: Binding<Int>) -> some View {
-        Picker(label, selection: Binding(
-            get: { state.wrappedValue },
-            set: { v in
-                state.wrappedValue = v
-                igniterDefaults?.set(v, forKey: key)
-            })) {
-            Text("Off").tag(0)
-            Text("Instant").tag(1)
-            Text("⌘ Command").tag(3)
-            Text("⌥ Option").tag(5)
-            Text("⌃ Control").tag(9)
-            Text("⇧ Shift").tag(17)
-        }
-        .pickerStyle(.menu)
-        .frame(width: 190, alignment: .leading)
-    }
-
-    private func installExtension() {
-        statusMessage = "Installing extension..."
-        do {
-            try pluginManager.install()
-            statusMessage = "Extension installed successfully"
-        } catch {
-            statusMessage = "Install failed: \(error.localizedDescription)"
-            logger.error("Install failed: \(error.localizedDescription, privacy: .public)")
+        HStack(spacing: 5) {
+            Text(glyph).font(Theme.mono(11)).foregroundStyle(Theme.slate)
+            Picker("", selection: Binding(
+                get: { state.wrappedValue },
+                set: { state.wrappedValue = $0; igniterDefaults?.set($0, forKey: key) })) {
+                Text("off").tag(0)
+                Text("instant").tag(1)
+                Text("⌘ hold").tag(3)
+                Text("⌥ hold").tag(5)
+                Text("⌃ hold").tag(9)
+                Text("⇧ hold").tag(17)
+            }
+            .pickerStyle(.menu)
+            .labelsHidden()
+            .controlSize(.small)
+            .frame(width: 108, alignment: .leading)
         }
     }
 
-    private func uninstallExtension() {
-        statusMessage = "Uninstalling extension..."
-        do {
-            try pluginManager.uninstall()
-            statusMessage = "Extension uninstalled successfully"
-        } catch {
-            statusMessage = "Uninstall failed: \(error.localizedDescription)"
-            logger.error("Uninstall failed: \(error.localizedDescription, privacy: .public)")
+    private var ignitionCaption: String {
+        let idle = idleTimeout > 0
+            ? "the igniter starts the saver itself at this idle, capturing the desktop at that exact moment — set macOS's saver timeout to Never so the two don't race"
+            : "macOS's own timeout starts the saver; the igniter keeps a fresh desktop capture ready for the boom"
+        return idle + "\ncorners are detected by the igniter itself — leave macOS's hot corners unbound so they don't race it"
+    }
+
+    private var firstError: String? {
+        refreshManager.lastActionError
+            ?? refreshManager.state.lastError
+            ?? pluginManager.screensaverError
+            ?? pluginManager.lastError
+    }
+
+    // MARK: Advanced
+
+    // A hand-rolled disclosure. The rows keep their layout space when hidden
+    // and only fade — animated window resizing is what read as jank, and on a
+    // pure-black window the reserved space is invisible when collapsed.
+    private var advanced: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeOut(duration: 0.18)) { showAdvanced.toggle() }
+            } label: {
+                HStack(spacing: 7) {
+                    Text(showAdvanced ? "▾" : "▸")
+                        .font(Theme.mono(10))
+                        .foregroundStyle(Theme.dim)
+                    eyebrow("ADVANCED")
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            advancedRows
+                .padding(.top, 12)
+                .opacity(showAdvanced ? 1 : 0)
+                .allowsHitTesting(showAdvanced)
+                .accessibilityHidden(!showAdvanced)
         }
+    }
+
+    private var advancedRows: some View {
+        VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 8) {
+                    Text("repos of").font(Theme.mono(11)).foregroundStyle(Theme.slate)
+                    TextField("token's account", text: $refreshManager.owner)
+                        .textFieldStyle(.roundedBorder)
+                        .font(Theme.mono(11))
+                        .frame(width: 170)
+                        .onSubmit { refreshManager.saveOwner() }
+                }
+                HStack(spacing: 8) {
+                    Text("verbs").font(Theme.mono(11)).foregroundStyle(Theme.slate)
+                    Text(refreshManager.customVerbCount.map { "custom list (\($0))" } ?? "bundled list")
+                        .font(Theme.mono(11)).foregroundStyle(Theme.ink)
+                    Button("Import…") { showVerbsImporter = true }
+                        .buttonStyle(.bordered).controlSize(.small)
+                    if refreshManager.customVerbCount != nil {
+                        Button("Use bundled") { refreshManager.resetVerbs() }
+                            .buttonStyle(.bordered).controlSize(.small)
+                    }
+                }
+                HStack(spacing: 16) {
+                    Button("Preview window") { openWindow(id: "preview") }
+                    Button("Screen Saver settings") { openScreenSaverSettings() }
+                    if tokenDone {
+                        Button("Forget token") { refreshManager.forgetToken() }
+                    }
+                }
+                .buttonStyle(.link)
+                .font(Theme.mono(11))
+            }
+    }
+
+    // MARK: Helpers
+
+    private func eyebrow(_ text: String) -> some View {
+        Text(text)
+            .font(Theme.mono(10, .semibold))
+            .tracking(3)
+            .foregroundStyle(Theme.dim)
     }
 
     private func openScreenSaverSettings() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.ScreenSaver-Settings.extension") {
             NSWorkspace.shared.open(url)
         }
+    }
+}
+
+/// Type-erased button style so a button can switch prominence with state.
+private struct AnyButtonStyle: PrimitiveButtonStyle {
+    private let apply: (Configuration) -> AnyView
+
+    init(_ style: some PrimitiveButtonStyle) {
+        apply = { AnyView(Button($0).buttonStyle(style)) }
+    }
+
+    func makeBody(configuration: Configuration) -> some View {
+        apply(configuration)
     }
 }
 

@@ -34,16 +34,6 @@ class PluginManager: ObservableObject {
         Bundle.main.builtInPlugInsURL?.appendingPathComponent("CodeSaverExtension.appex").path
     }
 
-    /// Version of the embedded extension.
-    var embeddedVersion: String? {
-        guard let path = embeddedExtensionPath,
-              let bundle = Bundle(path: path),
-              let version = bundle.infoDictionary?["CFBundleShortVersionString"] as? String else {
-            return nil
-        }
-        return version
-    }
-
     init() {
         checkInstallationStatus()
         checkScreensaverStatus()
@@ -133,32 +123,13 @@ class PluginManager: ObservableObject {
         }
     }
 
-    /// Uninstall the extension.
-    func uninstall() throws {
-        let extensionPath: String
-        if let installed = installedPath, !installed.isEmpty {
-            extensionPath = installed
-        } else if let embedded = embeddedExtensionPath {
-            extensionPath = embedded
-        } else {
-            throw PluginError.extensionPathNotFound
+    /// Register the extension (if needed) and make it the active screensaver
+    /// everywhere — the single action a drag-installed app needs.
+    func activate() async {
+        if !isInstalled {
+            try? install()
         }
-
-        logger.info("Uninstalling extension at: \(extensionPath, privacy: .public)")
-
-        isLoading = true
-        lastError = nil
-
-        do {
-            _ = try runProcess("/usr/bin/pluginkit", arguments: ["-r", extensionPath])
-            logger.info("Extension uninstalled successfully")
-
-            checkInstallationStatus()
-        } catch {
-            isLoading = false
-            lastError = error.localizedDescription
-            throw error
-        }
+        await enableAsScreensaver()
     }
 
     /// Check if our screensaver is the active screensaver on any display.
@@ -214,20 +185,11 @@ class PluginManager: ObservableObject {
 
 enum PluginError: LocalizedError {
     case embeddedExtensionNotFound
-    case extensionPathNotFound
-    case installationFailed(String)
-    case uninstallationFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .embeddedExtensionNotFound:
             return "Embedded extension not found in app bundle"
-        case .extensionPathNotFound:
-            return "Extension path not found"
-        case .installationFailed(let message):
-            return "Installation failed: \(message)"
-        case .uninstallationFailed(let message):
-            return "Uninstallation failed: \(message)"
         }
     }
 }

@@ -23,6 +23,7 @@ struct PreviewMain {
     }
 
     static func snapshot(outDir: String, times: [Double]) {
+        try? FileManager.default.createDirectory(atPath: outDir, withIntermediateDirectories: true)
         // CODESAVER_SNAPSIZE=WxH overrides — e.g. 5120x2880 for perf timing.
         var size = NSSize(width: 1728, height: 1080)
         if let spec = ProcessInfo.processInfo.environment["CODESAVER_SNAPSIZE"] {
