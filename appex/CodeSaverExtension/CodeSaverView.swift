@@ -1,4 +1,5 @@
 import AppKit
+import ImageIO
 import ScreenSaver
 import QuartzCore
 import os.log
@@ -216,6 +217,15 @@ final class BoomSession {
 
     static var shared: BoomSession?
     private static var attempted = false
+
+    /// Forgets the activation's session. Called when the last view goes
+    /// away: the appex host process can outlive a single activation, and a
+    /// static cache that survived would replay the previous desktop on the
+    /// next wake no matter what the igniter just captured.
+    static func release() {
+        shared = nil
+        attempted = false
+    }
 
     private init(core: BoomCore, backdrops: [Int: CGImage],
                  backdropBuffers: [Int: BoomCaptureBuffer], kind: Kind, verb: String) {
@@ -468,6 +478,13 @@ public final class CodeSaverView: ScreenSaverView {
     private var boomFieldIndex = 0
     /// This view's display origin in global CG coords (zero outside handoff).
     private var viewOriginCG = CGPoint.zero
+    /// Field-claim starvation clock (see renderMetalFrame): wall time of the
+    /// first frame this view was refused its field since the session
+    /// anchored, and the rendered frames since. Both reset the moment a
+    /// claim succeeds.
+    private var fieldLostSince: Double = 0
+    private var fieldLostFrames = 0
+    private static let fieldLossGrace = 2.0
 
     // Metal is THE renderer — no CPU fallback (it was pure mirror overhead;
     // every Mac this runs on has a GPU). If Metal init ever fails, the view
@@ -615,8 +632,13 @@ public final class CodeSaverView: ScreenSaverView {
 
     // MARK: Init
 
+    /// Views alive in this process; the shared BoomSession is dropped when
+    /// the count returns to zero (see BoomSession.release).
+    private static var liveViews = 0
+
     public override init?(frame: NSRect, isPreview: Bool) {
         super.init(frame: frame, isPreview: isPreview)
+        Self.liveViews += 1
         animationTimeInterval = 1.0 / 30.0
         loadResources()
         startCycle(freshVerb: true)
@@ -626,6 +648,7 @@ public final class CodeSaverView: ScreenSaverView {
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
+        Self.liveViews += 1
         animationTimeInterval = 1.0 / 30.0
         loadResources()
         startCycle(freshVerb: true)
@@ -703,6 +726,13 @@ public final class CodeSaverView: ScreenSaverView {
                 $0.count == 2 && $0[0] >= 0 && $0[1] > 0 && $0[0] <= data.count - $0[1]
             }
             guard valid else { continue }
+            // The producer packs blocks back to back, so the index's last
+            // byte IS the bin's last byte. Bounds alone can't tell a matched
+            // pair from a NEW bin read against an OLD index (the two files
+            // swap in separately, and the corpus normally grows): every old
+            // block would still fit, and the session would slice the new
+            // file at the old file's boundaries.
+            guard blocks.map({ $0[0] + $0[1] }).max() == data.count else { continue }
             corpusData = data
             fullIndex = idx
             blockRefs = chooseSubset(budget: Self.subsetSize)
@@ -919,7 +949,16 @@ public final class CodeSaverView: ScreenSaverView {
         // compositor source), in which case it ADOPTS the unclaimed field:
         // the built-in gets its own content even though the host never told
         // us which display we are.
-        var owns = boomSession?.claimField(boomFieldIndex, by: ObjectIdentifier(self)) ?? true
+        //
+        // The claim only matters WHILE the field is being drawn. Once the
+        // intro has ended (boomCore released) there is no field pass to
+        // double-render, so the claim is never consulted again — a view that
+        // never won its field must not hold black for the rest of the
+        // session on that account.
+        var owns = true
+        if intro != .none, let session = boomSession {
+            owns = session.claimField(boomFieldIndex, by: ObjectIdentifier(self))
+        }
         if !owns, CACurrentMediaTime() - lastLinkFire > 0.7,
            CACurrentMediaTime() - viewBirth > 1.2,   // let migration/screens win first
            let session = boomSession, let core = boomCore,
@@ -930,6 +969,28 @@ public final class CodeSaverView: ScreenSaverView {
             // syncMetalContent above bound the OLD field's textures; rebind
             // now or this frame paints the wrong display's content.
             syncMetalContent()
+        }
+        // Backstop: migration and adoption are matters of moments. A view
+        // still shut out of its field two seconds (and a run of rendered
+        // frames — a main-thread stall must not count) after the stage was
+        // set is not going to get one: it leaves the show and renders the
+        // ordinary saver instead of a black display. Its display is either
+        // one the manifest never described (hot-plugged after capture) or a
+        // duplicate the host wedged on top of the owner; in both cases the
+        // plain saver beats black.
+        if !owns, boomSession?.isAnchored == true {
+            let wall = CACurrentMediaTime()
+            if fieldLostSince == 0 { fieldLostSince = wall }
+            fieldLostFrames += 1
+            if wall - fieldLostSince > Self.fieldLossGrace, fieldLostFrames >= 15 {
+                BoomDiag.log("\(diagID) never won field \(boomFieldIndex) — leaving the boom, plain saver")
+                leaveBoomSession()
+                syncMetalContent()
+                owns = true
+            }
+        } else {
+            fieldLostSince = 0
+            fieldLostFrames = 0
         }
         guard var frame = owns ? buildFrameInput(scale: scale)
                                : BoomMetalRenderer.FrameInput() else { return }
@@ -1137,6 +1198,8 @@ public final class CodeSaverView: ScreenSaverView {
     /// The UI above the vignette: clock, spinner panel / teleport, idle line.
     private func buildUIQuads(_ frame: inout BoomMetalRenderer.FrameInput,
                               metal: BoomMetalRenderer, scale: CGFloat) {
+        pollWidgetFeed()   // warm the widget feed even while armed/booming
+        pollAlbumArt()     // faster cadence: the tuning window republishes live
         if intro == .armed {
             guard boomOriginOnThisDisplay else { return }
             if boomSession?.kind == .corner {
@@ -1149,6 +1212,10 @@ public final class CodeSaverView: ScreenSaverView {
             }
             return
         }
+        // Widgets first: the saver's own statusline always composites
+        // ABOVE the Claude panels. They exist through the boom, masked to
+        // wiped cells like the clock; the feed was parsed while armed.
+        buildWidgetQuads(&frame, metal: metal, scale: scale)
         if clockVisible { buildClockQuad(&frame, metal: metal) }
         buildPanelQuads(&frame, metal: metal, scale: scale)
     }
@@ -1371,6 +1438,663 @@ public final class CodeSaverView: ScreenSaverView {
         frame.quads.append(.init(key: "clock", rect: cache.blitRect,
                                  maskToWipedCells: intro == .boom))
         clockBottom = cache.bottom
+    }
+
+    // MARK: - Widget panels (live Claude Code sessions + now playing)
+    //
+    // Reads widgets/feed.json — written into the app-group container by
+    // `CodeSaver --feeds` (FeedsService.swift), which merges Claude Code
+    // hook state, bifrocate CoT spools, and the local music player. Panels
+    // follow the approved design: rounded TUI boxes bottom-left, one per
+    // live session, glyph in Claude orange (orange = actual Claude Code;
+    // violet stays the saver's own theater), music bottom-right. A stale
+    // feed (daemon gone) removes every panel — never show frozen state as
+    // if it were live.
+
+    private struct WidgetSession {
+        var cwd = "?"
+        var state = "done"
+        var tool: String?
+        var turnStarted: Double?
+        var turnEnded: Double?
+        var turnTokens: Int?
+        var sessionTokens: Int?
+        var lastActive: Double?
+        var stateSince: Double?
+        var bg: [String: Int] = [:]
+    }
+
+    private struct WidgetFeed {
+        var updated: Double = 0
+        var sessions: [WidgetSession] = []
+        var npApp: String?, npTitle = "", npArtist = ""
+        var npPos: Double = 0, npDur: Double = 0, npTS: Double = 0
+    }
+
+    private var widgetFeed = WidgetFeed()
+    private var widgetPollAt: Double = 0
+    private var widgetFeedMTime: Date?
+
+    // Album art (fed by widgets/albumart.json; style from widgets/settings.json)
+    private var artStyle = "none"          // none | ramp | braille
+    private var artKey = ""                // "app|title|artist" the grids belong to
+    private var artGrids: [String: AlbumArtGrid] = [:]
+    private var artMTime: Date?
+    private var artSettingsMTime: Date?
+    /// Laid-out art rows, cached per (track, style, font size). Caching the
+    /// LAYOUT rather than a bitmap keeps the art on the panel's own character
+    /// grid — a rasterized copy could only ever be composited at some pixel
+    /// offset, which is what threw its columns out of line with the chrome.
+    private var artRowsCache: (key: String, style: String, pt: CGFloat,
+                               cols: Int, rows: [NSAttributedString])?
+    /// Budget-fitted re-renders, once per (published grid, style, size,
+    /// tuning) — `published` is albumart.json's mtime, so a knob turn or a
+    /// new source image in the tuner re-renders even at the same size.
+    private var artFitCache: (key: String, style: String, cols: Int, rows: Int,
+                              tuning: Date?, published: Date?, grid: AlbumArtGrid?)?
+    private var artPollAt: Double = 0
+    /// Ceiling for the music panel, expressed as a LINE BUDGET — this is a
+    /// text UI, and "N lines" means something here in a way that a percentage
+    /// of the display never did. The effective ceiling is whichever sits
+    /// lower, this budget or the statusline's bottom.
+    /// TODO: deliberately absurd. On every display tested the statusline is
+    /// the binding constraint and this never fires; it exists so an
+    /// ultra-large display can't hand the panel a comical amount of room.
+    /// Tune it the day one actually bites.
+    private let npMaxLines: CGFloat = 60
+
+    private let ccOrange = NSColor(displayP3Red: 0.851, green: 0.467, blue: 0.341, alpha: 1)
+    private let ccOrangeHot = NSColor(displayP3Red: 0.941, green: 0.647, blue: 0.522, alpha: 1)
+
+    /// CODESAVER_WIDGETS=0 leaves the live feed out entirely — the session
+    /// timers tick with the wall clock, which is the one thing a seeded
+    /// snapshot run cannot pin.
+    private static let widgetsDisabled =
+        ProcessInfo.processInfo.environment["CODESAVER_WIDGETS"] == "0"
+
+    private func pollWidgetFeed() {
+        guard !Self.widgetsDisabled, now >= widgetPollAt else { return }
+        widgetPollAt = now + 1.0
+        guard let url = CorpusStore.corpusDirectory?
+            .appendingPathComponent("widgets/feed.json") else { return }
+        let m = (try? FileManager.default.attributesOfItem(atPath: url.path))?[
+            .modificationDate] as? Date
+        if let m, m == widgetFeedMTime { return }   // unchanged since last decode
+        widgetFeedMTime = m
+        var feed = WidgetFeed()
+        defer { widgetFeed = feed }
+        guard let data = try? Data(contentsOf: url),
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else { return }
+        feed.updated = obj["updated"] as? Double ?? 0
+        for raw in obj["sessions"] as? [[String: Any]] ?? [] {
+            var w = WidgetSession()
+            w.cwd = raw["cwd"] as? String ?? "?"
+            w.state = raw["state"] as? String ?? "done"
+            w.tool = raw["tool"] as? String
+            w.turnStarted = raw["turn_started"] as? Double
+            w.turnEnded = raw["turn_ended"] as? Double
+            w.turnTokens = raw["turn_tokens"] as? Int
+            w.sessionTokens = raw["session_tokens"] as? Int
+            w.lastActive = raw["last_active"] as? Double
+            w.stateSince = raw["state_since"] as? Double
+            w.bg = raw["bg"] as? [String: Int] ?? [:]
+            feed.sessions.append(w)
+        }
+        if let np = obj["nowplaying"] as? [String: Any] {
+            feed.npApp = np["app"] as? String
+            feed.npTitle = np["title"] as? String ?? ""
+            feed.npArtist = np["artist"] as? String ?? ""
+            feed.npPos = np["position"] as? Double ?? 0
+            feed.npDur = np["duration"] as? Double ?? 0
+            feed.npTS = np["ts"] as? Double ?? 0
+        }
+    }
+
+    private func widgetHexColor(_ s: String) -> NSColor? {
+        var h = s; if h.hasPrefix("#") { h.removeFirst() }
+        guard h.count == 6, let v = UInt32(h, radix: 16) else { return nil }
+        return NSColor(deviceRed: CGFloat((v >> 16) & 0xFF) / 255,
+                       green: CGFloat((v >> 8) & 0xFF) / 255,
+                       blue: CGFloat(v & 0xFF) / 255, alpha: 1)
+    }
+
+    /// 4 Hz: style toggle from the host app, art grids from the daemon — and
+    /// from the tuning window, which republishes on every knob turn.
+    private func pollAlbumArt() {
+        guard !Self.widgetsDisabled, now >= artPollAt else { return }
+        artPollAt = now + 0.25
+        let fm = FileManager.default
+        guard let dir = CorpusStore.corpusDirectory?
+            .appendingPathComponent("widgets", isDirectory: true) else { return }
+        let sURL = dir.appendingPathComponent("settings.json")
+        let sM = (try? fm.attributesOfItem(atPath: sURL.path))?[.modificationDate] as? Date
+        if sM != artSettingsMTime {
+            artSettingsMTime = sM
+            if let d = try? Data(contentsOf: sURL),
+               let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+               let st = o["albumArtStyle"] as? String {
+                artStyle = st
+            } else {
+                artStyle = "none"
+            }
+        }
+        guard artStyle != "none" else { return }
+        let aURL = dir.appendingPathComponent("albumart.json")
+        let aM = (try? fm.attributesOfItem(atPath: aURL.path))?[.modificationDate] as? Date
+        guard aM != artMTime else { return }
+        artMTime = aM
+        artRowsCache = nil
+        artFitCache = nil
+        artGrids = [:]
+        artKey = ""
+        guard let d = try? Data(contentsOf: aURL),
+              let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+              let key = o["key"] as? String else { return }
+        artKey = key
+        for style in ["ramp", "braille"] {
+            guard let g = o[style] as? [String: Any],
+                  let grid = AlbumArtGrid(json: g) else { continue }
+            artGrids[style] = grid
+        }
+    }
+
+    /// Row step of an art grid in points at the current base font.
+    private func artRowStep(_ g: AlbumArtGrid) -> CGFloat {
+        g.rowStep(baseFont: font!, charW: charW)
+    }
+
+    /// Rasterize the art grid once per (track, style, scale); the cached
+    /// image is then blitted into the per-frame panel raster.
+    private func albumArtRows(_ grid: AlbumArtGrid,
+                              style: String) -> [NSAttributedString] {
+        if let c = artRowsCache, c.key == artKey, c.style == style,
+           c.pt == font!.pointSize, c.cols == grid.cols {
+            return c.rows
+        }
+        let rows = grid.attributedRows(baseFont: font!)
+        artRowsCache = (artKey, style, font!.pointSize, grid.cols, rows)
+        return rows
+    }
+
+    /// The grid that fits the height budget. Never scales the FONT: glyphs at
+    /// a scaled size have a different advance and can never sit on the
+    /// panel's cell grid — that was the misalignment. When the published grid
+    /// is too tall, the art is RE-RENDERED at fewer cells (the renderers are
+    /// native and in-process), so every glyph stays at the panel's own cell
+    /// size, on cell boundaries, at any budget.
+    private func fittedArtGrid(room: CGFloat) -> AlbumArtGrid? {
+        guard let g = artGrids[artStyle], g.cols > 0, g.rows > 0 else { return nil }
+        let naturalH = artRowStep(g) * CGFloat(g.rows)
+        if naturalH <= room { return g }             // native size fits
+        let s = room / max(1, naturalH)
+        guard s >= 0.45 else { return nil }          // below this it's a smudge
+        let cols = max(8, Int((CGFloat(g.cols) * s).rounded(.down)))
+        let rows = max(4, Int((CGFloat(g.rows) * s).rounded(.down)))
+        let tuningTS = AlbumArtTuning.url.flatMap {
+            (try? FileManager.default.attributesOfItem(atPath: $0.path))?[
+                .modificationDate] as? Date
+        }
+        if let c = artFitCache, c.key == artKey, c.style == artStyle,
+           c.cols == cols, c.rows == rows, c.tuning == tuningTS,
+           c.published == artMTime {
+            return c.grid
+        }
+        // Re-render from what the PUBLISHED grid was rendered from: the
+        // tuner publishes its live knobs and the image it opened alongside
+        // the grid, so a fit-down in the tuning window tracks the sliders
+        // and the picked cover, not the last-saved tuning and whatever track
+        // is playing. The daemon's grids carry neither, and fall back to the
+        // saved tuning over the current track's art as before.
+        var grid: AlbumArtGrid?
+        let fm = FileManager.default
+        let srcURL = g.sourcePath.flatMap { fm.isReadableFile(atPath: $0) ? URL(fileURLWithPath: $0) : nil }
+            ?? CorpusStore.corpusDirectory?.appendingPathComponent("widgets/albumart-src.img")
+        if let srcURL,
+           let isrc = CGImageSourceCreateWithURL(srcURL as CFURL, nil),
+           let img = CGImageSourceCreateImageAtIndex(isrc, 0, nil) {
+            let tuning = g.tuning ?? AlbumArtTuning.load()
+            if artStyle == "ramp" {
+                var p = AlbumArtRamp.Params(json: tuning["ramp"] ?? [:])
+                p.cols = Double(cols)
+                p.rows = Double(rows)
+                grid = AlbumArtRamp.render(img, params: p)
+                    .flatMap { AlbumArtGrid(json: $0) }
+            } else {
+                var p = AlbumArtBraille.Params(json: tuning["braille"] ?? [:])
+                p.cols = Double(cols)
+                p.rows = Double(rows)
+                grid = AlbumArtBraille.render(img, params: p)
+                    .flatMap { AlbumArtGrid(json: $0) }
+            }
+        }
+        artFitCache = (artKey, artStyle, cols, rows, tuningTS, artMTime, grid)
+        return grid
+    }
+
+    /// Terminal-style marquee: hold, walk one glyph at a time, hold at the
+    /// far end, snap back. Featured-artist credits routinely run past any
+    /// sane panel width, and clipping them drops the collaborators entirely.
+    private func marqueeText(_ text: String, width: Int) -> String {
+        let chars = Array(text)
+        guard width > 0, chars.count > width else { return text }
+        let over = chars.count - width
+        let glyph = 0.34            // seconds per glyph
+        let hold = 2.2              // pause at each end
+        let cycle = hold * 2 + Double(over) * glyph
+        let t = now.truncatingRemainder(dividingBy: cycle)
+        let off: Int
+        if t < hold { off = 0 }
+        else if t < hold + Double(over) * glyph { off = Int((t - hold) / glyph) }
+        else { off = over }
+        let start = min(over, max(0, off))
+        return String(chars[start..<min(chars.count, start + width)])
+    }
+
+    /// "~/Desktop/codesaver" from an absolute cwd.
+    private func widgetTilde(_ path: String) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return path.hasPrefix(home) ? "~" + path.dropFirst(home.count) : path
+    }
+
+    private func widgetStateLabel(_ w: WidgetSession) -> String {
+        switch w.state {
+        case "thinking":     return "Thinking"
+        case "responding":   return "Responding"
+        case "toolcall":     return "\(w.tool ?? "?"): emit"
+        case "waiting_tool": return "\(w.tool ?? "?"): exec"
+        case "permission":   return "Permissions required"
+        default:             return "Done"
+        }
+    }
+
+    /// "2 agents, 1 monitor still running" from Stop's background_tasks.
+    private func widgetBGLabel(_ bg: [String: Int]) -> String? {
+        guard !bg.isEmpty else { return nil }
+        let names: [(key: String, one: String, many: String)] = [
+            ("subagent", "agent", "agents"), ("monitor", "monitor", "monitors"),
+            ("shell", "shell", "shells"), ("workflow", "workflow", "workflows"),
+            ("teammate", "teammate", "teammates"),
+            ("cloud session", "cloud session", "cloud sessions"),
+            ("MCP task", "MCP task", "MCP tasks"),
+        ]
+        var parts: [String] = []
+        for n in names {
+            if let c = bg[n.key], c > 0 { parts.append("\(c) \(c == 1 ? n.one : n.many)") }
+        }
+        for (k, c) in bg.sorted(by: { $0.key < $1.key })
+        where !names.contains(where: { $0.key == k }) && c > 0 {
+            parts.append("\(c) \(k)")
+        }
+        guard !parts.isEmpty else { return nil }
+        return parts.joined(separator: ", ") + " still running"
+    }
+
+    /// The "(4m 12s ∙ 8.2k tokens ∙ …)" tail; nil during the latency window.
+    private func widgetParen(_ w: WidgetSession, wall: Double) -> String? {
+        var parts: [String] = []
+        if w.state != "done" {
+            // Active: time in THIS state, then the turn's totals.
+            if let ss = w.stateSince, wall > ss { parts.append(timeString(wall - ss)) }
+            if let tok = w.turnTokens, tok > 0 { parts.append("\(countString(Double(tok))) tokens") }
+            if let t0 = w.turnStarted, wall > t0 + 1 {
+                parts.append("elapsed " + timeString(wall - t0))
+            }
+            guard !parts.isEmpty else { return nil }
+            return "(" + parts.joined(separator: " \u{2219} ") + ")"
+        }
+        if let tok = w.turnTokens, tok > 0 { parts.append("\(countString(Double(tok))) tokens") }
+        if let bgl = widgetBGLabel(w.bg) { parts.append(bgl) }
+        if let la = w.lastActive, wall - la > 5 {
+            let ago = wall - la
+            let label = ago < 60 ? "\(Int(ago))s"
+                : ago < 5400 ? "\(Int((ago / 60).rounded()))m"
+                : "\(Int((ago / 3600).rounded()))h"
+            parts.append("\(label) ago")
+        }
+        guard !parts.isEmpty else { return nil }
+        return "(" + parts.joined(separator: " \u{2219} ") + ")"
+    }
+
+    private struct WidgetRow { var runs: [(String, [NSAttributedString.Key: Any])] }
+
+    /// Rasterizes one rounded TUI panel and appends its quad. `rows` are
+    /// full-width strings of exactly `cols` characters (rails included).
+    private func emitWidgetPanel(_ frame: inout BoomMetalRenderer.FrameInput,
+                                 metal: BoomMetalRenderer, scale: CGFloat,
+                                 key: String, rows: [WidgetRow],
+                                 bottomLeft origin: NSPoint, mask: Bool,
+                                 art: (rows: [NSAttributedString], step: CGFloat,
+                                       cols: Int, afterRow: Int)? = nil) {
+        let step = lineH
+        var width: CGFloat = 0
+        let built: [NSAttributedString] = rows.map { row in
+            let line = NSMutableAttributedString()
+            for (text, attrs) in row.runs {
+                line.append(NSAttributedString(string: text, attributes: attrs))
+            }
+            width = max(width, line.size().width)
+            return line
+        }
+        let pad: CGFloat = 6
+        let size = NSSize(width: width + pad * 2,
+                          height: step * CGFloat(built.count) + pad * 2)
+        guard let img = rasterUI(size: size, scale: scale, {
+            NSColor.black.withAlphaComponent(0.87).setFill()
+            NSBezierPath(roundedRect: NSRect(origin: .zero, size: size),
+                         xRadius: 3, yRadius: 3).fill()
+            var y = pad
+            for (i, line) in built.enumerated() {
+                line.draw(at: NSPoint(x: pad, y: y))
+                y += step
+                if let art, art.afterRow == i {
+                    // Straight into this context, starting on a CELL BOUNDARY
+                    // of the panel's own grid — the art shares the chrome's
+                    // font, so its columns coincide with the rails and the
+                    // text below. Pixel-centering here is what kept knocking
+                    // the art off the grid.
+                    let totalCells = Int((width / charW).rounded())
+                    let lead = CGFloat(max(1, (totalCells - art.cols) / 2))
+                    AlbumArtGrid.draw(rows: art.rows,
+                                      at: NSPoint(x: pad + lead * charW, y: y),
+                                      step: art.step)
+                }
+            }
+        }) else { return }
+        metal.setUITexture(key, image: img, always: true)
+        frame.quads.append(.init(key: key, rect: CGRect(
+            x: origin.x, y: origin.y - size.height,
+            width: size.width, height: size.height),
+            maskToWipedCells: mask))
+    }
+
+    private func buildWidgetQuads(_ frame: inout BoomMetalRenderer.FrameInput,
+                                  metal: BoomMetalRenderer, scale: CGFloat) {
+        pollWidgetFeed()
+        guard font != nil else { return }
+        let mask = intro == .boom
+        let wall = Date().timeIntervalSince1970
+        guard wall - widgetFeed.updated < 20 else { return }   // daemon stale → nothing
+
+        let base = font!
+        let bold = NSFont(name: "SFMono-Semibold", size: base.pointSize)
+            ?? .monospacedSystemFont(ofSize: base.pointSize, weight: .semibold)
+        let railC = NSColor(white: 0.30, alpha: 1)
+        let railDimC = NSColor(white: 0.20, alpha: 1)
+        let labelC = NSColor(deviceRed: 0.31, green: 0.35, blue: 0.39, alpha: 1)
+        let tokenC = NSColor(deviceRed: 0.43, green: 0.48, blue: 0.53, alpha: 1)
+        let doneC = NSColor(white: 0.44, alpha: 1)
+        func run(_ c: NSColor, _ f0: NSFont? = nil) -> [NSAttributedString.Key: Any] {
+            [.font: f0 ?? base, .foregroundColor: c]
+        }
+        func glowRun(_ c: NSColor, halo: NSColor, blur: CGFloat) -> [NSAttributedString.Key: Any] {
+            let sh = NSShadow()
+            sh.shadowColor = halo
+            sh.shadowBlurRadius = blur
+            sh.shadowOffset = .zero
+            return [.font: bold, .foregroundColor: c, .shadow: sh]
+        }
+
+        // Activity floats up, resting sinks: active panels (newest turn first)
+        // above, done panels below. Sorted BEFORE the rack is capped, so the
+        // cap keeps the sessions that are working (the feed arrives in
+        // turn-start order, which would have kept four resting panels over
+        // a long-running tool call or a parked permission prompt).
+        let sessions = Array(widgetFeed.sessions.sorted { l, r in
+            let la = l.state != "done", ra = r.state != "done"
+            if la != ra { return la }
+            return (l.turnStarted ?? 0) > (r.turnStarted ?? 0)
+        }.prefix(4))
+
+        // Uniform rack width from the widest content, clamped.
+        var contents: [(w: WidgetSession, label: String, paren: String?,
+                        cwd: String, bottom: String)] = []
+        var innerMax = 40
+        for w in sessions {
+            let label = widgetStateLabel(w)
+            let paren = widgetParen(w, wall: wall)
+            let cwd = widgetTilde(w.cwd)
+            let bottom = w.sessionTokens.map {
+                "session \(countString(Double($0))) tokens" } ?? ""
+            let contentLen = 2 + 2 + label.count + (paren.map { $0.count + 1 } ?? 0) + 2
+            innerMax = max(innerMax, contentLen, cwd.count + 6, bottom.count + 6)
+        }
+        let inner = min(innerMax, 72)
+        for w in sessions {
+            var label = widgetStateLabel(w)
+            var paren = widgetParen(w, wall: wall)
+            // Status row spends: "│ " + glyph + " " + label + " (paren)" and
+            // must leave the closing " │" on column inner+1, so label and
+            // parenthetical together get inner-6 cells. An over-long label
+            // loses its tail first, never the parenthetical's numbers — but
+            // a parenthetical that can't fit beside even a stub of the label
+            // (several background-task kinds at once) loses ITS tail, closing
+            // paren kept: a row wider than the rails breaks the box.
+            var budget = inner - 5 - (paren.map { $0.count + 1 } ?? 0)
+            let labelStub = min(label.count, 6)
+            if let p = paren, budget < labelStub {
+                let parenMax = inner - 6 - labelStub
+                paren = parenMax >= 5 ? String(p.prefix(parenMax - 2)) + "\u{2026})" : nil
+                budget = inner - 5 - (paren.map { $0.count + 1 } ?? 0)
+            }
+            if label.count > budget, budget > 2 {
+                label = String(label.prefix(budget - 1)) + "\u{2026}"
+            }
+            contents.append((w, label, paren, widgetTilde(w.cwd),
+                             w.sessionTokens.map {
+                                 "session \(countString(Double($0))) tokens" } ?? ""))
+        }
+
+        // The hero spinner panel owns its space: any session panel that
+        // would climb into it is simply not shown. Count what fits first and
+        // keep the HEAD of the sorted rack — stacking bottom-up in reverse
+        // lands the first entry topmost, nearest the hero, and a break inside
+        // that loop would have dropped exactly the active panels the sort
+        // just promoted.
+        let heroSize = spinnerAttributedString().size()
+        let heroBottom = spinnerTextOrigin(for: heroSize).y + heroSize.height
+            + uiFont.pointSize * 1.05 + lineH * 0.75
+        let panelH = lineH * 3 + 12
+        let pitch = lineH * 3 + 14 + lineH * 0.5
+        let margin = lineH * 1.2
+        var y = bounds.height - margin          // stack grows upward
+        let fitCount = contents.indices.prefix {
+            y - CGFloat($0) * pitch - panelH >= heroBottom
+        }.count
+        for (i, c) in contents.prefix(fitCount).enumerated().reversed() {
+            let active = c.w.state != "done"
+            let rC = active ? railC : railDimC
+            // Frames 1...5 only: at panel scale the hero's "·" rest frame
+            // reads as a dropout, not a beat.
+            let glyphFrame = active
+                ? Self.spinnerFrames[1 + Int(((1 - cos(2 * Double.pi * (now + Double(i) * 0.37) / 2.4)) / 2 * 4).rounded())]
+                : "\u{273B}"
+
+            // Top rail: ╭─ cwd ────╮ (truncate cwd from the left if huge)
+            var cwd = c.cwd
+            if cwd.count > inner - 6 { cwd = "\u{2026}" + cwd.suffix(inner - 7) }
+            let topFill = max(0, inner - cwd.count - 4)
+            let top = WidgetRow(runs: [
+                ("\u{256D}\u{2500} ", run(rC)),
+                (cwd, run(labelC)),
+                (" " + String(repeating: "\u{2500}", count: topFill) + "\u{256E}", run(rC)),
+            ])
+
+            // Status row: │ ✻ Label (…) padded │
+            var runs: [(String, [NSAttributedString.Key: Any])] = []
+            runs.append(("\u{2502} ", run(rC)))
+            var used = 2
+            if active {
+                runs.append((glyphFrame, glowRun(ccOrange.blended(withFraction: 0.25, of: ccOrangeHot) ?? ccOrange,
+                    halo: ccOrangeHot.withAlphaComponent(0.85),
+                    blur: base.pointSize * 0.55)))
+                runs.append((" ", run(rC)))
+                // The hero statusline's per-character glow ripple, in Claude
+                // clay: orange base sweeping toward warm white, desynced per
+                // panel so the rack never pulses in lockstep.
+                let chars = Array(c.label)
+                let period = Double(chars.count) + 16
+                let pos = ((now + Double(i) * 2.13) * 13)
+                    .truncatingRemainder(dividingBy: period) - 5
+                for (k, ch) in chars.enumerated() {
+                    let d = Double(k) - pos
+                    let b = CGFloat(exp(-(d * d) / (2 * 1.9 * 1.9)))
+                    var attrs: [NSAttributedString.Key: Any] = [
+                        .font: bold,
+                        .foregroundColor: ccOrange.mixed(with: glowText, 0.9 * b),
+                    ]
+                    if b > 0.1 {
+                        let sh = NSShadow()
+                        sh.shadowColor = ccOrangeHot.withAlphaComponent(0.9 * b)
+                        sh.shadowBlurRadius = base.pointSize * 0.65 * b
+                        sh.shadowOffset = .zero
+                        attrs[.shadow] = sh
+                    }
+                    runs.append((String(ch), attrs))
+                }
+            } else {
+                runs.append((glyphFrame + " ", run(doneC)))
+                runs.append((c.label, run(doneC)))
+            }
+            used += 2 + c.label.count
+            if let paren = c.paren {
+                runs.append((" ", run(rC)))
+                runs.append((paren, run(active ? NSColor(white: 0.5, alpha: 1) : doneC)))
+                used += 1 + paren.count
+            }
+            let fill = max(0, inner - used - 1)
+            runs.append((String(repeating: " ", count: fill) + " \u{2502}", run(rC)))
+            let status = WidgetRow(runs: runs)
+
+            // Bottom rail: ╰────── session N tokens ─╯
+            let bl = c.bottom
+            let botFill = max(0, inner - bl.count - 4)
+            let bottom = WidgetRow(runs: [
+                ("\u{2570}" + String(repeating: "\u{2500}", count: botFill) + " ", run(rC)),
+                (bl, run(tokenC)),
+                (" \u{2500}\u{256F}", run(rC)),
+            ])
+
+            emitWidgetPanel(&frame, metal: metal, scale: scale,
+                            key: "widget-s\(i)", rows: [top, status, bottom],
+                            bottomLeft: NSPoint(x: leftInset, y: y), mask: mask)
+            y -= pitch
+        }
+
+        buildNowPlayingQuad(&frame, metal: metal, scale: scale, wall: wall,
+                            mask: mask)
+    }
+
+    private func buildNowPlayingQuad(_ frame: inout BoomMetalRenderer.FrameInput,
+                                     metal: BoomMetalRenderer, scale: CGFloat,
+                                     wall: Double, mask: Bool) {
+        guard let app = widgetFeed.npApp, !widgetFeed.npTitle.isEmpty,
+              wall - widgetFeed.npTS < 15 else { return }
+        // The panel is BUDGETED, never gated. Its ceiling is whichever sits
+        // lower: a fixed share of the screen, or the bottom of the hero
+        // statusline. The art then scales into whatever remains, so it can
+        // never clip the statusline no matter how long the verb runs — the
+        // old approach let a long verb make the art vanish entirely.
+        let heroSize = spinnerAttributedString().size()
+        let heroBottom = spinnerTextOrigin(for: heroSize).y + heroSize.height
+            + uiFont.pointSize * 1.05 + lineH * 0.75
+        let npMargin = lineH * 1.2
+        let ceiling = max(bounds.height - npMaxLines * lineH, heroBottom)
+            + lineH * 0.6
+        let chromeH = lineH * 5 + 12
+        guard bounds.height - npMargin - chromeH >= ceiling else { return }
+        let base = font!
+        let railC = NSColor(white: 0.26, alpha: 1)
+        let labelC = NSColor(deviceRed: 0.31, green: 0.35, blue: 0.39, alpha: 1)
+        let titleC = NSColor(deviceRed: 0.58, green: 0.65, blue: 0.72, alpha: 1)
+        func run(_ c: NSColor) -> [NSAttributedString.Key: Any] {
+            [.font: base, .foregroundColor: c]
+        }
+
+        let title0 = widgetFeed.npTitle, artist0 = widgetFeed.npArtist
+        // Without art the panel still needs some width; WITH art, the art
+        // alone decides it. Track metadata never widens the panel — a long
+        // feature credit used to stretch it halfway across the screen.
+        var inner = min(60, max(40, max(title0.count, artist0.count) + 6))
+        var art: AlbumArtGrid?
+        if artStyle != "none",
+           artKey == "\(app)|\(widgetFeed.npTitle)|\(widgetFeed.npArtist)" {
+            let room = bounds.height - npMargin - chromeH - ceiling
+            art = fittedArtGrid(room: room)
+            if let g = art { inner = max(24, g.cols + 3) }
+        }
+        // Title clips, artist scrolls — both bounded by the art-derived width
+        // instead of being allowed to set it.
+        let field = max(4, inner - 3)
+        var title = title0
+        if title.count > field { title = String(title.prefix(field - 1)) + "\u{2026}" }
+        let artist = marqueeText(artist0, width: field)
+
+        func timeMS(_ v: Double) -> String {
+            let s = max(0, Int(v)); return "\(s / 60):" + String(format: "%02d", s % 60)
+        }
+        let pos = min(widgetFeed.npDur, widgetFeed.npPos + (wall - widgetFeed.npTS))
+        let posS = timeMS(pos), durS = timeMS(widgetFeed.npDur)
+
+        let head = "\u{266A} now playing"
+        let topFill = max(0, inner - head.count - 4)
+        let top = WidgetRow(runs: [
+            ("\u{256D}\u{2500} ", run(railC)), (head, run(labelC)),
+            (" " + String(repeating: "\u{2500}", count: topFill) + "\u{256E}", run(railC)),
+        ])
+        // Row-width invariant: every row is exactly inner+1 cells wide.
+        func padRow(_ text: String, _ c: NSColor) -> WidgetRow {
+            let fill = max(0, inner - text.count - 3)
+            return WidgetRow(runs: [
+                ("\u{2502} ", run(railC)), (text, run(c)),
+                (String(repeating: " ", count: fill) + " \u{2502}", run(railC)),
+            ])
+        }
+        let titleRow = padRow(title, titleC)
+        let artistRow = padRow(artist, NSColor(white: 0.40, alpha: 1))
+
+        // 2:41 ───────●─────── 4:11
+        let barW = max(6, inner - posS.count - durS.count - 5)
+        let frac = widgetFeed.npDur > 0 ? pos / widgetFeed.npDur : 0
+        let mark = min(barW - 1, max(0, Int(Double(barW) * frac)))
+        var progRuns: [(String, [NSAttributedString.Key: Any])] = []
+        progRuns.append(("\u{2502} ", run(railC)))
+        progRuns.append((posS + " ", run(NSColor(white: 0.40, alpha: 1))))
+        progRuns.append((String(repeating: "\u{2500}", count: mark), run(NSColor(white: 0.30, alpha: 1))))
+        progRuns.append(("\u{25CF}", run(cursorColor)))
+        progRuns.append((String(repeating: "\u{2500}", count: barW - mark - 1), run(NSColor(white: 0.22, alpha: 1))))
+        progRuns.append((" " + durS, run(NSColor(white: 0.40, alpha: 1))))
+        progRuns.append((" \u{2502}", run(railC)))
+        let progRow = WidgetRow(runs: progRuns)
+
+        let bl = app + ".app"
+        let botFill = max(0, inner - bl.count - 4)
+        let bottom = WidgetRow(runs: [
+            ("\u{2570}" + String(repeating: "\u{2500}", count: botFill) + " ", run(railC)),
+            (bl, run(labelC)), (" \u{2500}\u{256F}", run(railC)),
+        ])
+
+        var rows = [top]
+        var artPayload: (rows: [NSAttributedString], step: CGFloat,
+                         cols: Int, afterRow: Int)?
+        if let g = art {
+            // Blank rows (│ + spaces + │) reserve the art's height AND supply
+            // its side rails; the art is drawn over them at NATIVE cell size.
+            let stepA = artRowStep(g)
+            let h = stepA * CGFloat(g.rows) + 4
+            let n = max(1, Int((h / lineH).rounded(.up)))
+            for _ in 0..<n { rows.append(padRow("", titleC)) }
+            artPayload = (albumArtRows(g, style: artStyle), stepA, g.cols, 0)
+        }
+        rows += [titleRow, artistRow, progRow, bottom]
+        let width = CGFloat(inner + 2) * charW * 1.0
+        let margin = lineH * 1.2
+        emitWidgetPanel(&frame, metal: metal, scale: scale, key: "widget-np",
+                        rows: rows,
+                        bottomLeft: NSPoint(
+                            x: bounds.width - leftInset - width - 12,
+                            y: bounds.height - margin), mask: mask,
+                        art: artPayload)
     }
 
     private func appendTeleportFlash(_ fills: inout [BoomMetalRenderer.CellInstance],
@@ -1683,6 +2407,11 @@ public final class CodeSaverView: ScreenSaverView {
 
     deinit {
         stopFrameClock()
+        Self.liveViews -= 1
+        if Self.liveViews <= 0 {
+            Self.liveViews = 0
+            BoomSession.release()
+        }
     }
 
     /// Advances the simulation clock. Exposed for the preview/snapshot harness.
@@ -2147,6 +2876,14 @@ public final class CodeSaverView: ScreenSaverView {
     /// every frame itself.
     public var externallyDriven = false
 
+    /// Reseeds the scene's random stream (corpus draws, verb picks, writer
+    /// placement, dwell times). The snapshot harness pins it before building
+    /// a view, so the same timestamps render the same frames run after run;
+    /// the shipping saver never calls it and stays entropy-seeded.
+    public static func seedSceneRNG(_ seed: UInt64) {
+        saverRNG = SaverRNG(state: seed)
+    }
+
     /// The captured desktop this view stands in front of. Production reads it
     /// off the session; the harness hands each display its own screenshot.
     public var previewBackdrop: CGImage?
@@ -2162,7 +2899,7 @@ public final class CodeSaverView: ScreenSaverView {
     /// through a frame finds the work already done.
     public func previewReset(core: BoomCore, fieldIndex: Int,
                              arm: Double, seed: UInt64) {
-        saverRNG = SaverRNG(state: seed)
+        Self.seedSceneRNG(seed)
         setupSize = .zero          // makes ensureSetup rebuild rows + writers
         ensureSetup()
         startCycle(freshVerb: true)
@@ -2242,8 +2979,18 @@ public final class CodeSaverView: ScreenSaverView {
     /// launch — the snapshot harness's deterministic trigger.
     private func configureIntroFromEnv() {
         guard let spec = ProcessInfo.processInfo.environment["CODESAVER_BOOM"] else { return }
-        let parts = spec.split(separator: ",").compactMap { Double($0) }
-        guard parts.count >= 2 else { return }
+        // Strict: every field must parse, in place. Dropping a bad field and
+        // reading the survivors positionally armed the boom at the wrong
+        // point with the wrong countdown, silently — the one thing a
+        // deterministic snapshot trigger must never do.
+        let fields = spec.split(separator: ",", omittingEmptySubsequences: false)
+            .map { Double($0.trimmingCharacters(in: .whitespaces)) }
+        guard (2...3).contains(fields.count),
+              fields.allSatisfy({ $0.map(\.isFinite) == true }) else {
+            viewLog.error("CODESAVER_BOOM=\"\(spec, privacy: .public)\" is not \"x,y[,armSeconds]\" — intro not armed")
+            return
+        }
+        let parts = fields.compactMap { $0 }
         armIntro(atNormalized: CGPoint(x: parts[0], y: parts[1]),
                  countdown: parts.count >= 3 ? parts[2] : 2.0)
     }
@@ -2258,12 +3005,31 @@ public final class CodeSaverView: ScreenSaverView {
         guard intro == .none, let win = window, bounds.width > 8 else { return }
         guard let session = BoomSession.loadIfNeeded(codeLines: { self.boomCodeLines() },
                                                      verbs: verbs.map(\.ing)) else { return }
-        // Which field is ours: appex service windows sit at their display's
-        // CG origin (see clockVisible).
         let wo = win.frame.origin
-        boomFieldIndex = session.core.fields.firstIndex {
-            abs($0.originCG.x - wo.x) < 0.5 && abs($0.originCG.y - wo.y) < 0.5
-        } ?? 0
+        // A view that turns up after the show is over (a display hot-plugged
+        // or woken mid-session: the host builds it a fresh view, and the
+        // cached session is still the activation's) has nothing to replay —
+        // stepping the shared core through every missed tick would stall the
+        // whole process for seconds per minute of age. It starts as the
+        // ordinary saver, which is exactly where the others already are.
+        let t = session.simTime
+        if t > session.core.duration + 5 {
+            BoomDiag.log(String(format: "%@ attach: session %.0f s old — boom over, plain saver",
+                                diagID, t))
+            return
+        }
+        // Which field is ours: appex service windows sit at their display's
+        // CG origin (see clockVisible). No field for this origin (or for the
+        // window's screen) means the manifest never described this display:
+        // it is not one of the show's, so it never binds a field — binding
+        // it to field 0 regardless would only make it a second claimant on
+        // the main display, refused every frame and holding black for it.
+        guard let idx = fieldIndex(in: session, for: win) else {
+            BoomDiag.log(String(format: "%@ attach: window origin (%.0f, %.0f) matches no field — plain saver",
+                                diagID, wo.x, wo.y))
+            return
+        }
+        boomFieldIndex = idx
         boomSession = session
         boomCore = session.core
         BoomDiag.log(String(format: "%@ attach: window origin (%.0f, %.0f) → field %d, simTime %.2f",
@@ -2275,7 +3041,6 @@ public final class CodeSaverView: ScreenSaverView {
             y: (session.core.params.originCG.y - viewOriginCG.y) / fieldSize.height)
         armedVerb = session.verb
         for i in rows.indices { rows[i] = [] }
-        let t = session.simTime
         if t < 0 {
             intro = .armed
             armEndsAt = now - t
@@ -2283,6 +3048,41 @@ public final class CodeSaverView: ScreenSaverView {
         } else {
             detonate(start: now - t)
         }
+    }
+
+    /// The session field a window belongs to: by frame origin first (where
+    /// the host puts service windows), else by the window's screen — nil
+    /// when the display is not one the manifest captured.
+    private func fieldIndex(in session: BoomSession, for win: NSWindow) -> Int? {
+        let wo = win.frame.origin
+        if let i = session.core.fields.firstIndex(where: {
+            abs($0.originCG.x - wo.x) < 0.5 && abs($0.originCG.y - wo.y) < 0.5
+        }) { return i }
+        guard let screen = win.screen,
+              let num = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID
+        else { return nil }
+        let b = CGDisplayBounds(num)
+        return session.core.fields.firstIndex {
+            abs($0.originCG.x - b.origin.x) < 0.5 && abs($0.originCG.y - b.origin.y) < 0.5
+        }
+    }
+
+    /// Drops out of the shared show and becomes the ordinary saver: no
+    /// session, no core, no field — the plain steady state from the next
+    /// frame. The session itself lives on for the sibling views.
+    private func leaveBoomSession() {
+        guard let session = boomSession else { return }
+        session.releaseField(boomFieldIndex, by: ObjectIdentifier(self))
+        boomSession = nil
+        boomCore = nil
+        intro = .none
+        viewOriginCG = .zero
+        fieldLostSince = 0
+        fieldLostFrames = 0
+        // A screen link chosen for the abandoned field is the wrong clock
+        // now; re-engagement without a session picks the plain grid timer.
+        reengageFallbackIfNeeded()
+        setNeedsDisplay(bounds)
     }
 
     /// The host parks every window on the main display first and migrates it
@@ -2404,7 +3204,10 @@ public final class CodeSaverView: ScreenSaverView {
             viewOriginCG = .zero
         }
         guard let core = boomCore else { return }
-        core.advance(to: max(0, now - boomStart))
+        // Same cap as the per-frame catch-up in advance(by:): past
+        // duration+6 the field is fully transitioned, and a start handed in
+        // from an old session clock must not replay every tick since.
+        core.advance(to: min(max(0, now - boomStart), core.duration + 6))
         for i in core.fields.indices { _ = core.drainPaints(i) }
         // The boom opens a fresh request; its latency window covers the whole
         // show — parens only after the zap has landed.
@@ -2620,7 +3423,9 @@ public final class CodeSaverView: ScreenSaverView {
         let secStr = String(format: "%02d", c.second ?? 0)
         let scale = window?.backingScaleFactor ?? 2
 
-        let key = "\(hourStr):\(minStr):\(secStr)|\(c.day ?? 0)|\(use24Hour)|" +
+        // Keyed on the 24-hour `hh`, not just the rendered hour: in 12-hour
+        // mode the raster also carries AM/PM, which hourStr cannot tell apart.
+        let key = "\(hh)|\(hourStr):\(minStr):\(secStr)|\(c.day ?? 0)|\(use24Hour)|" +
             "\(Int(bounds.width))x\(Int(bounds.height))|\(scale)|\(clockScale)|\(clockPadCells)|" +
             "\(clockVPadRows)|\(clockBackdropAlpha)|\(clockBorderWhite)|\(clockDigitWhite)|\(clockTopFrac)"
         if clockCache?.key != key {

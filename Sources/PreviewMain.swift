@@ -9,6 +9,11 @@ import ScreenCaptureKit
 // Set CODESAVER_RESOURCES to a directory containing corpus.txt / spinner-verbs.txt.
 // The previewer drops a stand-in desktop capture in for the boom; override it
 // with CODESAVER_CAPTURE or by dropping build/stand-in-capture.png.
+// Snapshots seed the scene RNG (corpus picks, verbs, writer placement) with a
+// fixed constant so two runs — or two batches of one clip — line up;
+// CODESAVER_SEED=<decimal|0xhex> picks a different deterministic scene.
+// The live widget panels read the real feed (their timers follow the wall
+// clock); CODESAVER_WIDGETS=0 leaves them out for byte-identical frames.
 
 @main
 struct PreviewMain {
@@ -30,6 +35,10 @@ struct PreviewMain {
             let parts = spec.split(separator: "x").compactMap { Double($0) }
             if parts.count == 2 { size = NSSize(width: parts[0], height: parts[1]) }
         }
+        // Seed BEFORE the view exists: init draws the first corpus subset,
+        // verb, and writer bands off the scene RNG. detonate() pins its
+        // BoomCore the same way; this is the other half of "deterministic".
+        CodeSaverView.seedSceneRNG(sceneSeed)
         guard let view = CodeSaverView(frame: NSRect(origin: .zero, size: size), isPreview: false) else {
             fatalError("failed to create view")
         }
@@ -63,6 +72,25 @@ struct PreviewMain {
     }
 
     static var tuner: Tuner?
+
+    /// Scene seed for the snapshot harness: CODESAVER_SEED (decimal or
+    /// 0x-hex), else the constant detonate() pins its BoomCore to. A value
+    /// that doesn't parse is reported, not silently swapped for the default.
+    static var sceneSeed: UInt64 {
+        let fallback: UInt64 = 0xC0DE_5AFE
+        guard let raw = ProcessInfo.processInfo.environment["CODESAVER_SEED"]?
+                .trimmingCharacters(in: .whitespaces), !raw.isEmpty else { return fallback }
+        let lower = raw.lowercased()
+        let parsed = lower.hasPrefix("0x")
+            ? UInt64(lower.dropFirst(2), radix: 16)
+            : UInt64(raw)
+        guard let v = parsed else {
+            FileHandle.standardError.write(
+                Data("CODESAVER_SEED=\(raw) is not a UInt64; using default seed\n".utf8))
+            return fallback
+        }
+        return v
+    }
 
     /// The stand-in desktop, decoded once — the backdrop for any display we
     /// couldn't screenshot.
@@ -673,6 +701,12 @@ final class Tuner: NSObject {
         let replay = pendingRebuild || target < frame
         pendingRebuild = false
         if replay {
+            // makeCore() draws the debris code pool off the scene RNG. Seed
+            // FIRST, or the pool depends on how many draws the previous
+            // replay's stepping consumed — and a .sim knob replay would
+            // compare two different pictures. previewReset reseeds per view
+            // right after, as before.
+            CodeSaverView.seedSceneRNG(seed)
             core = makeCore()
             if let core {
                 let stand = PreviewMain.standIn()

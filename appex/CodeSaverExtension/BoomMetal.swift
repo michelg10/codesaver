@@ -509,6 +509,63 @@ final class BoomMetalRenderer {
     /// clears the phosphor when the pulse ends.
     private var lastPulseActive = false
 
+    // MARK: In-flight fence
+    //
+    // Every dynamic resource here is ONE instance rewritten in place — the
+    // per-frame UI rasters (tex.replace), the dyn/glow textures, the glyph,
+    // fill and instance buffers. CAMetalLayer hands out up to three
+    // drawables, so with nothing else in the way the CPU could be filling
+    // frame N while the GPU still reads N-1: transient tearing under load.
+    // The cheap fix is one frame in flight at a time — a frame's first
+    // in-place write waits for the previous command buffer to complete.
+    // That forfeits CPU/GPU overlap, which at this workload (~1–3 ms a side
+    // at 30 Hz) costs nothing visible. A triple-buffer refactor would swap
+    // this for a per-slot resource ring and a semaphore of value 3.
+    private let inFlight = DispatchSemaphore(value: 1)
+    /// This frame has already waited (the wait is once per frame).
+    private var frameHeld = false
+    /// …and the wait actually succeeded, so a signal is owed. A wait that
+    /// timed out proceeds WITHOUT a token: the straggling command buffer's
+    /// own handler restores the count, and nothing double-signals.
+    private var frameOwnsToken = false
+
+    /// Call before the first in-place resource write of a frame; idempotent
+    /// within one. The view writes UI rasters BEFORE renderFrame, so this
+    /// runs from setUITexture as well as from the frame entry points.
+    /// libdispatch traps if a semaphore dies below its initial value, so a
+    /// renderer torn down between a UI-raster write and its frame gives
+    /// the token back first.
+    deinit { releaseFrame() }
+
+    private func acquireFrame() {
+        guard !frameHeld else { return }
+        frameHeld = true
+        // Bounded: a command buffer that never completes (GPU reset, a lost
+        // handler) must never wedge the saver.
+        frameOwnsToken = inFlight.wait(timeout: .now() + .milliseconds(100)) == .success
+    }
+
+    /// Ends a frame that did NOT commit a command buffer (or one that
+    /// already waited for its own completion).
+    private func releaseFrame() {
+        guard frameHeld else { return }
+        frameHeld = false
+        if frameOwnsToken { inFlight.signal() }
+        frameOwnsToken = false
+    }
+
+    /// Hands the frame's token to `cb`: released when the GPU is done with
+    /// every resource this frame wrote.
+    private func handOffFrame(to cb: MTLCommandBuffer) {
+        guard frameHeld else { return }
+        frameHeld = false
+        if frameOwnsToken {
+            let fence = inFlight
+            cb.addCompletedHandler { _ in fence.signal() }
+        }
+        frameOwnsToken = false
+    }
+
     // Rolling perf counters (CODESAVER_PERF=1).
     private static let perfEnabled = ProcessInfo.processInfo.environment["CODESAVER_PERF"] == "1"
     private var perfFrames = 0
@@ -620,6 +677,7 @@ final class BoomMetalRenderer {
         uiImageIdentity[key] = ObjectIdentifier(image)
         if let tex = uiTextures[key], tex.width == image.width, tex.height == image.height,
            let data = imageBytes(image) {
+            acquireFrame()   // in-place: the previous frame may still sample it
             data.withUnsafeBytes { raw in
                 tex.replace(region: MTLRegionMake2D(0, 0, image.width, image.height),
                             mipmapLevel: 0, withBytes: raw.baseAddress!,
@@ -738,17 +796,24 @@ final class BoomMetalRenderer {
             layer.drawableSize = CGSize(width: pw, height: ph)
             layer.contentsScale = scale
         }
+        acquireFrame()
         if let core, let field = boundField { uploadDyn(field: field, tick: core.tickCount) }
         let cpuStart = CACurrentMediaTime()
         autoreleasepool {
             guard let drawable = layer.nextDrawable(),
-                  let cb = ctx.queue.makeCommandBuffer() else { return }
+                  let cb = ctx.queue.makeCommandBuffer() else {
+                releaseFrame()   // nothing committed: give the token back now
+                return
+            }
+            // encodeFrame's own early-out (no encoder) still commits below,
+            // so the hand-off covers every path from here on.
             encodeFrame(frame, target: drawable.texture, core: core,
                         fieldIndex: fieldIndex, commandBuffer: cb, scale: scale)
             cb.addCompletedHandler { [weak self] done in
                 let gpu = (done.gpuEndTime - done.gpuStartTime) * 1000
                 DispatchQueue.main.async { self?.notePerf(gpuMs: gpu) }
             }
+            handOffFrame(to: cb)
             cb.present(drawable)
             cb.commit()
         }
@@ -784,6 +849,10 @@ final class BoomMetalRenderer {
             pixelFormat: .bgra8Unorm, width: pw, height: ph, mipmapped: false)
         d.usage = .renderTarget
         d.storageMode = .private
+        // Synchronous frame: fence in, and release on EVERY exit — the
+        // success path has already waited for its own completion by then.
+        acquireFrame()
+        defer { releaseFrame() }
         guard let target = ctx.device.makeTexture(descriptor: d),
               let cb = ctx.queue.makeCommandBuffer() else { return nil }
         if let core, let field = boundField { uploadDyn(field: field, tick: core.tickCount) }

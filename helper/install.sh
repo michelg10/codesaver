@@ -12,6 +12,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 LABEL=com.michelg10.CodeSaver.Igniter
+LOG_DIR="$HOME/Library/Logs/CodeSaver"
 APP_DIR="$HOME/Library/Application Support/CodeSaver/CodeSaverIgniter.app"
 BIN="$APP_DIR/Contents/MacOS/codesaver-igniter"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
@@ -37,9 +38,28 @@ if ! security find-certificate -c "$SIGN_ID" >/dev/null 2>&1; then
   SIGN_ID="-"
 fi
 
-launchctl bootout "gui/$UID_NUM/$LABEL" 2>/dev/null || true
+# Not loaded yet (first install) is the normal failure here; keep its message
+# in case the job is genuinely stuck instead.
+BOOTOUT_ERR=$(launchctl bootout "gui/$UID_NUM/$LABEL" 2>&1 >/dev/null || true)
+# launchd tears the old instance down asynchronously; bootstrapping while
+# that is still in flight fails with "Bootstrap failed: 5: Input/output
+# error" and leaves NO igniter running (the only saver trigger). Wait it out
+# — past launchd's default 20 s ExitTimeOut — and refuse to go on while the
+# old job is still loaded: every bootstrap below would fail, yet `launchctl
+# print` would still answer for the OLD instance and read as success.
+OLD_GONE=0
+for _ in {1..50}; do
+  launchctl print "gui/$UID_NUM/$LABEL" >/dev/null 2>&1 || { OLD_GONE=1; break }
+  sleep 0.5
+done
+if (( ! OLD_GONE )); then
+  echo "── the previous igniter is still loaded after 25 s; not replacing it"
+  [[ -n $BOOTOUT_ERR ]] && echo "   launchctl bootout: $BOOTOUT_ERR"
+  echo "   stop it, then re-run:  launchctl bootout gui/$UID_NUM/$LABEL"
+  exit 1
+fi
 
-mkdir -p "$APP_DIR/Contents/MacOS"
+mkdir -p "$APP_DIR/Contents/MacOS" "$LOG_DIR"
 cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -66,13 +86,33 @@ cat > "$PLIST" <<PLIST
     <key>ProgramArguments</key><array><string>$BIN</string></array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
+    <key>StandardOutPath</key><string>$LOG_DIR/igniter.log</string>
+    <key>StandardErrorPath</key><string>$LOG_DIR/igniter.log</string>
 </dict>
 </plist>
 PLIST
 
-launchctl bootstrap "gui/$UID_NUM" "$PLIST"
+# Success means OUR bootstrap was accepted — not merely that some job with
+# this label is loaded (see the wait above). Keep the last error to show.
+BOOTSTRAPPED=0
+BOOTSTRAP_ERR=""
+for attempt in {1..5}; do
+  if BOOTSTRAP_ERR=$(launchctl bootstrap "gui/$UID_NUM" "$PLIST" 2>&1); then
+    BOOTSTRAPPED=1
+    break
+  fi
+  sleep 1
+done
+if (( ! BOOTSTRAPPED )); then
+  echo "── igniter did NOT start: ${BOOTSTRAP_ERR:-bootstrap failed}"
+  echo "   re-run:  launchctl bootstrap gui/$UID_NUM $PLIST"
+  exit 1
+fi
+launchctl print "gui/$UID_NUM/$LABEL" >/dev/null 2>&1 \
+  || { echo "── igniter bootstrapped but is not loaded: launchctl bootstrap gui/$UID_NUM $PLIST"; exit 1 }
 
 echo "── igniter installed and running (signed: $SIGN_ID)"
+echo "   launch decisions + capture failures: $LOG_DIR/igniter.log"
 echo
 echo "   macOS is the trigger: set System Settings → Lock Screen →"
 echo "   'Start Screen Saver when inactive' to taste, and/or a hot corner."

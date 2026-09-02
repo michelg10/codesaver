@@ -15,11 +15,13 @@ import ServiceManagement
 enum RefreshError: LocalizedError {
     case noToken
     case noContainer
+    case alreadyRunning
 
     var errorDescription: String? {
         switch self {
         case .noToken: return "GitHub not connected — open CodeSaver and import or paste a token"
         case .noContainer: return "app-group container unavailable"
+        case .alreadyRunning: return "a refresh is already running in another process"
         }
     }
 }
@@ -80,6 +82,11 @@ enum RefreshService {
         guard let corpusDir = CorpusStore.corpusDirectory,
               let repoCache = CorpusStore.repoCacheDirectory,
               let scratch = CorpusStore.scratchDirectory else { throw RefreshError.noContainer }
+        // The app's Refresh Now and the hourly `--refresh` agent are separate
+        // processes sharing scratch, the repo cache and the corpus tmp files;
+        // only one may be in here at a time (the lock file lives in corpusDir).
+        guard let lock = try CorpusStore.tryLockRefresh() else { throw RefreshError.alreadyRunning }
+        defer { lock.release() }
         let fm = FileManager.default
         try fm.createDirectory(at: repoCache, withIntermediateDirectories: true)
         try fm.createDirectory(at: scratch, withIntermediateDirectories: true)
@@ -90,8 +97,8 @@ enum RefreshService {
         progress?("Listing repos…")
         let login = try await client.currentLogin()
         let owner = configuredOwner ?? login
-        let repos = try await client.listSourceRepos(owner: owner, ownLogin: login)
-            .sorted { $0.name.lowercased() < $1.name.lowercased() }
+        let listing = try await client.listSourceRepos(owner: owner, ownLogin: login)
+        let repos = listing.repos.sorted { $0.name.lowercased() < $1.name.lowercased() }
         log.info("\(repos.count) source repos on github.com/\(owner, privacy: .public)")
 
         for (i, repo) in repos.enumerated() {
@@ -120,8 +127,9 @@ enum RefreshService {
             }
         }
 
-        // Drop mirrors of repos gone upstream (skip if the listing hit its ceiling).
-        if repos.count < 1000 {
+        // Drop mirrors of repos gone upstream — but only when the listing was
+        // complete. Past the page ceiling, an unlisted name is unknown, not gone.
+        if !listing.hitCeiling {
             let names = Set(repos.map(\.name))
             let mirrors = (try? fm.contentsOfDirectory(at: repoCache, includingPropertiesForKeys: [.isDirectoryKey])) ?? []
             for mirror in mirrors where !names.contains(mirror.lastPathComponent) {
@@ -145,7 +153,8 @@ enum RefreshService {
     }
 
     /// `CodeSaver --refresh [--force]` — what the LaunchAgent runs. A gate
-    /// skip exits 0 too, so launchd never sees hourly "failures".
+    /// skip exits 0 too, as does yielding to a refresh already under way in
+    /// the app, so launchd never sees hourly "failures".
     static func headlessRefresh(force: Bool) async -> Bool {
         let gate = evaluateGates(force: force)
         guard gate.run else {
@@ -161,6 +170,10 @@ enum RefreshService {
                 try await refresh()
             }.value
             print("refreshed: \(summary)")
+            return true
+        } catch RefreshError.alreadyRunning {
+            log.info("refresh skipped: already running in another process")
+            print("refresh skipped: already running in another process")
             return true
         } catch {
             var state = CorpusStore.loadState()

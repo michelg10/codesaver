@@ -40,7 +40,7 @@ open /Applications/CodeSaver.app  # the app walks you through the rest
 
 `install.sh` auto-detects your Apple Development team from the keychain (`TEAM_ID=…` overrides; a free Apple ID via Xcode → Accounts works) — no other configuration exists outside the app. Everything after the build is the app's job: the window is a three-step checklist — enable the screensaver, connect GitHub, switch on auto-refresh. A prebuilt `CodeSaver.app` needs no repo at all: drag it into /Applications, open it, same three steps.
 
-With the igniter installed, use **macOS's own trigger**: set System Settings → Lock Screen → "Start Screen Saver when inactive" to taste, and/or bind a hot corner to Start Screen Saver. The agent only scouts: after ~20 s of inactivity (tunable: `defaults write com.michelg10.CodeSaver.Igniter captureAfterIdle -float 20`) it captures each display once and records the mouse — the screen is static precisely because you're idle, so one capture suffices and costs nothing. It also watches the cursor approach saver-bound hot corners and captures pre-emptively, so corner launches detonate instantly. Captures are deleted the moment you return. Grant the igniter **Screen Recording** permission for the pixelated-desktop act — without it (or without a fresh capture, e.g. a surprise activation) the saver simply starts normally. `build/codesaver-igniter --capture` writes a one-off manifest for testing.
+With the igniter installed, use **macOS's own trigger**: set System Settings → Lock Screen → "Start Screen Saver when inactive" to taste, and/or bind a hot corner to Start Screen Saver. The agent only scouts: after ~20 s of inactivity (tunable: `defaults write com.michelg10.CodeSaver.Igniter captureAfterIdle -float 20`) it captures each display once and records the mouse — the screen is static precisely because you're idle, so one capture suffices and costs nothing. It also watches the cursor approach saver-bound hot corners and captures pre-emptively, so corner launches detonate instantly. Captures are deleted the moment you return. Grant the igniter **Screen Recording** permission for the pixelated-desktop act — without it (or without a fresh capture, e.g. a surprise activation) the saver simply starts normally. Same at the lock screen: ScreenCaptureKit lists no displays there, so a corner hit on the lock screen starts the plain saver — it is not treated as a permission failure (only a real denial triggers the ten-minute capture backoff). Launch decisions and capture failures are logged to `~/Library/Logs/CodeSaver/igniter.log`; `codesaver-igniter --corners` prints corner config plus the lock/permission state the agent sees. `build/codesaver-igniter --capture` writes a one-off manifest for testing.
 
 ## The corpus feeds itself
 
@@ -67,7 +67,7 @@ build.sh                       builds the windowed preview / snapshot harness
 Sources/PreviewMain.swift      windowed preview / PNG snapshot renderer
 ```
 
-The snapshot harness is how the aesthetics were tuned: `./build.sh && ./build/preview --snapshot <dir> <t1> <t2>…` renders deterministic frames offscreen (`CODESAVER_WORKDUR` pins the cycle length).
+The snapshot harness is how the aesthetics were tuned: `./build.sh && ./build/preview --snapshot <dir> <t1> <t2>…` renders deterministic frames offscreen (`CODESAVER_WORKDUR` pins the cycle length, `CODESAVER_CLOCK_EPOCH` the clock, `CODESAVER_SEED` the scene; `CODESAVER_WIDGETS=0` leaves the live session panels out).
 
 ## Tuning
 

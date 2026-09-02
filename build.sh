@@ -17,9 +17,12 @@ swiftc -O -parse-as-library -module-name CodeSaverPreview \
   appex/CodeSaverExtension/BoomMetal.swift \
   appex/CodeSaver/Helpers/Logger.swift \
   appex/CodeSaver/CorpusStore.swift \
+  appex/CodeSaver/AlbumArtShared.swift \
+  appex/CodeSaver/AlbumArtRamp.swift \
+  appex/CodeSaver/AlbumArtBraille.swift \
   Sources/PreviewMain.swift \
   -framework ScreenSaver -framework AppKit -framework QuartzCore -framework Metal \
-  -framework ScreenCaptureKit \
+  -framework ScreenCaptureKit -framework ImageIO \
   -o build/preview
 echo "── built build/preview  (run it for a live window)"
 

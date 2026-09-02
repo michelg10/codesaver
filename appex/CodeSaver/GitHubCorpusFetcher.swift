@@ -67,21 +67,31 @@ struct GitHubClient {
         return try JSONDecoder().decode(User.self, from: try await get("https://api.github.com/user")).login
     }
 
+    struct RepoListing {
+        let repos: [GitHubRepo]   // non-forks only
+        /// The raw walk filled every page it is allowed, so repos past it were
+        /// never seen — their absence from `repos` means nothing.
+        let hitCeiling: Bool
+    }
+
     /// Non-fork repos owned by `owner` — what `gh repo list OWNER --source`
     /// used to return. Private repos appear only when `owner` is the token's
     /// own account (the /user/repos listing).
-    func listSourceRepos(owner: String, ownLogin: String) async throws -> [GitHubRepo] {
+    func listSourceRepos(owner: String, ownLogin: String) async throws -> RepoListing {
         let base = owner.lowercased() == ownLogin.lowercased()
             ? "https://api.github.com/user/repos?affiliation=owner"
             : "https://api.github.com/users/\(owner)/repos?type=owner"
         var repos: [GitHubRepo] = []
+        var hitCeiling = true
         for page in 1...10 {  // 1000-repo ceiling, same spirit as the old REPO_LIMIT
             let batch = try JSONDecoder().decode([GitHubRepo].self,
                                                  from: try await get("\(base)&per_page=100&page=\(page)"))
             repos.append(contentsOf: batch)
-            if batch.count < 100 { break }
+            if batch.count < 100 { hitCeiling = false; break }
         }
-        return repos.filter { !$0.fork }
+        // Forks are dropped AFTER the ceiling check: the filtered count says
+        // nothing about whether the raw listing was complete.
+        return RepoListing(repos: repos.filter { !$0.fork }, hitCeiling: hitCeiling)
     }
 
     /// Downloads the repo tarball to a temp file (URLSession follows the
@@ -126,9 +136,11 @@ enum CorpusIngest {
     static let secretRegexes: [NSRegularExpression] = {
         let patterns: [(String, NSRegularExpression.Options)] = [
             // key-ish identifier (with any tail, so password/SECRET_KEY/aws_access_key_id
-            // all match) directly assigned
+            // all match) directly assigned — bare (API_KEY = …), or quoted /
+            // subscripted the way dict, JSON and header literals spell it
+            // ("api_key": …, 'password': …, config["token"] = …)
             ("(api[_-]?key|passw|passwd|pwd|secret|token|credential"
-             + "|private[_-]?key|access[_-]?key|signing[_-]?key|auth)[\\w-]*\\s*[:=]", [.caseInsensitive]),
+             + "|private[_-]?key|access[_-]?key|signing[_-]?key|auth)[\\w-]*[\\s\"'\\]]*[:=]", [.caseInsensitive]),
             // value-shaped: known token prefixes, JWTs, creds-in-URL
             ("AKIA[0-9A-Z]{16}", []),
             ("\\bghp_[A-Za-z0-9]{20,}|\\bgithub_pat_[A-Za-z0-9_]{20,}", []),
@@ -203,11 +215,15 @@ enum CorpusIngest {
         return kept
     }
 
-    /// Bottom-up: any directory holding an implausible number of source files
-    /// is vendored/generated — drop it whole.
+    /// Bottom-up: any subdirectory holding an implausible number of source
+    /// files is vendored/generated — drop it whole. The mirror root itself is
+    /// exempt: a flat repo (a solutions dump, a script collection) keeps its
+    /// top-level files, bounded by the per-file filters and maxRepoBytes;
+    /// deleting the root would drop the repo and its marker, so it would
+    /// re-download on every refresh and never reach the corpus.
     private static func pruneBulkDirs(_ root: URL) {
         let fm = FileManager.default
-        var dirs: [URL] = [root]
+        var dirs: [URL] = []
         if let e = fm.enumerator(at: root, includingPropertiesForKeys: [.isDirectoryKey]) {
             while let url = e.nextObject() as? URL {
                 if (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
@@ -290,9 +306,13 @@ enum CorpusIngest {
     }
 
     /// Packs the whole cache into corpus.bin + corpus-index.json, deduplicating
-    /// identical files across repos by content hash, then atomically swaps both
-    /// into place (bin first: a reader that catches the pair mid-swap fails the
-    /// index-vs-bin validation and falls back for one session).
+    /// identical files across repos by content hash, then swaps both into place
+    /// with two rename(2)s, bin first. Each rename is atomic but the pair is
+    /// not, so the reader binds an index to its exact bin: every block must fit
+    /// AND the bin's byte count must equal the index's last offset+length. A
+    /// reader that catches the pair mid-swap (new bin with the old index, or
+    /// old bin with the new) fails that check and falls back for one session
+    /// instead of slicing the bin at the wrong boundaries.
     static func buildCorpus(cacheDir: URL, corpusDir: URL) throws -> BuildResult {
         let fm = FileManager.default
         try fm.createDirectory(at: corpusDir, withIntermediateDirectories: true)

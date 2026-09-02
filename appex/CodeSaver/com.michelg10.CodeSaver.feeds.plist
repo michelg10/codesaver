@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- LaunchAgent registered by SMAppService (see FeedsService.swift).
+     Keeps `CodeSaver --feeds` alive: the widget feed daemon that merges
+     Claude Code hook state + bifrocate CoT spools + now-playing into
+     widgets/feed.json in the app-group container. Cheap by construction
+     (1s tick over tiny files) and niced below interactive work. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.michelg10.CodeSaver.feeds</string>
+	<key>BundleProgram</key>
+	<string>Contents/MacOS/CodeSaver</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>CodeSaver</string>
+		<string>--feeds</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>Nice</key>
+	<integer>10</integer>
+	<key>AssociatedBundleIdentifiers</key>
+	<array>
+		<string>com.michelg10.CodeSaver</string>
+	</array>
+</dict>
+</plist>

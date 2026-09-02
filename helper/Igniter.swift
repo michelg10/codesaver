@@ -30,7 +30,14 @@ import ScreenCaptureKit
 //   codesaver-igniter --corners       print corner config + geometry, then exit
 //
 // Screen Recording permission is required for the pixelated-desktop act;
-// without it the saver simply starts normally.
+// without it the saver simply starts normally. Same at the lock screen:
+// ScreenCaptureKit hands back zero displays there, so a corner hit at the
+// lock screen starts the plain saver (there is no desktop to burn) — and
+// must NOT be mistaken for a permission failure, whose ten-minute backoff
+// would then swallow the boom for every hit that follows.
+//
+// Decisions and failures go to stderr with a timestamp; the LaunchAgent
+// routes that to ~/Library/Logs/CodeSaver/igniter.log (helper/install.sh).
 
 // MARK: - Probes
 
@@ -50,6 +57,23 @@ func displayKeptAwake() -> Bool {
     guard IOPMCopyAssertionsStatus(&dict) == kIOReturnSuccess,
           let status = dict?.takeRetainedValue() as? [String: Int] else { return false }
     return (status["PreventUserIdleDisplaySleep"] ?? 0) > 0
+}
+
+/// True while loginwindow's lock screen is up. Read from the session
+/// dictionary — no permissions required. In this state ScreenCaptureKit
+/// answers with an EMPTY display list (replayd logs "TCC Allow" and returns
+/// content with no displays), so nothing can be captured.
+func screenIsLocked() -> Bool {
+    guard let dict = CGSessionCopyCurrentDictionary() as? [String: Any] else { return false }
+    return (dict["CGSSessionScreenIsLocked"] as? Bool) ?? false
+}
+
+/// stderr with a timestamp. The LaunchAgent plist points stderr at
+/// ~/Library/Logs/CodeSaver/igniter.log, so the rare "why was there no
+/// boom" line survives instead of vanishing into launchd's /dev/null.
+func igniterLog(_ msg: String) {
+    let stamp = ISO8601DateFormatter().string(from: Date())
+    FileHandle.standardError.write(Data("\(stamp) igniter: \(msg)\n".utf8))
 }
 
 func primaryHeight() -> CGFloat {
@@ -101,6 +125,19 @@ func igniterDefaults() -> UserDefaults? {
         return .standard
     }
     return UserDefaults(suiteName: "com.michelg10.CodeSaver.Igniter")
+}
+
+/// The Screen Recording grant is keyed on code identity — the installed
+/// LaunchAgent bundle's, which the bare build/ binary does not share (TCC
+/// attributes a shell-launched binary to its responsible process, usually
+/// the terminal). CLI diagnostics say so, or a preflight answer from build/
+/// reads as the agent's and sends the user re-granting a permission it has.
+func identityCaveat() -> String? {
+    if Bundle.main.bundleIdentifier == "com.michelg10.CodeSaver.Igniter" { return nil }
+    return "   ^ for THIS binary's identity, not the installed agent's (TCC keys the grant on code\n"
+        + "     identity). The agent's own verdict is every 'capture denied' line in\n"
+        + "     ~/Library/Logs/CodeSaver/igniter.log; its grant is 'CodeSaver Igniter' under\n"
+        + "     System Settings → Privacy & Security → Screen Recording."
 }
 
 struct CustomCorner {
@@ -198,9 +235,16 @@ func saverIsRunning() -> Bool {
 /// never enter it at all. captureImage(in:) takes global display POINTS, and
 /// hands back native retina pixels with no cursor on its own — which is why
 /// the display-mode lookup and showsCursor live only in the fallback.
-func captureDisplays(completion: @escaping ([CGDirectDisplayID: CGImage]) -> Void) {
-    SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, _ in
-        guard let content else { DispatchQueue.main.async { completion([:]) }; return }
+func captureDisplays(completion: @escaping ([CGDirectDisplayID: CGImage], String?) -> Void) {
+    SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, error in
+        guard let content else {
+            let why = "shareable content: \(error?.localizedDescription ?? "nil, no error")"
+            DispatchQueue.main.async { completion([:], why) }
+            return
+        }
+        // An empty display list is what the lock screen looks like — not an
+        // error, and `captureImage` is never even called.
+        let why = content.displays.isEmpty ? "shareable content lists no displays" : nil
         var result: [CGDirectDisplayID: CGImage] = [:]
         let lock = NSLock()
         let group = DispatchGroup()
@@ -230,7 +274,11 @@ func captureDisplays(completion: @escaping ([CGDirectDisplayID: CGImage]) -> Voi
                 ) { image, _ in store(image) }
             }
         }
-        group.notify(queue: .main) { completion(result) }
+        group.notify(queue: .main) {
+            completion(result, result.isEmpty
+                ? (why ?? "\(content.displays.count) display(s) listed, every capture came back nil")
+                : nil)
+        }
     }
 }
 
@@ -449,10 +497,13 @@ final class Igniter {
                   !displayKeptAwake(),
                   !idleCaptured
                       || Date().timeIntervalSince(lastIdleCapture) > idleRefreshEvery,
-                  !saverUp {
+                  !saverUp, !screenIsLocked() {
             // Proactive scout (macOS owns the trigger): capture once the
             // user has settled, then refresh every few minutes while they
-            // stay away — never once the saver itself is on the glass.
+            // stay away — never once the saver itself is on the glass, and
+            // not at the lock screen (SCK lists no displays there; a failed
+            // shot no longer latches this gate, so without the check it
+            // would re-ask every tick until unlock).
             lastIdleCapture = Date()
             capture(kind: "idle")
             idleCaptured = true
@@ -471,11 +522,15 @@ final class Igniter {
         // Approach path (Dock corners and custom corners alike): cursor
         // nearing a trigger corner → capture NOW, so the trigger itself
         // needs no wait.
-        if captureOK, idle < captureAfterIdle, !capturing,
+        // Never while the saver is on the glass: the cursor stays parked in
+        // the corner after a hit, so without this guard the scout re-shoots
+        // every 5 s — photographing the boom itself, and a rapid re-hit
+        // would then ride that saver-photo as if it were the desktop.
+        if captureOK, idle < captureAfterIdle, !capturing, !saverUp,
            Date().timeIntervalSince(lastCornerCapture) > 5 {
             let near = corners.contains(where: { hypot($0.x - m.x, $0.y - m.y) < cornerProximity })
                 || custom.contains(where: { hypot($0.point.x - m.x, $0.point.y - m.y) < cornerProximity })
-            if near {
+            if near, !screenIsLocked() {
                 lastCornerCapture = Date()
                 capture(kind: "corner")
             }
@@ -488,7 +543,7 @@ final class Igniter {
             let nearest = custom.map { hypot($0.point.x - m.x, $0.point.y - m.y) }
                 .min() ?? .infinity
             if nearest > 100 { cornerArmed = true }
-            if cornerArmed, Date().timeIntervalSince(lastLaunch) > 8 {
+            if cornerArmed, Date().timeIntervalSince(lastLaunch) > 3 {
                 let held = heldModifiers()
                 let hit = custom.contains {
                     hypot($0.point.x - m.x, $0.point.y - m.y) < 5
@@ -511,25 +566,32 @@ final class Igniter {
         if capturing {
             pendingLaunch = true
         } else if kind == "corner", cornerCaptured,
-                  Date().timeIntervalSince(lastCornerCapture) < 4 {
-            launchSaver()   // ride the approach pre-capture: still warm
+                  Date().timeIntervalSince(lastCornerCapture) < 4,
+                  lastCornerCapture > lastSaverExit {
+            // Only a capture taken since the last saver dismissal can be
+            // ridden — anything older shows a desktop the user has since
+            // changed (or the saver itself).
+            launchSaver("\(kind): riding the approach capture")
+        } else if screenIsLocked() {
+            // Nothing to capture at the lock screen; don't even ask SCK.
+            launchSaver("\(kind) at the lock screen: plain saver, no capture")
         } else if Date() < captureBackoffUntil {
-            launchSaver()   // no permission for the boom; plain saver still works
+            launchSaver("\(kind) during capture backoff: plain saver")
         } else {
             if kind == "corner" { lastCornerCapture = Date() }
-            capture(kind: kind) { [weak self] in self?.launchSaver() }
+            capture(kind: kind) { [weak self] in self?.launchSaver("\(kind): fresh capture") }
         }
     }
 
-    private func launchSaver() {
+    private func launchSaver(_ why: String) {
+        igniterLog("launching saver — \(why)")
         let url = URL(fileURLWithPath:
             "/System/Library/CoreServices/ScreenSaverEngine.app")
         NSWorkspace.shared.openApplication(
             at: url, configuration: NSWorkspace.OpenConfiguration()
         ) { _, error in
             if let error {
-                FileHandle.standardError.write(
-                    Data("igniter: saver launch failed: \(error.localizedDescription)\n".utf8))
+                igniterLog("saver launch failed: \(error.localizedDescription)")
             }
         }
     }
@@ -537,13 +599,44 @@ final class Igniter {
     private func capture(kind: String, then: (() -> Void)? = nil) {
         capturing = true
         let mouse = mouseCG()
-        captureDisplays { [weak self] images in
-            // No images means no Screen Recording permission (or capture
-            // failure): write nothing — the saver then starts normally —
-            // and back off so we don't spam the TCC prompt.
+        captureDisplays { [weak self] images, why in
+            // No images: write nothing (the saver then starts normally) —
+            // but only ONE of the possible reasons deserves the long backoff.
+            //  • Screen Recording denied: asked directly, without prompting
+            //    (CGPreflightScreenCaptureAccess). Ten minutes before the
+            //    next try, so the TCC prompt isn't spammed.
+            //  • Lock screen: ScreenCaptureKit lists zero displays there.
+            //    Nothing to capture and nothing wrong — no backoff at all.
+            //    (Inferring "no permission" from the empty result used to
+            //    poison the next ten minutes: every corner hit, even from
+            //    the unlocked desktop, launched a boomless saver.)
+            //  • Anything else is a transient SCK/replayd hiccup: retry
+            //    almost at once.
             if images.isEmpty {
-                FileHandle.standardError.write(Data("igniter: capture unavailable (screen recording permission?)\n".utf8))
-                self?.captureBackoffUntil = Date().addingTimeInterval(600)
+                // Whatever manifest is on disk predates this attempt: a
+                // corner hit must not ride it — and it is a screenshot of
+                // the desktop, so it must not outlive its owner flag either
+                // (the return-cleanup only sweeps what a flag says is
+                // there; drop the flag alone and the file is orphaned).
+                // Delete it and forget the attempt outright, so the retry
+                // is a real one: the idle gate re-opens the moment the
+                // backoff passes instead of waiting out idleRefreshEvery
+                // on a latch that was set before the shot came back.
+                deleteManifest()
+                self?.idleCaptured = false
+                self?.cornerCaptured = false
+                if kind == "corner" { self?.lastCornerCapture = .distantPast }
+                else { self?.lastIdleCapture = .distantPast }
+                let detail = why ?? "no detail"
+                if !CGPreflightScreenCaptureAccess() {
+                    igniterLog("\(kind) capture denied — no Screen Recording permission (\(detail)); backing off 10 min")
+                    self?.captureBackoffUntil = Date().addingTimeInterval(600)
+                } else if screenIsLocked() {
+                    igniterLog("\(kind) capture skipped — screen is locked, no desktop to capture (\(detail))")
+                } else {
+                    igniterLog("\(kind) capture empty — \(detail); retrying in 2 s")
+                    self?.captureBackoffUntil = Date().addingTimeInterval(2)
+                }
             } else if kind == "idle", idleSeconds() < 1.0 {
                 // The user returned during the shot's latency. The return-
                 // cleanup already ran (nothing to delete then) and reset
@@ -562,7 +655,7 @@ final class Igniter {
             // the capture (fresh either way) is on disk before the launch.
             if self?.pendingLaunch == true {
                 self?.pendingLaunch = false
-                self?.launchSaver()
+                self?.launchSaver("\(kind): hit landed mid-capture, riding it")
             }
             then?()
         }
@@ -594,13 +687,18 @@ struct IgniterMain {
             for p in saverHotCorners() {
                 print(String(format: "dock saver corner (%.0f, %.0f)", p.x, p.y))
             }
+            print("screen locked = \(screenIsLocked())")
+            print("screen recording granted (preflight) = \(CGPreflightScreenCaptureAccess())")
+            if let caveat = identityCaveat() { print(caveat) }
             exit(0)
         }
 
         if CommandLine.arguments.contains("--capture") {
-            captureDisplays { images in
+            captureDisplays { images, why in
                 writeManifest(kind: "idle", mouse: mouseCG(), captures: images)
-                print("manifest written (\(images.count) display(s) captured)")
+                print("manifest written (\(images.count) display(s) captured)"
+                      + (why.map { " — \($0)" } ?? ""))
+                if images.isEmpty, let caveat = identityCaveat() { print(caveat) }
                 exit(0)
             }
             app.run()

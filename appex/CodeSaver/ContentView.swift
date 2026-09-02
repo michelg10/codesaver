@@ -17,7 +17,7 @@ private let logger = AppexLog.logger("HostApp")
 /// idle-trigger config there; the agent re-reads it within seconds.
 private let igniterDefaults = UserDefaults(suiteName: "com.michelg10.CodeSaver.Igniter")
 
-private enum Theme {
+enum Theme {
     static let ink = Color(red: 0.93, green: 0.98, blue: 1.0)
     static let slate = Color(red: 0.58, green: 0.65, blue: 0.72)
     static let dim = Color.white.opacity(0.30)
@@ -57,6 +57,7 @@ struct ContentView: View {
     @State private var pastedToken = ""
     @State private var showAdvanced = false
     @State private var showVerbsImporter = false
+    @State private var albumArtStyle: String = ContentView.loadAlbumArtStyle()
     @State private var igniterState = IgniterState.missing
     @State private var cornerTL = igniterDefaults?.integer(forKey: "cornerTL") ?? 0
     @State private var cornerTR = igniterDefaults?.integer(forKey: "cornerTR") ?? 0
@@ -97,6 +98,13 @@ struct ContentView: View {
             pluginManager.checkScreensaverStatus()
             refreshManager.reload()
             igniterState = Self.probeIgniter()
+            albumArtStyle = Self.loadAlbumArtStyle()
+        }
+        // The tuning window writes the same key (picking a style there
+        // selects it); re-read rather than show a value seeded at init.
+        .onReceive(NotificationCenter.default.publisher(
+            for: .albumArtStyleDidChange)) { _ in
+            albumArtStyle = Self.loadAlbumArtStyle()
         }
         .onAppear { igniterState = Self.probeIgniter() }
         .fileImporter(isPresented: $showVerbsImporter,
@@ -414,6 +422,38 @@ struct ContentView: View {
             ?? pluginManager.lastError
     }
 
+    // MARK: Album art style (shared with the saver via the group container)
+
+    private static func artSettingsURL() -> URL? {
+        CorpusStore.corpusDirectory?
+            .appendingPathComponent("widgets/settings.json")
+    }
+
+    static func loadAlbumArtStyle() -> String {
+        guard let u = artSettingsURL(), let d = try? Data(contentsOf: u),
+              let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
+              let s = o["albumArtStyle"] as? String else { return "none" }
+        return s
+    }
+
+    static func saveAlbumArtStyle(_ style: String) {
+        guard let u = artSettingsURL() else { return }
+        var o: [String: Any] = [:]
+        if let d = try? Data(contentsOf: u),
+           let e = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] {
+            o = e
+        }
+        o["albumArtStyle"] = style
+        try? FileManager.default.createDirectory(
+            at: u.deletingLastPathComponent(), withIntermediateDirectories: true)
+        // Atomic: the saver polls this file at 4 Hz and treats an unparseable
+        // read (a truncate-then-write caught halfway) as "art off".
+        if let d = try? JSONSerialization.data(withJSONObject: o),
+           (try? d.write(to: u, options: .atomic)) != nil {
+            NotificationCenter.default.post(name: .albumArtStyleDidChange, object: nil)
+        }
+    }
+
     // MARK: Advanced
 
     // A hand-rolled disclosure. The rows keep their layout space when hidden
@@ -462,6 +502,22 @@ struct ContentView: View {
                         Button("Use bundled") { refreshManager.resetVerbs() }
                             .buttonStyle(.bordered).controlSize(.small)
                     }
+                }
+                HStack(spacing: 8) {
+                    Text("album art").font(Theme.mono(11)).foregroundStyle(Theme.slate)
+                    Picker("", selection: Binding(
+                        get: { albumArtStyle },
+                        set: { albumArtStyle = $0; ContentView.saveAlbumArtStyle($0) })) {
+                        Text("off").tag("none")
+                        Text("ramp").tag("ramp")
+                        Text("braille").tag("braille")
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .controlSize(.small)
+                    .frame(width: 210, alignment: .leading)
+                    Button("Tune…") { openWindow(id: "albumart") }
+                        .buttonStyle(.bordered).controlSize(.small)
                 }
                 HStack(spacing: 16) {
                     Button("Preview window") { openWindow(id: "preview") }

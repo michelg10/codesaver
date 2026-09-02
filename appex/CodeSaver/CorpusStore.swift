@@ -102,4 +102,42 @@ enum CorpusStore {
             }
         }
     }
+
+    // MARK: Cross-process refresh lock
+
+    /// The app's "Refresh Now" and the `--refresh` LaunchAgent are separate
+    /// processes sharing one scratch dir, one repo cache and one pair of
+    /// corpus tmp files; nothing in-process can serialize them. An advisory
+    /// flock(2) on this file does, and the kernel drops it if the holder dies.
+    static var refreshLockURL: URL? { corpusDirectory?.appendingPathComponent(".refresh.lock") }
+
+    /// Held for as long as the token lives, or until `release()`.
+    final class RefreshLock: @unchecked Sendable {
+        private var fd: Int32
+        fileprivate init(fd: Int32) { self.fd = fd }
+        deinit { release() }
+        func release() {
+            guard fd >= 0 else { return }
+            flock(fd, LOCK_UN)
+            close(fd)
+            fd = -1
+        }
+    }
+
+    /// nil = another process holds the lock (a refresh is mid-flight there).
+    /// Throws only when the lock file itself can't be opened.
+    static func tryLockRefresh() throws -> RefreshLock? {
+        guard let url = refreshLockURL else { throw POSIXError(.ENOENT) }
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+        let fd = open(url.path, O_RDWR | O_CREAT | O_CLOEXEC, 0o644)  // CLOEXEC: tar must not inherit it
+        guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+            let err = errno
+            close(fd)
+            if err == EWOULDBLOCK { return nil }
+            throw POSIXError(POSIXErrorCode(rawValue: err) ?? .EIO)
+        }
+        return RefreshLock(fd: fd)
+    }
 }

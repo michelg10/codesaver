@@ -29,9 +29,7 @@ final class RefreshManager: ObservableObject {
         hasToken = TokenStore.current != nil
         state = CorpusStore.loadState()
         owner = RefreshService.configuredOwner ?? ""
-        let status = RefreshAgent.status
-        agentEnabled = status == .enabled
-        agentNeedsApproval = status == .requiresApproval
+        adoptAgentStatus(RefreshAgent.status, FeedsAgent.status)
         customVerbCount = CorpusStore.verbsURL
             .flatMap { try? String(contentsOf: $0, encoding: .utf8) }
             .map(Self.verbCount)
@@ -158,18 +156,29 @@ final class RefreshManager: ObservableObject {
 
     // MARK: Auto-refresh agent
 
+    /// The toggle owns BOTH LaunchAgents — corpus refresh and the widget
+    /// feeds daemon — as the pair `--register-agent` registers, since this
+    /// toggle is the only registration path a drag-installed app ever runs.
     func setAutoRefresh(_ enabled: Bool) {
         if enabled {
             if !RefreshAgent.isAtStablePath {
                 lastActionError = "auto-refresh needs the app to live in /Applications"
             }
-            let status = RefreshAgent.register(interactive: true)
-            agentEnabled = status == .enabled
-            agentNeedsApproval = status == .requiresApproval
+            adoptAgentStatus(RefreshAgent.register(interactive: true),
+                             FeedsAgent.register(interactive: true))
         } else {
             RefreshAgent.unregister()
+            FeedsAgent.unregister()
             reload()
         }
+    }
+
+    /// One toggle, two agents: on only when both run; "needs approval" when
+    /// either is waiting on Login Items.
+    private func adoptAgentStatus(_ refresh: SMAppService.Status,
+                                  _ feeds: SMAppService.Status) {
+        agentEnabled = refresh == .enabled && feeds == .enabled
+        agentNeedsApproval = refresh == .requiresApproval || feeds == .requiresApproval
     }
 
     func openLoginItems() {

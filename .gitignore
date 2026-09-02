@@ -2,3 +2,4 @@
 build/
 appex/build/
 setup.conf
+__pycache__/

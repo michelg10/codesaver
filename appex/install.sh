@@ -78,11 +78,23 @@ if [[ ${NO_ACTIVATE:-0} != 1 ]]; then
   fi
 fi
 
-# (Re-)register the corpus-refresh LaunchAgent now that the app sits at its
-# stable /Applications path; a no-op when already enabled. RunAtLoad gives a
-# first fetch right away once a GitHub token is present.
+# (Re-)register the LaunchAgents (corpus refresh + widget feeds) now that the
+# app sits at its stable /Applications path; a no-op when already enabled.
+# RunAtLoad gives a first corpus fetch right away once a token is present.
 /Applications/CodeSaver.app/Contents/MacOS/CodeSaver --register-agent 2>/dev/null \
   || echo "── agent registration failed — toggle “Refresh automatically” in the app"
+
+# The feeds daemon is KeepAlive: it survived the bundle swap above on the
+# unlinked inode, and re-registering an already-enabled agent never re-execs
+# it — so without a kick it keeps running the PREVIOUS build until logout.
+# (The refresh agent needs none: StartInterval re-execs it every hour.)
+FEEDS_LABEL="$(/usr/libexec/PlistBuddy -c 'Print :Label' \
+  CodeSaver/com.michelg10.CodeSaver.feeds.plist 2>/dev/null || echo com.michelg10.CodeSaver.feeds)"
+if launchctl kickstart -k "gui/$(id -u)/$FEEDS_LABEL" 2>/dev/null; then
+  echo "── restarted the feeds daemon on the new build"
+else
+  echo "── feeds daemon not loaded yet (it starts with “Refresh automatically” / next login)"
+fi
 
 echo "── installed /Applications/CodeSaver.app"
 pluginkit -m -v -p com.apple.screensaver 2>/dev/null | grep -i codesaver || echo "   (not yet visible to pluginkit — System Settings usually picks it up shortly)"
