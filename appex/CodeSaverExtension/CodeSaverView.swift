@@ -1449,7 +1449,10 @@ public final class CodeSaverView: ScreenSaverView {
     // live session, glyph in Claude orange (orange = actual Claude Code;
     // violet stays the saver's own theater), music bottom-right. A stale
     // feed (daemon gone) removes every panel — never show frozen state as
-    // if it were live.
+    // if it were live. A session pinned in bifrocate (its pin daemon keeps
+    // the prompt cache warm with keep-alive pings) rests as
+    // `✻ Pinned (next ping in 35m ∙ 2h 32m ago)` and sits above the other
+    // resting panels.
 
     private struct WidgetSession {
         var cwd = "?"
@@ -1462,6 +1465,17 @@ public final class CodeSaverView: ScreenSaverView {
         var lastActive: Double?
         var stateSince: Double?
         var bg: [String: Int] = [:]
+        var pin: WidgetPin?
+    }
+
+    /// bifrocate's pin daemon has this session (feed `pin`). `fresh` is
+    /// false when the daemon hasn't written its state lately.
+    private struct WidgetPin {
+        var pinnedAt: Double = 0
+        var status: String?
+        var nextPingAt: Double?
+        var pingedAt: Double?
+        var fresh = true
     }
 
     private struct WidgetFeed {
@@ -1539,6 +1553,15 @@ public final class CodeSaverView: ScreenSaverView {
             w.lastActive = raw["last_active"] as? Double
             w.stateSince = raw["state_since"] as? Double
             w.bg = raw["bg"] as? [String: Int] ?? [:]
+            if let p = raw["pin"] as? [String: Any] {
+                var pin = WidgetPin()
+                pin.pinnedAt = p["pinned_at"] as? Double ?? 0
+                pin.status = p["status"] as? String
+                pin.nextPingAt = p["next_ping_at"] as? Double
+                pin.pingedAt = p["pinged_at"] as? Double
+                pin.fresh = p["fresh"] as? Bool ?? true
+                w.pin = pin
+            }
             feed.sessions.append(w)
         }
         if let np = obj["nowplaying"] as? [String: Any] {
@@ -1704,7 +1727,26 @@ public final class CodeSaverView: ScreenSaverView {
         case "toolcall":     return "\(w.tool ?? "?"): emit"
         case "waiting_tool": return "\(w.tool ?? "?"): exec"
         case "permission":   return "Permissions required"
-        default:             return "Done"
+        default:             return w.pin != nil ? "Pinned" : "Done"
+        }
+    }
+
+    /// "next ping in 35m", or the pin daemon's reason there isn't one.
+    private func widgetPinNext(_ pin: WidgetPin, wall: Double) -> String {
+        guard pin.fresh else { return "pin daemon silent" }
+        switch pin.status {
+        case "waiting":
+            guard let n = pin.nextPingAt else { return "pinned" }
+            return n > wall ? "next ping in " + spanString(n - wall) : "ping due"
+        case "sent":     return "pinging\u{2026}"
+        case "busy":     return "next ping after this turn"
+        case "cold":     return "cache cold"
+        case "held":     return "ping held"
+        case "stalled":  return "pings stalled"
+        case "error":    return "ping failed"
+        case "gone":     return "session gone"
+        case "no_spool", "not_claude", "no_registry": return "not pingable"
+        default:         return "pinned"
         }
     }
 
@@ -1741,6 +1783,16 @@ public final class CodeSaverView: ScreenSaverView {
                 parts.append("elapsed " + timeString(wall - t0))
             }
             guard !parts.isEmpty else { return nil }
+            return "(" + parts.joined(separator: " \u{2219} ") + ")"
+        }
+        if let pin = w.pin {
+            // Pinned and resting: what the pin daemon does next, then how
+            // long the pin has been held. The tokens/background tail gives
+            // way — the pin is the story of a resting pinned panel.
+            parts.append(widgetPinNext(pin, wall: wall))
+            if pin.pinnedAt > 0, wall > pin.pinnedAt {
+                parts.append(spanString(wall - pin.pinnedAt) + " ago")
+            }
             return "(" + parts.joined(separator: " \u{2219} ") + ")"
         }
         if let tok = w.turnTokens, tok > 0 { parts.append("\(countString(Double(tok))) tokens") }
@@ -1843,6 +1895,8 @@ public final class CodeSaverView: ScreenSaverView {
         let sessions = Array(widgetFeed.sessions.sorted { l, r in
             let la = l.state != "done", ra = r.state != "done"
             if la != ra { return la }
+            let lp = l.pin != nil, rp = r.pin != nil      // pinned rests above resting
+            if lp != rp { return lp }
             return (l.turnStarted ?? 0) > (r.turnStarted ?? 0)
         }.prefix(4))
 
@@ -1952,6 +2006,11 @@ public final class CodeSaverView: ScreenSaverView {
                     }
                     runs.append((String(ch), attrs))
                 }
+            } else if c.w.pin != nil {
+                // Kept warm: the glyph in quiet clay, the words resting grey.
+                runs.append((glyphFrame + " ",
+                             run(ccOrange.blended(withFraction: 0.45, of: doneC) ?? doneC)))
+                runs.append((c.label, run(doneC)))
             } else {
                 runs.append((glyphFrame + " ", run(doneC)))
                 runs.append((c.label, run(doneC)))
@@ -2823,6 +2882,15 @@ public final class CodeSaverView: ScreenSaverView {
         let s = Int(seconds)
         if s < 60 { return "\(s)s" }
         return "\(s / 60)m \(s % 60)s"
+    }
+
+    /// "45s", "35m", "2h 32m" — the pin line's spans. `timeString` is for
+    /// sub-hour turn timers and would read "152m 3s" here.
+    private func spanString(_ seconds: Double) -> String {
+        let s = max(0, Int(seconds))
+        if s < 60 { return "\(s)s" }
+        if s < 3600 { return "\(s / 60)m" }
+        return "\(s / 3600)h \(s % 3600 / 60)m"
     }
 
     private func countString(_ v: Double) -> String {

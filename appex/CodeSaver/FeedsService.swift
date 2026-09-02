@@ -16,6 +16,10 @@
 //       (`superseded`) markers, ~1s off the wire.
 //    3. Now playing — Music.app / Spotify via AppleScript, polled only
 //       while the player is actually running.
+//    4. ~/.bifrocate/pins.json + pins.state.json — bifrocate's pin daemon:
+//       which sessions are pinned (kept warm with keep-alive pings) and,
+//       per pin, what the daemon will do next. A pinned session stays on
+//       the rack while its pin lives, even past the hour.
 //
 //  The merge rule is recency: the freshest signal wins, except a
 //  PermissionRequest holds until any newer event for that session.
@@ -34,6 +38,8 @@ enum FeedsService {
     private static var home: URL { FileManager.default.homeDirectoryForCurrentUser }
     private static var hookDir: URL { home.appendingPathComponent(".claude/codesaver/sessions") }
     private static var spoolDir: URL { home.appendingPathComponent(".bifrocate/cot") }
+    private static var pinsURL: URL { home.appendingPathComponent(".bifrocate/pins.json") }
+    private static var pinStateURL: URL { home.appendingPathComponent(".bifrocate/pins.state.json") }
     static var widgetsDir: URL? {
         CorpusStore.corpusDirectory?.appendingPathComponent("widgets", isDirectory: true)
     }
@@ -261,6 +267,27 @@ enum FeedsService {
         }
     }
 
+    // MARK: Pins (bifrocate's pin daemon)
+
+    /// A decoded JSON object cached by mtime. Both pin files are tiny and
+    /// rewritten rarely — pins.json on a toggle, pins.state.json on change or
+    /// every ~30s — so a stat per tick is all they cost.
+    private struct JSONCache { var mtime: Date?; var obj: [String: Any] = [:] }
+    private static var pinsCache = JSONCache()
+    private static var pinStateCache = JSONCache()
+
+    private static func cachedJSON(_ url: URL, _ cache: inout JSONCache) -> [String: Any] {
+        let m = (try? FileManager.default.attributesOfItem(atPath: url.path))?[
+            .modificationDate] as? Date
+        if m == cache.mtime { return cache.obj }
+        cache.mtime = m
+        guard m != nil, let data = try? Data(contentsOf: url),
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else { cache.obj = [:]; return [:] }
+        cache.obj = obj
+        return obj
+    }
+
     // MARK: Merge + feed
 
     private static func buildFeed(spool: [String: SpoolState],
@@ -269,6 +296,14 @@ enum FeedsService {
         let fm = FileManager.default
         let now = Date().timeIntervalSince1970
         var sessions: [[String: Any]] = []
+
+        // bifrocate's pins: desired state, and what its daemon last reported.
+        // The state file is written at least every 30s while the daemon
+        // runs; older than 90s means nobody is pinging.
+        let pins = (cachedJSON(pinsURL, &pinsCache)["pins"] as? [String: Any]) ?? [:]
+        let pinState = cachedJSON(pinStateURL, &pinStateCache)
+        let pinStateFresh = now - ((pinState["updated_at"] as? Double) ?? 0) < 90
+        let pinEntries = (pinState["sessions"] as? [String: Any]) ?? [:]
 
         let names = (try? fm.contentsOfDirectory(atPath: hookDir.path)) ?? []
         // Untouched for 2h -> nothing inside can still be within the hour
@@ -305,7 +340,12 @@ enum FeedsService {
             // in any open CLI, so "last used" always looked seconds old.
             guard activity > 0 else { continue }
             let lastUsed = activity
-            if now - lastUsed > 3600 { continue }
+            // …unless the session is pinned: the pin is an explicit wish to
+            // keep it warm, so its panel stays (showing the pin's state, cold
+            // included) until the pin daemon drops the pin — which it does
+            // within a minute of the CLI going away.
+            let pin = pins[sid] as? [String: Any]
+            if now - lastUsed > 3600, pin == nil { continue }
 
             // Recency merge; permission holds until something newer arrives.
             var state: String
@@ -371,6 +411,17 @@ enum FeedsService {
                 }
             }
             if state == "done", let bg = h.bg, !bg.isEmpty { entry["bg"] = bg }
+            if let pin {
+                var p: [String: Any] = ["pinned_at": pin["pinned_at"] as? Double ?? 0,
+                                        "fresh": pinStateFresh]
+                if let e = pinEntries[sid] as? [String: Any] {
+                    if let st = e["status"] as? String { p["status"] = st }
+                    if let n = e["next_ping_at"] as? Double { p["next_ping_at"] = n }
+                    if let t = e["pinged_at"] as? Double { p["pinged_at"] = t }
+                    if let c = e["pings"] as? Int { p["pings"] = c }
+                }
+                entry["pin"] = p
+            }
             sessions.append(entry)
         }
         sessions.sort {
