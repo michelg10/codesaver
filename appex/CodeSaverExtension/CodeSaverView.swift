@@ -1720,6 +1720,14 @@ public final class CodeSaverView: ScreenSaverView {
         return path.hasPrefix(home) ? "~" + path.dropFirst(home.count) : path
     }
 
+    /// "~/Desktop/codesaver" → ("~/Desktop/", "codesaver"): the top rail
+    /// paints the two at different weights. A bare "~" or "/" — or a path
+    /// truncated inside its last component — is all tail.
+    private func widgetSplitLastDir(_ path: String) -> (String, String) {
+        guard path.count > 1, let slash = path.lastIndex(of: "/") else { return ("", path) }
+        return (String(path[...slash]), String(path[path.index(after: slash)...]))
+    }
+
     private func widgetStateLabel(_ w: WidgetSession) -> String {
         switch w.state {
         case "thinking":     return "Thinking"
@@ -1968,9 +1976,13 @@ public final class CodeSaverView: ScreenSaverView {
             var cwd = c.cwd
             if cwd.count > inner - 6 { cwd = "\u{2026}" + cwd.suffix(inner - 7) }
             let topFill = max(0, inner - cwd.count - 4)
+            // The parents rest at the label weight; the final directory — the
+            // name a project is actually recognised by — is the bright one.
+            let (cwdHead, cwdTail) = widgetSplitLastDir(cwd)
             let top = WidgetRow(runs: [
                 ("\u{256D}\u{2500} ", run(rC)),
-                (cwd, run(labelC)),
+                (cwdHead, run(labelC)),
+                (cwdTail, run(tokenC)),
                 (" " + String(repeating: "\u{2500}", count: topFill) + "\u{256E}", run(rC)),
             ])
 
@@ -2025,14 +2037,20 @@ public final class CodeSaverView: ScreenSaverView {
             runs.append((String(repeating: " ", count: fill) + " \u{2502}", run(rC)))
             let status = WidgetRow(runs: runs)
 
-            // Bottom rail: ╰────── session N tokens ─╯
+            // Bottom rail: ╰────── session N tokens ─╯ — the count is the
+            // bright word; "session … tokens" sits at the label weight.
             let bl = c.bottom
             let botFill = max(0, inner - bl.count - 4)
-            let bottom = WidgetRow(runs: [
+            var botRuns: [(String, [NSAttributedString.Key: Any])] = [
                 ("\u{2570}" + String(repeating: "\u{2500}", count: botFill) + " ", run(rC)),
-                (bl, run(tokenC)),
-                (" \u{2500}\u{256F}", run(rC)),
-            ])
+            ]
+            if let n = c.w.sessionTokens {
+                botRuns.append(("session ", run(labelC)))
+                botRuns.append((countString(Double(n)), run(tokenC)))
+                botRuns.append((" tokens", run(labelC)))
+            }
+            botRuns.append((" \u{2500}\u{256F}", run(rC)))
+            let bottom = WidgetRow(runs: botRuns)
 
             emitWidgetPanel(&frame, metal: metal, scale: scale,
                             key: "widget-s\(i)", rows: [top, status, bottom],
