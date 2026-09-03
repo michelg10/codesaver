@@ -43,17 +43,15 @@ struct AlbumArtTunable {
 
 // MARK: - A rendered grid
 
-/// The renderers' JSON output, parsed. Font metrics arrive as RATIOS of the
-/// base font size (braille only; 0 means "plain monospace"), because the
-/// saver's cell size follows screen width and the app's preview does not.
+/// The renderer's JSON output, parsed. Cells are the panel's own monospace
+/// glyphs at a 2:1 aspect — the aspect the ramp's sampling assumed — so the
+/// grid carries no font metrics of its own and lands on the chrome's
+/// character grid wherever it is drawn.
 struct AlbumArtGrid {
     var cols = 0
     var rows = 0
     var chars: [String] = []
     var colors: [[String]] = []
-    var fontSize: CGFloat = 0
-    var letterSpacing: CGFloat = 0
-    var lineHeight: CGFloat = 0
     /// The parameters this grid was rendered with, in `AlbumArtTuning.load()`
     /// shape, and the image it was rendered from — both optional. The tuning
     /// window stamps them so a consumer that has to RE-RENDER at a smaller
@@ -68,8 +66,6 @@ struct AlbumArtGrid {
     static let tuningKey = "tuning"
     static let sourceKey = "source"
 
-    var isBraille: Bool { fontSize > 0 }
-
     init?(json o: [String: Any]) {
         guard let cols = o["cols"] as? Int, let rows = o["rows"] as? Int,
               let chars = o["chars"] as? [String],
@@ -79,30 +75,19 @@ struct AlbumArtGrid {
         self.rows = rows
         self.chars = chars
         self.colors = colors
-        if let m = o["metrics"] as? [String: Any] {
-            let base = CGFloat((m["baseFontSize"] as? Double) ?? 15)
-            guard base > 0 else { return nil }
-            fontSize = CGFloat((m["fontSize"] as? Double) ?? 0) / base
-            letterSpacing = CGFloat((m["letterSpacing"] as? Double) ?? 0) / base
-            lineHeight = CGFloat((m["lineHeight"] as? Double) ?? 0) / base
-        }
         tuning = o[Self.tuningKey] as? [String: [String: Double]]
         sourcePath = o[Self.sourceKey] as? String
     }
 
-    /// Row pitch in points. Braille carries its own (its glyph box is taller
-    /// than the mono cell); the ramp uses a 2:1 cell, which is the aspect its
-    /// sampling assumed.
-    func rowStep(baseFont: NSFont, charW: CGFloat) -> CGFloat {
-        isBraille ? baseFont.pointSize * lineHeight : charW * 2
-    }
+    /// Row pitch in points: a 2:1 cell, the aspect the ramp's sampling assumed.
+    static func rowStep(charW: CGFloat) -> CGFloat { charW * 2 }
 
     /// Exactly cols × rows cells — no padding fudge. The art is positioned on
     /// the panel's character grid, so any stray point here would offset every
     /// glyph against the chrome around it.
-    func size(baseFont: NSFont, charW: CGFloat) -> NSSize {
+    func size(charW: CGFloat) -> NSSize {
         NSSize(width: charW * CGFloat(cols),
-               height: rowStep(baseFont: baseFont, charW: charW) * CGFloat(rows))
+               height: Self.rowStep(charW: charW) * CGFloat(rows))
     }
 
     static func color(_ hex: String) -> NSColor? {
@@ -114,30 +99,20 @@ struct AlbumArtGrid {
                        blue: CGFloat(v & 0xFF) / 255, alpha: 1)
     }
 
-    /// Lay the grid out once. Braille needs the explicit Apple Braille face
-    /// plus negative tracking: SF Mono has no braille glyphs, and the
-    /// substituted face's advance is ~11% wider, which combs the art into
-    /// vertical stripes without the kern. Callers that redraw every frame (the saver's
+    /// Lay the grid out once. Callers that redraw every frame (the saver's
     /// panel) cache these and only pay the draw; the layout is identical
     /// either way, so the art lands on the same grid in both.
     func attributedRows(baseFont: NSFont) -> [NSAttributedString] {
-        let f: NSFont = isBraille
-            ? (NSFont(name: "AppleBraille", size: baseFont.pointSize * fontSize)
-               ?? baseFont)
-            : baseFont
-        let kern: CGFloat = isBraille ? baseFont.pointSize * letterSpacing : 0
         var out: [NSAttributedString] = []
         for (r, line) in chars.enumerated() {
             guard r < colors.count else { break }
             let row = NSMutableAttributedString()
             for (c, ch) in line.enumerated() {
                 guard c < colors[r].count else { break }
-                var attrs: [NSAttributedString.Key: Any] = [
-                    .font: f,
+                row.append(NSAttributedString(string: String(ch), attributes: [
+                    .font: baseFont,
                     .foregroundColor: Self.color(colors[r][c]) ?? NSColor.clear,
-                ]
-                if kern != 0 { attrs[.kern] = kern }
-                row.append(NSAttributedString(string: String(ch), attributes: attrs))
+                ]))
             }
             out.append(row)
         }
@@ -152,7 +127,7 @@ struct AlbumArtGrid {
 
     func draw(baseFont: NSFont, charW: CGFloat, at origin: NSPoint) {
         Self.draw(rows: attributedRows(baseFont: baseFont), at: origin,
-                  step: rowStep(baseFont: baseFont, charW: charW))
+                  step: Self.rowStep(charW: charW))
     }
 }
 
@@ -163,11 +138,10 @@ struct AlbumArtGrid {
 /// the saver shows it — no rebuild. Absent file = every renderer default.
 enum AlbumArtTuning {
     static var url: URL? {
-        CorpusStore.corpusDirectory?
-            .appendingPathComponent("widgets/albumart-tuning.json")
+        CorpusStore.widgetsDirectory?.appendingPathComponent("albumart-tuning.json")
     }
 
-    /// `["ramp": [key: value], "braille": [key: value]]`
+    /// `["ramp": [key: value]]`
     static func load() -> [String: [String: Double]] {
         guard let u = url, let d = try? Data(contentsOf: u),
               let o = (try? JSONSerialization.jsonObject(with: d))

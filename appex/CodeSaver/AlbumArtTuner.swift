@@ -31,31 +31,28 @@ extension Notification.Name {
 
 @MainActor
 final class AlbumArtTunerModel: ObservableObject {
-    @Published var style = "braille"
     @Published var ramp = AlbumArtRamp.Params()
-    @Published var braille = AlbumArtBraille.Params()
     @Published var sourceLabel = "—"
     @Published var hint = ""
     @Published var renderMS = 0.0
     @Published var saved = false
     /// Album art is square; a text grid is not. Locked (the default), moving
-    /// either size slider derives the other from the STYLE'S OWN cell aspect
-    /// so the rendered block stays 1:1 on screen.
+    /// either size slider derives the other from the cell aspect so the
+    /// rendered block stays 1:1 on screen.
     @Published var lockSquare = true
     /// The app has album art switched off. The tuner still renders and
-    /// publishes, but the saver draws nothing until a style is picked — say
-    /// so, rather than silently switching art on for the user.
+    /// publishes, but the saver draws nothing until art is turned on — say
+    /// so, rather than silently switching it on for the user.
     @Published var artOff = false
 
     private var image: CGImage?
     /// The file `image` was decoded from — stamped into the published grid
     /// so a consumer re-rendering at another size uses the same pixels.
     private var imageURL: URL?
-    /// Only an explicit pick in this window's style control may write the
-    /// style back to settings.json. Loading, knob turns and the initial
-    /// render must not: with art switched off in the app, the model's
-    /// default style would otherwise be persisted as a side effect of merely
-    /// opening the window.
+    /// Only an explicit "turn on" in this window may write the style back to
+    /// settings.json. Loading, knob turns and the initial render must not:
+    /// with art switched off in the app, it would otherwise be switched on
+    /// as a side effect of merely opening the window.
     private var styleChosen = false
     /// What the preview is showing. In `.currentTrack` the artwork must be
     /// re-read when the daemon fetches a new one: publishing under the LIVE
@@ -73,38 +70,28 @@ final class AlbumArtTunerModel: ObservableObject {
             .modificationDate] as? Date
     }
 
-    /// Cell height ÷ cell width, in the same units AlbumArtGrid draws with.
-    /// Ramp cells are exactly 2:1 (rowStep = charW * 2). Braille rows are the
-    /// Apple Braille line (18.8623/15 em) over SF Mono's 0.61816 em advance.
-    private var cellAspect: Double {
-        style == "ramp" ? 2.0 : (18.8623 / 15.0) / 0.61816
-    }
+    /// Cell height ÷ cell width, in the same units AlbumArtGrid draws with:
+    /// ramp cells are exactly 2:1 (rowStep = charW * 2).
+    private let cellAspect = 2.0
 
     private func clamp(_ key: String, _ v: Double) -> Double {
         guard let t = tunables.first(where: { $0.key == key }) else { return v }
         return Swift.min(Swift.max(v, t.min), t.max)
     }
 
-    private func write(_ key: String, _ v: Double) {
-        if style == "ramp" { ramp[key] = v } else { braille[key] = v }
-    }
+    private func write(_ key: String, _ v: Double) { ramp[key] = v }
 
-    var tunables: [AlbumArtTunable] {
-        style == "ramp" ? AlbumArtRamp.Params.tunables
-                        : AlbumArtBraille.Params.tunables
-    }
+    var tunables: [AlbumArtTunable] { AlbumArtRamp.Params.tunables }
 
     // MARK: Lifecycle
 
     func start() {
-        let t = AlbumArtTuning.load()
-        if let r = t["ramp"] { ramp = AlbumArtRamp.Params(json: r) }
-        if let b = t["braille"] { braille = AlbumArtBraille.Params(json: b) }
+        if let r = AlbumArtTuning.load()["ramp"] { ramp = AlbumArtRamp.Params(json: r) }
         if let s = try? String(contentsOf: settingsURL ?? URL(fileURLWithPath: "/dev/null")),
            let d = s.data(using: .utf8),
            let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
-           let st = o["albumArtStyle"] as? String {
-            if st == "none" { artOff = true } else { style = st }
+           (o["albumArtStyle"] as? String) == "none" {
+            artOff = true
         }
         loadCurrentTrack()
         // Follow the music: a track change swaps the artwork underneath us.
@@ -166,10 +153,10 @@ final class AlbumArtTunerModel: ObservableObject {
         apply()
     }
 
-    /// The style control: the one place the style is a user decision rather
-    /// than derived state, so the one place that may persist it.
-    func selectStyle(_ s: String) {
-        style = s
+    /// The "turn on" control: the one place switching art on is a user
+    /// decision rather than derived state, so the one place that may persist
+    /// it.
+    func turnOn() {
         styleChosen = true
         artOff = false
         apply()
@@ -177,9 +164,7 @@ final class AlbumArtTunerModel: ObservableObject {
 
     // MARK: Params access
 
-    func value(_ key: String) -> Double {
-        style == "ramp" ? ramp[key] : braille[key]
-    }
+    func value(_ key: String) -> Double { ramp[key] }
 
     func set(_ key: String, _ v: Double) {
         write(key, v)
@@ -203,14 +188,13 @@ final class AlbumArtTunerModel: ObservableObject {
     }
 
     func reset() {
-        if style == "ramp" { ramp = AlbumArtRamp.Params() }
-        else { braille = AlbumArtBraille.Params() }
+        ramp = AlbumArtRamp.Params()
         saved = false
         apply()
     }
 
     func save() {
-        AlbumArtTuning.save(["ramp": ramp.json, "braille": braille.json])
+        AlbumArtTuning.save(["ramp": ramp.json])
         saved = true
     }
 
@@ -240,28 +224,16 @@ final class AlbumArtTunerModel: ObservableObject {
         // knobs would not respond until Save, and an opened image would not
         // survive the fit.
         let stamp: [String: Any] = [
-            AlbumArtGrid.tuningKey: ["ramp": ramp.json, "braille": braille.json],
+            AlbumArtGrid.tuningKey: ["ramp": ramp.json],
             AlbumArtGrid.sourceKey: imageURL?.path ?? srcURL?.path ?? "",
         ]
-        if style == "ramp", let g = AlbumArtRamp.render(image, params: ramp) {
+        if let g = AlbumArtRamp.render(image, params: ramp) {
             payload["ramp"] = g.merging(stamp) { _, new in new }
-        } else if style == "braille",
-                  let g = AlbumArtBraille.render(image, params: braille) {
-            payload["braille"] = g.merging(stamp) { _, new in new }
         }
         renderMS = (CFAbsoluteTimeGetCurrent() - t0) * 1000
 
         let dst = wdir.appendingPathComponent("albumart.json")
         let tmp = wdir.appendingPathComponent(".albumart.json.tuner")
-        // Keep the other style's grid when it belongs to this same track, so
-        // toggling ramp/braille doesn't strip the one you're not tuning.
-        let other = style == "ramp" ? "braille" : "ramp"
-        if let d = try? Data(contentsOf: dst),
-           let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
-           (o["key"] as? String) == (payload["key"] as? String),
-           let keep = o[other] {
-            payload[other] = keep
-        }
         if let d = try? JSONSerialization.data(withJSONObject: payload),
            (try? d.write(to: tmp)) != nil {
             // rename(2) over the old file: the saver polls this at 4 Hz and
@@ -271,8 +243,8 @@ final class AlbumArtTunerModel: ObservableObject {
         if styleChosen { writeStyle() }
     }
 
-    /// The saver only draws art for the style it is set to, so PICKING a
-    /// style here selects it. Only a pick: `apply` gates this on
+    /// Switch art on in the app's settings (the saver draws nothing while
+    /// it reads "none"). Only on an explicit "turn on": `apply` gates this on
     /// `styleChosen`, so opening the window with art switched off in the app
     /// leaves it off.
     private func writeStyle() {
@@ -280,8 +252,8 @@ final class AlbumArtTunerModel: ObservableObject {
         var o: [String: Any] = [:]
         if let d = try? Data(contentsOf: u),
            let e = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] { o = e }
-        guard (o["albumArtStyle"] as? String) != style else { return }
-        o["albumArtStyle"] = style
+        guard (o["albumArtStyle"] as? String) != "ramp" else { return }
+        o["albumArtStyle"] = "ramp"
         guard let d = try? JSONSerialization.data(withJSONObject: o),
               (try? d.write(to: u, options: .atomic)) != nil else { return }
         NotificationCenter.default.post(name: .albumArtStyleDidChange, object: nil)
@@ -300,9 +272,7 @@ final class AlbumArtTunerModel: ObservableObject {
         return "\(app)|\(title)|\(np["artist"] as? String ?? "")"
     }
 
-    private var widgets: URL? {
-        CorpusStore.corpusDirectory?.appendingPathComponent("widgets", isDirectory: true)
-    }
+    private var widgets: URL? { CorpusStore.widgetsDirectory }
     private var settingsURL: URL? {
         widgets?.appendingPathComponent("settings.json")
     }
@@ -366,17 +336,13 @@ private struct AlbumArtControls: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 8) {
-                Picker("", selection: Binding(get: { model.style },
-                                              set: { model.selectStyle($0) })) {
-                    Text("ramp").tag("ramp")
-                    Text("braille").tag("braille")
-                }
-                .pickerStyle(.segmented).labelsHidden()
                 if model.artOff {
-                    Text("album art is off in the app — pick a style above to turn it on")
+                    Text("album art is off in the app — the saver won't draw it")
                         .font(.system(size: 10))
                         .foregroundStyle(.orange)
                         .fixedSize(horizontal: false, vertical: true)
+                    Button("Turn on album art") { model.turnOn() }
+                        .controlSize(.small)
                 }
 
                 HStack(spacing: 6) {

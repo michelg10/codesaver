@@ -425,15 +425,16 @@ struct ContentView: View {
     // MARK: Album art style (shared with the saver via the group container)
 
     private static func artSettingsURL() -> URL? {
-        CorpusStore.corpusDirectory?
-            .appendingPathComponent("widgets/settings.json")
+        CorpusStore.widgetsDirectory?.appendingPathComponent("settings.json")
     }
 
     static func loadAlbumArtStyle() -> String {
         guard let u = artSettingsURL(), let d = try? Data(contentsOf: u),
               let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
               let s = o["albumArtStyle"] as? String else { return "none" }
-        return s
+        // One renderer now. A settings file still naming the retired braille
+        // style reads as "on" rather than leaving the picker unselected.
+        return s == "none" ? "none" : "ramp"
     }
 
     static func saveAlbumArtStyle(_ style: String) {
@@ -509,13 +510,12 @@ struct ContentView: View {
                         get: { albumArtStyle },
                         set: { albumArtStyle = $0; ContentView.saveAlbumArtStyle($0) })) {
                         Text("off").tag("none")
-                        Text("ramp").tag("ramp")
-                        Text("braille").tag("braille")
+                        Text("on").tag("ramp")
                     }
                     .pickerStyle(.segmented)
                     .labelsHidden()
                     .controlSize(.small)
-                    .frame(width: 210, alignment: .leading)
+                    .frame(width: 140, alignment: .leading)
                     Button("Tune…") { openWindow(id: "albumart") }
                         .buttonStyle(.bordered).controlSize(.small)
                 }

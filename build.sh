@@ -19,7 +19,6 @@ swiftc -O -parse-as-library -module-name CodeSaverPreview \
   appex/CodeSaver/CorpusStore.swift \
   appex/CodeSaver/AlbumArtShared.swift \
   appex/CodeSaver/AlbumArtRamp.swift \
-  appex/CodeSaver/AlbumArtBraille.swift \
   Sources/PreviewMain.swift \
   -framework ScreenSaver -framework AppKit -framework QuartzCore -framework Metal \
   -framework ScreenCaptureKit -framework ImageIO \

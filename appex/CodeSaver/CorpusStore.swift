@@ -37,6 +37,17 @@ enum CorpusStore {
                                              isDirectory: true)
     }
 
+    /// widgets/ under the corpus: the feed, album art and settings the saver's
+    /// panels read and the feeds daemon writes. CODESAVER_WIDGETS_DIR points
+    /// the snapshot harness at a fixture directory instead, so a rendered
+    /// frame can show a chosen panel state rather than whatever is playing.
+    static var widgetsDirectory: URL? {
+        if let p = ProcessInfo.processInfo.environment["CODESAVER_WIDGETS_DIR"], !p.isEmpty {
+            return URL(fileURLWithPath: p, isDirectory: true)
+        }
+        return corpusDirectory?.appendingPathComponent("widgets", isDirectory: true)
+    }
+
     /// Per-repo filtered mirror of GitHub (what ingest/cache/ used to be).
     static var repoCacheDirectory: URL? {
         containerURL?.appendingPathComponent("Library/Caches/CodeSaver/cache", isDirectory: true)

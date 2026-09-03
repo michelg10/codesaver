@@ -40,9 +40,7 @@ enum FeedsService {
     private static var spoolDir: URL { home.appendingPathComponent(".bifrocate/cot") }
     private static var pinsURL: URL { home.appendingPathComponent(".bifrocate/pins.json") }
     private static var pinStateURL: URL { home.appendingPathComponent(".bifrocate/pins.state.json") }
-    static var widgetsDir: URL? {
-        CorpusStore.corpusDirectory?.appendingPathComponent("widgets", isDirectory: true)
-    }
+    static var widgetsDir: URL? { CorpusStore.widgetsDirectory }
 
     // MARK: Per-session model
 
@@ -114,8 +112,8 @@ enum FeedsService {
             }
             tailSpools(offsets: &offsets, spool: &spool)
             if tick % 3 == 0 { nowPlaying = pollNowPlaying() }
-            // Album art: on track change, extract + convert on a worker
-            // thread (extraction ~1s, two converters ~3s — never in a tick).
+            // Album art: on track change, extract + render on a worker
+            // thread (extraction ~1s, the render ~1s — never in a tick).
             // A tuning edit re-renders the playing track: the tuning window
             // saves, this notices within a tick, and the saver shows the new
             // art — the whole point of keeping the knobs out of the binary.
@@ -539,11 +537,9 @@ enum FeedsService {
         return t.terminationStatus == 0 ? data : nil
     }
 
-    /// Extract the current track's artwork, convert it to BOTH text styles
-    /// with the tuned Python pipelines, and publish widgets/albumart.json.
-    /// The converters live in the container (installed by install.sh,
-    /// editable without a rebuild — tuning happens on real renders). A
-    /// failure at any stage simply leaves the previous art in place.
+    /// Extract the current track's artwork, render it to the text grid with
+    /// the tuned parameters, and publish widgets/albumart.json. A failure at
+    /// any stage simply leaves the previous art in place.
     private static func refreshAlbumArt(app: String, key: String) {
         guard let wdir = widgetsDir else { return }
         let src = wdir.appendingPathComponent("albumart-src.img")
@@ -576,12 +572,11 @@ enum FeedsService {
             guard (try? img.write(to: src)) != nil else { return }
         }
 
-        // Decode once, then run both renderers natively. These were Python
-        // (PIL/numpy) while the styles were being tuned; the pipelines are
-        // settled now, so they live in-process — no interpreter dependency,
-        // no per-track subprocess, and the app works on any machine.
-        // feeds/albumart/*.py stay in the repo as the reference the ports
-        // were verified against.
+        // Decode, then render natively. This was Python (PIL/numpy) while
+        // the style was being tuned; the pipeline is settled now, so it
+        // lives in-process — no interpreter dependency, no per-track
+        // subprocess, and the app works on any machine. feeds/albumart/ramp.py
+        // stays in the repo as the reference the port was verified against.
         guard let isrc = CGImageSourceCreateWithURL(src as CFURL, nil),
               let cg = CGImageSourceCreateImageAtIndex(isrc, 0, nil) else { return }
         let tuning = AlbumArtTuning.load()
@@ -591,11 +586,7 @@ enum FeedsService {
             cg, params: AlbumArtRamp.Params(json: tuning["ramp"] ?? [:])) {
             payload["ramp"] = ramp
         }
-        if let braille = AlbumArtBraille.render(
-            cg, params: AlbumArtBraille.Params(json: tuning["braille"] ?? [:])) {
-            payload["braille"] = braille
-        }
-        guard payload["ramp"] != nil || payload["braille"] != nil else { return }
+        guard payload["ramp"] != nil else { return }
         let tmp = wdir.appendingPathComponent(".albumart.json.tmp")
         let dst = wdir.appendingPathComponent("albumart.json")
         if let data = try? JSONSerialization.data(withJSONObject: payload),

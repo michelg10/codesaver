@@ -30,11 +30,9 @@
 		1A00008C000000000000000A /* FeedsService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A00008E000000000000000B /* FeedsService.swift */; };
 		1A000090000000000000000A /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A000091000000000000000B /* main.swift */; };
 		1A000092000000000000000A /* AlbumArtRamp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A000093000000000000000B /* AlbumArtRamp.swift */; };
-		1A000094000000000000000A /* AlbumArtBraille.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A000095000000000000000B /* AlbumArtBraille.swift */; };
 		1A000096000000000000000A /* AlbumArtShared.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A000098000000000000000B /* AlbumArtShared.swift */; };
 		1A000097000000000000000A /* AlbumArtShared.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A000098000000000000000B /* AlbumArtShared.swift */; };
 		1A00009B000000000000000A /* AlbumArtRamp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A000093000000000000000B /* AlbumArtRamp.swift */; };
-		1A00009C000000000000000A /* AlbumArtBraille.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A000095000000000000000B /* AlbumArtBraille.swift */; };
 		1A000099000000000000000A /* AlbumArtTuner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A00009A000000000000000B /* AlbumArtTuner.swift */; };
 		1A00008D000000000000000A /* com.michelg10.CodeSaver.feeds.plist in Embed LaunchAgent */ = {isa = PBXBuildFile; fileRef = 1A00008F000000000000000B /* com.michelg10.CodeSaver.feeds.plist */; };
 		1A000006000000000000000A /* ScreenSaver.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1A000006000000000000000B /* ScreenSaver.framework */; };
@@ -118,7 +116,6 @@
 		1A00008E000000000000000B /* FeedsService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FeedsService.swift; sourceTree = "<group>"; };
 		1A000091000000000000000B /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		1A000093000000000000000B /* AlbumArtRamp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AlbumArtRamp.swift; sourceTree = "<group>"; };
-		1A000095000000000000000B /* AlbumArtBraille.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AlbumArtBraille.swift; sourceTree = "<group>"; };
 		1A000098000000000000000B /* AlbumArtShared.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AlbumArtShared.swift; sourceTree = "<group>"; };
 		1A00009A000000000000000B /* AlbumArtTuner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AlbumArtTuner.swift; sourceTree = "<group>"; };
 		1A00008F000000000000000B /* com.michelg10.CodeSaver.feeds.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "com.michelg10.CodeSaver.feeds.plist"; sourceTree = "<group>"; };
@@ -173,7 +170,6 @@
 				1A00008E000000000000000B /* FeedsService.swift */,
 				1A000091000000000000000B /* main.swift */,
 				1A000093000000000000000B /* AlbumArtRamp.swift */,
-				1A000095000000000000000B /* AlbumArtBraille.swift */,
 				1A000098000000000000000B /* AlbumArtShared.swift */,
 				1A00009A000000000000000B /* AlbumArtTuner.swift */,
 				1A00008F000000000000000B /* com.michelg10.CodeSaver.feeds.plist */,
@@ -359,7 +355,6 @@
 				1A000092000000000000000A /* AlbumArtRamp.swift in Sources */,
 				1A000096000000000000000A /* AlbumArtShared.swift in Sources */,
 				1A000099000000000000000A /* AlbumArtTuner.swift in Sources */,
-				1A000094000000000000000A /* AlbumArtBraille.swift in Sources */,
 				1A000085000000000000000A /* GitHubCorpusFetcher.swift in Sources */,
 				1A00008B000000000000000A /* RefreshManager.swift in Sources */,
 				1A000086000000000000000A /* CorpusStore.swift in Sources */,
@@ -380,7 +375,6 @@
 				1A000087000000000000000A /* CorpusStore.swift in Sources */,
 				1A000097000000000000000A /* AlbumArtShared.swift in Sources */,
 				1A00009B000000000000000A /* AlbumArtRamp.swift in Sources */,
-				1A00009C000000000000000A /* AlbumArtBraille.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

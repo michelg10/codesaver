@@ -1490,7 +1490,7 @@ public final class CodeSaverView: ScreenSaverView {
     private var widgetFeedMTime: Date?
 
     // Album art (fed by widgets/albumart.json; style from widgets/settings.json)
-    private var artStyle = "none"          // none | ramp | braille
+    private var artStyle = "none"          // none | ramp
     private var artKey = ""                // "app|title|artist" the grids belong to
     private var artGrids: [String: AlbumArtGrid] = [:]
     private var artMTime: Date?
@@ -1529,8 +1529,8 @@ public final class CodeSaverView: ScreenSaverView {
     private func pollWidgetFeed() {
         guard !Self.widgetsDisabled, now >= widgetPollAt else { return }
         widgetPollAt = now + 1.0
-        guard let url = CorpusStore.corpusDirectory?
-            .appendingPathComponent("widgets/feed.json") else { return }
+        guard let url = CorpusStore.widgetsDirectory?
+            .appendingPathComponent("feed.json") else { return }
         let m = (try? FileManager.default.attributesOfItem(atPath: url.path))?[
             .modificationDate] as? Date
         if let m, m == widgetFeedMTime { return }   // unchanged since last decode
@@ -1588,8 +1588,7 @@ public final class CodeSaverView: ScreenSaverView {
         guard !Self.widgetsDisabled, now >= artPollAt else { return }
         artPollAt = now + 0.25
         let fm = FileManager.default
-        guard let dir = CorpusStore.corpusDirectory?
-            .appendingPathComponent("widgets", isDirectory: true) else { return }
+        guard let dir = CorpusStore.widgetsDirectory else { return }
         let sURL = dir.appendingPathComponent("settings.json")
         let sM = (try? fm.attributesOfItem(atPath: sURL.path))?[.modificationDate] as? Date
         if sM != artSettingsMTime {
@@ -1597,7 +1596,9 @@ public final class CodeSaverView: ScreenSaverView {
             if let d = try? Data(contentsOf: sURL),
                let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
                let st = o["albumArtStyle"] as? String {
-                artStyle = st
+                // One renderer now: a settings file still naming the retired
+                // braille style reads as on, not off.
+                artStyle = st == "none" ? "none" : "ramp"
             } else {
                 artStyle = "none"
             }
@@ -1615,16 +1616,16 @@ public final class CodeSaverView: ScreenSaverView {
               let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
               let key = o["key"] as? String else { return }
         artKey = key
-        for style in ["ramp", "braille"] {
+        for style in ["ramp"] {
             guard let g = o[style] as? [String: Any],
                   let grid = AlbumArtGrid(json: g) else { continue }
             artGrids[style] = grid
         }
     }
 
-    /// Row step of an art grid in points at the current base font.
+    /// Row step of an art grid in points at the current cell width.
     private func artRowStep(_ g: AlbumArtGrid) -> CGFloat {
-        g.rowStep(baseFont: font!, charW: charW)
+        AlbumArtGrid.rowStep(charW: charW)
     }
 
     /// Rasterize the art grid once per (track, style, scale); the cached
@@ -1672,24 +1673,16 @@ public final class CodeSaverView: ScreenSaverView {
         var grid: AlbumArtGrid?
         let fm = FileManager.default
         let srcURL = g.sourcePath.flatMap { fm.isReadableFile(atPath: $0) ? URL(fileURLWithPath: $0) : nil }
-            ?? CorpusStore.corpusDirectory?.appendingPathComponent("widgets/albumart-src.img")
+            ?? CorpusStore.widgetsDirectory?.appendingPathComponent("albumart-src.img")
         if let srcURL,
            let isrc = CGImageSourceCreateWithURL(srcURL as CFURL, nil),
            let img = CGImageSourceCreateImageAtIndex(isrc, 0, nil) {
             let tuning = g.tuning ?? AlbumArtTuning.load()
-            if artStyle == "ramp" {
-                var p = AlbumArtRamp.Params(json: tuning["ramp"] ?? [:])
-                p.cols = Double(cols)
-                p.rows = Double(rows)
-                grid = AlbumArtRamp.render(img, params: p)
-                    .flatMap { AlbumArtGrid(json: $0) }
-            } else {
-                var p = AlbumArtBraille.Params(json: tuning["braille"] ?? [:])
-                p.cols = Double(cols)
-                p.rows = Double(rows)
-                grid = AlbumArtBraille.render(img, params: p)
-                    .flatMap { AlbumArtGrid(json: $0) }
-            }
+            var p = AlbumArtRamp.Params(json: tuning["ramp"] ?? [:])
+            p.cols = Double(cols)
+            p.rows = Double(rows)
+            grid = AlbumArtRamp.render(img, params: p)
+                .flatMap { AlbumArtGrid(json: $0) }
         }
         artFitCache = (artKey, artStyle, cols, rows, tuningTS, artMTime, grid)
         return grid
