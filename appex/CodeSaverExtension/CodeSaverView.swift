@@ -2240,8 +2240,8 @@ public final class CodeSaverView: ScreenSaverView {
         // wide glyph is one step like any other, it just frees two cells.
         var over = 0, rest = total
         while over < chars.count, rest > width { rest -= cells[over]; over += 1 }
-        let glyph = 0.34            // seconds per glyph
-        let hold = 2.2              // pause at each end
+        let glyph = 0.19            // seconds per glyph — 0.34 read as a crawl on a long title
+        let hold = 1.8              // pause at each end
         let cycle = hold * 2 + Double(over) * glyph
         let t = now.truncatingRemainder(dividingBy: cycle)
         let off: Int
