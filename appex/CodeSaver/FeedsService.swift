@@ -98,6 +98,7 @@ enum FeedsService {
         var lastFeed = ""
         var tick = 0
         var nowPlaying: [String: Any]?
+        var pausedSince: Double?                     // wall time the player was first seen paused
         var lastPrune = Date.distantPast
 
         if let dir = widgetsDir {
@@ -111,7 +112,23 @@ enum FeedsService {
                 pruneSessionFiles()
             }
             tailSpools(offsets: &offsets, spool: &spool)
-            if tick % 3 == 0 { nowPlaying = pollNowPlaying() }
+            if tick % 3 == 0 {
+                // Paused music stays on the panel for half an hour — long
+                // enough to come back to, short enough that a player left
+                // paused overnight doesn't hold the corner all night. The
+                // clock starts at the first paused poll; only a resume or a
+                // stop resets it, so once it runs out the entry stays gone.
+                var np = pollNowPlaying()
+                if (np?["state"] as? String) == "paused" {
+                    let t = Date().timeIntervalSince1970
+                    let since = pausedSince ?? t
+                    pausedSince = since
+                    if t - since > 1800 { np = nil } else { np?["paused_since"] = since }
+                } else {
+                    pausedSince = nil
+                }
+                nowPlaying = np
+            }
             // Album art: on track change, extract + render on a worker
             // thread (extraction ~1s, the render ~1s — never in a tick).
             // A tuning edit re-renders the playing track: the tuning window
@@ -458,7 +475,7 @@ enum FeedsService {
     private static func pollNowPlaying() -> [String: Any]? {
         for p in players {
             guard playerRunning(p.name) else { continue }
-            // One script, newline-joined fields; empty when paused/stopped.
+            // One script, newline-joined fields; empty when stopped.
             // Executed via /usr/bin/osascript: the daemon must never
             // initialize the AppleEvents machinery in-process (it registers
             // an ASN that makes LaunchServices treat this process as the
@@ -472,12 +489,15 @@ enum FeedsService {
             let src = """
             with timeout of 3 seconds
                 tell application "\(p.name)"
-                    if player state is playing then
+                    if player state is playing or player state is paused then
+                        -- `ps`, not `st`: Music's dictionary claims `st`.
+                        set ps to "paused"
+                        if player state is playing then set ps to "playing"
                         set t to name of current track
                         set a to artist of current track
                         set pos to player position
                         set dur to duration of current track
-                        return t & "\\n" & a & "\\n" & (pos as text) & "\\n" & (dur as text)
+                        return ps & "\\n" & t & "\\n" & a & "\\n" & (pos as text) & "\\n" & (dur as text)
                     end if
                     return ""
                 end tell
@@ -488,17 +508,17 @@ enum FeedsService {
                       .trimmingCharacters(in: .whitespacesAndNewlines),
                   !text.isEmpty else { continue }
             let parts = text.components(separatedBy: "\n")
-            guard parts.count >= 4 else { continue }
+            guard parts.count >= 5 else { continue }
             // AppleScript numbers can arrive comma-decimal under some locales.
             func num(_ s: String) -> Double? { Double(s.replacingOccurrences(of: ",", with: ".")) }
-            var dur = num(parts[3]) ?? 0
+            var dur = num(parts[4]) ?? 0
             // Spotify's `duration of current track` is milliseconds (its
             // sdef says seconds; it isn't) while `player position` is
             // seconds. Music returns seconds for both. The feed carries
             // seconds — the saver clocks the progress bar against it.
             if p.name == "Spotify" { dur /= 1000 }
-            return ["app": p.name, "title": parts[0], "artist": parts[1],
-                    "position": num(parts[2]) ?? 0, "duration": dur,
+            return ["app": p.name, "state": parts[0], "title": parts[1], "artist": parts[2],
+                    "position": num(parts[3]) ?? 0, "duration": dur,
                     "ts": Date().timeIntervalSince1970]
         }
         return nil
@@ -538,11 +558,39 @@ enum FeedsService {
     }
 
     /// Extract the current track's artwork, render it to the text grid with
-    /// the tuned parameters, and publish widgets/albumart.json. A failure at
-    /// any stage simply leaves the previous art in place.
+    /// the tuned parameters, and publish widgets/albumart.json under the
+    /// track's key. A track WITHOUT artwork — or one whose art can't be
+    /// fetched — publishes the key alone: the saver reads that as "asked, and
+    /// there is none" and rests its placeholder, rather than waiting on art
+    /// that will never come.
     private static func refreshAlbumArt(app: String, key: String) {
         guard let wdir = widgetsDir else { return }
-        let src = wdir.appendingPathComponent("albumart-src.img")
+        var payload: [String: Any] = ["key": key,
+                                      "ts": Date().timeIntervalSince1970]
+        // The renderer was Python (PIL/numpy) while the style was being
+        // tuned; the pipeline is settled now, so it lives in-process — no
+        // interpreter dependency, no per-track subprocess, and the app works
+        // on any machine. feeds/albumart/ramp.py stays in the repo as the
+        // reference the port was verified against.
+        if let cg = fetchArtwork(app: app, into: wdir.appendingPathComponent("albumart-src.img")),
+           let ramp = AlbumArtRamp.render(
+               cg, params: AlbumArtRamp.Params(json: AlbumArtTuning.load()["ramp"] ?? [:])) {
+            payload["ramp"] = ramp
+        }
+        let tmp = wdir.appendingPathComponent(".albumart.json.tmp")
+        let dst = wdir.appendingPathComponent("albumart.json")
+        if let data = try? JSONSerialization.data(withJSONObject: payload),
+           (try? data.write(to: tmp)) != nil {
+            try? CorpusStore.replaceFile(at: dst, with: tmp)  // rename over the old: no gap
+        }
+    }
+
+    /// The current track's cover, saved to `src` and decoded — nil when the
+    /// player has none (or won't say). On nil the previous track's file is
+    /// removed too, so nothing downstream (the tuner's "current track") can
+    /// mistake it for this one's.
+    private static func fetchArtwork(app: String, into src: URL) -> CGImage? {
+        var ok = false
         if app == "Music" {
             let script = """
             tell application "Music"
@@ -553,46 +601,30 @@ enum FeedsService {
             write d to f
             close access f
             """
-            guard runProcess("/usr/bin/osascript", ["-e", script]) != nil else { return }
+            ok = runProcess("/usr/bin/osascript", ["-e", script]) != nil
         } else {
             // Spotify exposes a URL, not bytes.
             let script = "tell application \"\(app)\" to artwork url of current track"
-            guard let d = runProcess("/usr/bin/osascript", ["-e", script]),
-                  let urlStr = String(data: d, encoding: .utf8)?
-                      .trimmingCharacters(in: .whitespacesAndNewlines),
-                  let url = URL(string: urlStr) else { return }
-            let sem = DispatchSemaphore(value: 0)
-            var img: Data?
-            URLSession.shared.dataTask(with: url) { data, _, _ in
-                img = data
-                sem.signal()
-            }.resume()
-            _ = sem.wait(timeout: .now() + 15)
-            guard let img else { return }
-            guard (try? img.write(to: src)) != nil else { return }
+            if let d = runProcess("/usr/bin/osascript", ["-e", script]),
+               let urlStr = String(data: d, encoding: .utf8)?
+                   .trimmingCharacters(in: .whitespacesAndNewlines),
+               let url = URL(string: urlStr) {
+                let sem = DispatchSemaphore(value: 0)
+                var img: Data?
+                URLSession.shared.dataTask(with: url) { data, _, _ in
+                    img = data
+                    sem.signal()
+                }.resume()
+                _ = sem.wait(timeout: .now() + 15)
+                if let img, (try? img.write(to: src)) != nil { ok = true }
+            }
         }
-
-        // Decode, then render natively. This was Python (PIL/numpy) while
-        // the style was being tuned; the pipeline is settled now, so it
-        // lives in-process — no interpreter dependency, no per-track
-        // subprocess, and the app works on any machine. feeds/albumart/ramp.py
-        // stays in the repo as the reference the port was verified against.
-        guard let isrc = CGImageSourceCreateWithURL(src as CFURL, nil),
-              let cg = CGImageSourceCreateImageAtIndex(isrc, 0, nil) else { return }
-        let tuning = AlbumArtTuning.load()
-        var payload: [String: Any] = ["key": key,
-                                      "ts": Date().timeIntervalSince1970]
-        if let ramp = AlbumArtRamp.render(
-            cg, params: AlbumArtRamp.Params(json: tuning["ramp"] ?? [:])) {
-            payload["ramp"] = ramp
+        if ok, let isrc = CGImageSourceCreateWithURL(src as CFURL, nil),
+           let cg = CGImageSourceCreateImageAtIndex(isrc, 0, nil) {
+            return cg
         }
-        guard payload["ramp"] != nil else { return }
-        let tmp = wdir.appendingPathComponent(".albumart.json.tmp")
-        let dst = wdir.appendingPathComponent("albumart.json")
-        if let data = try? JSONSerialization.data(withJSONObject: payload),
-           (try? data.write(to: tmp)) != nil {
-            try? CorpusStore.replaceFile(at: dst, with: tmp)  // rename over the old: no gap
-        }
+        try? FileManager.default.removeItem(at: src)
+        return nil
     }
 }
 

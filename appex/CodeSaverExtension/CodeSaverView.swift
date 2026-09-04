@@ -1453,6 +1453,15 @@ public final class CodeSaverView: ScreenSaverView {
     // the prompt cache warm with keep-alive pings) rests as
     // `✻ Pinned (next ping in 35m ∙ 2h 32m ago)` and sits above the other
     // resting panels.
+    //
+    // The music panel's art box is there from a track's first frame, sized
+    // from the saved tuning. While the cover is on its way it is a CRT seen
+    // by a fast camera: no beam, no band — the whole box is one brightness
+    // gradient, phosphor age since the write position passed, rolling down
+    // and wrapping, every cell a symbol-ramp glyph; when the cover lands the
+    // same pass writes it in. A track with no cover rests the field, still
+    // and dim. Paused music stays — the feed holds it for half an hour — the
+    // cover stepped back under a small ■ PAUSED box.
 
     private struct WidgetSession {
         var cwd = "?"
@@ -1483,30 +1492,48 @@ public final class CodeSaverView: ScreenSaverView {
         var sessions: [WidgetSession] = []
         var npApp: String?, npTitle = "", npArtist = ""
         var npPos: Double = 0, npDur: Double = 0, npTS: Double = 0
+        /// "playing" or "paused" (the daemon drops a pause after 30 min).
+        var npState: String?, npPausedSince: Double?
     }
 
     private var widgetFeed = WidgetFeed()
     private var widgetPollAt: Double = 0
     private var widgetFeedMTime: Date?
 
-    // Album art (fed by widgets/albumart.json; style from widgets/settings.json)
-    private var artStyle = "none"          // none | ramp
-    private var artKey = ""                // "app|title|artist" the grids belong to
-    private var artGrids: [String: AlbumArtGrid] = [:]
+    // Album art (fed by widgets/albumart.json; on/off from widgets/settings.json)
+    private var artOn = false
+    private var artKey = ""                // "app|title|artist" the grid belongs to
+    /// The published cover. nil under a key that matches the track means the
+    /// daemon looked and the track has none.
+    private var artGrid: AlbumArtGrid?
     private var artMTime: Date?
     private var artSettingsMTime: Date?
-    /// Laid-out art rows, cached per (track, style, font size). Caching the
+    /// The saved tuning's grid size, refreshed when the tuning file changes.
+    /// The art box is sized from THIS before any cover arrives, so the panel
+    /// is exactly as wide while loading as it will be with the cover in it.
+    private var artParams = AlbumArtRamp.Params()
+    private var artTuningMTime: Date?
+    /// Laid-out art rows, cached per (track, font size). Caching the
     /// LAYOUT rather than a bitmap keeps the art on the panel's own character
     /// grid — a rasterized copy could only ever be composited at some pixel
     /// offset, which is what threw its columns out of line with the chrome.
-    private var artRowsCache: (key: String, style: String, pt: CGFloat,
-                               cols: Int, rows: [NSAttributedString])?
-    /// Budget-fitted re-renders, once per (published grid, style, size,
-    /// tuning) — `published` is albumart.json's mtime, so a knob turn or a
-    /// new source image in the tuner re-renders even at the same size.
-    private var artFitCache: (key: String, style: String, cols: Int, rows: Int,
+    private var artRowsCache: (key: String, pt: CGFloat, cols: Int,
+                               rows: [NSAttributedString])?
+    /// Budget-fitted re-renders, once per (published grid, size, tuning) —
+    /// `published` is albumart.json's mtime, so a knob turn or a new source
+    /// image in the tuner re-renders even at the same size.
+    private var artFitCache: (key: String, cols: Int, rows: Int,
                               tuning: Date?, published: Date?, grid: AlbumArtGrid?)?
     private var artPollAt: Double = 0
+    /// The track the panel is on and when it first showed — the placeholder's
+    /// clock — and when its cover landed — the reveal's.
+    private var npTrackKey = ""
+    private var npTrackSince: Double = 0
+    private var artShownSince: Double?
+    /// Composited art rows (placeholder, reveal, paused overlay), keyed on
+    /// everything they were built from: a static state costs one build, an
+    /// animated one a build per quantised tick.
+    private var artFXCache: (key: String, rows: [NSAttributedString])?
     /// Ceiling for the music panel, expressed as a LINE BUDGET — this is a
     /// text UI, and "N lines" means something here in a way that a percentage
     /// of the display never did. The effective ceiling is whichever sits
@@ -1571,6 +1598,8 @@ public final class CodeSaverView: ScreenSaverView {
             feed.npPos = np["position"] as? Double ?? 0
             feed.npDur = np["duration"] as? Double ?? 0
             feed.npTS = np["ts"] as? Double ?? 0
+            feed.npState = np["state"] as? String
+            feed.npPausedSince = np["paused_since"] as? Double
         }
     }
 
@@ -1582,86 +1611,93 @@ public final class CodeSaverView: ScreenSaverView {
                        blue: CGFloat(v & 0xFF) / 255, alpha: 1)
     }
 
-    /// 4 Hz: style toggle from the host app, art grids from the daemon — and
-    /// from the tuning window, which republishes on every knob turn.
+    /// 4 Hz: the on/off switch from the host app, the saved tuning's size,
+    /// and the art grid from the daemon — or from the tuning window, which
+    /// republishes on every knob turn.
     private func pollAlbumArt() {
         guard !Self.widgetsDisabled, now >= artPollAt else { return }
         artPollAt = now + 0.25
         let fm = FileManager.default
         guard let dir = CorpusStore.widgetsDirectory else { return }
+        func mtime(_ u: URL) -> Date? {
+            (try? fm.attributesOfItem(atPath: u.path))?[.modificationDate] as? Date
+        }
         let sURL = dir.appendingPathComponent("settings.json")
-        let sM = (try? fm.attributesOfItem(atPath: sURL.path))?[.modificationDate] as? Date
+        let sM = mtime(sURL)
         if sM != artSettingsMTime {
             artSettingsMTime = sM
+            // Anything but "none" is on: a settings file still naming the
+            // retired braille style reads as on, not off.
             if let d = try? Data(contentsOf: sURL),
                let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
                let st = o["albumArtStyle"] as? String {
-                // One renderer now: a settings file still naming the retired
-                // braille style reads as on, not off.
-                artStyle = st == "none" ? "none" : "ramp"
+                artOn = st != "none"
             } else {
-                artStyle = "none"
+                artOn = false
             }
         }
-        guard artStyle != "none" else { return }
+        guard artOn else { return }
+        // Compare the OPTIONAL: a deleted tuning file means "back to the
+        // defaults", which is a size change like any other.
+        let tM = AlbumArtTuning.url.flatMap(mtime)
+        if tM != artTuningMTime {
+            artTuningMTime = tM
+            artParams = AlbumArtRamp.Params(json: AlbumArtTuning.load()["ramp"] ?? [:])
+        }
         let aURL = dir.appendingPathComponent("albumart.json")
-        let aM = (try? fm.attributesOfItem(atPath: aURL.path))?[.modificationDate] as? Date
+        let aM = mtime(aURL)
         guard aM != artMTime else { return }
         artMTime = aM
         artRowsCache = nil
         artFitCache = nil
-        artGrids = [:]
+        artGrid = nil
         artKey = ""
         guard let d = try? Data(contentsOf: aURL),
               let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
               let key = o["key"] as? String else { return }
         artKey = key
-        for style in ["ramp"] {
-            guard let g = o[style] as? [String: Any],
-                  let grid = AlbumArtGrid(json: g) else { continue }
-            artGrids[style] = grid
-        }
+        if let g = o["ramp"] as? [String: Any] { artGrid = AlbumArtGrid(json: g) }
     }
 
-    /// Row step of an art grid in points at the current cell width.
-    private func artRowStep(_ g: AlbumArtGrid) -> CGFloat {
-        AlbumArtGrid.rowStep(charW: charW)
+    /// The art box for a height budget: a cols × rows grid, shrunk — both
+    /// together, so the cover stays square — when its natural height overruns
+    /// the room. nil when even that would be a smudge; then the panel has no
+    /// art box at all. The placeholder (sized from the saved tuning) and the
+    /// fitted cover go through this SAME rule, which is what keeps the
+    /// panel's width from jumping when the cover lands. Never scales the
+    /// FONT: glyphs at a scaled size have a different advance and can never
+    /// sit on the panel's cell grid — that was the misalignment.
+    private func artBox(cols: Int, rows: Int, room: CGFloat) -> (cols: Int, rows: Int)? {
+        guard cols > 0, rows > 0 else { return nil }
+        let naturalH = AlbumArtGrid.rowStep(charW: charW) * CGFloat(rows)
+        if naturalH <= room { return (cols, rows) }
+        let s = room / max(1, naturalH)
+        guard s >= 0.45 else { return nil }          // below this it's a smudge
+        return (max(8, Int((CGFloat(cols) * s).rounded(.down))),
+                max(4, Int((CGFloat(rows) * s).rounded(.down))))
     }
 
-    /// Rasterize the art grid once per (track, style, scale); the cached
-    /// image is then blitted into the per-frame panel raster.
-    private func albumArtRows(_ grid: AlbumArtGrid,
-                              style: String) -> [NSAttributedString] {
-        if let c = artRowsCache, c.key == artKey, c.style == style,
-           c.pt == font!.pointSize, c.cols == grid.cols {
+    /// Rasterize the art grid once per (track, font size); the cached rows
+    /// are then drawn into the per-frame panel raster.
+    private func albumArtRows(_ grid: AlbumArtGrid) -> [NSAttributedString] {
+        if let c = artRowsCache, c.key == artKey, c.pt == font!.pointSize,
+           c.cols == grid.cols {
             return c.rows
         }
         let rows = grid.attributedRows(baseFont: font!)
-        artRowsCache = (artKey, style, font!.pointSize, grid.cols, rows)
+        artRowsCache = (artKey, font!.pointSize, grid.cols, rows)
         return rows
     }
 
-    /// The grid that fits the height budget. Never scales the FONT: glyphs at
-    /// a scaled size have a different advance and can never sit on the
-    /// panel's cell grid — that was the misalignment. When the published grid
-    /// is too tall, the art is RE-RENDERED at fewer cells (the renderers are
-    /// native and in-process), so every glyph stays at the panel's own cell
-    /// size, on cell boundaries, at any budget.
+    /// The published grid when it fits the height budget; otherwise the art
+    /// RE-RENDERED at the box's size (the renderer is native and in-process),
+    /// so every glyph stays at the panel's own cell size, on cell boundaries.
     private func fittedArtGrid(room: CGFloat) -> AlbumArtGrid? {
-        guard let g = artGrids[artStyle], g.cols > 0, g.rows > 0 else { return nil }
-        let naturalH = artRowStep(g) * CGFloat(g.rows)
-        if naturalH <= room { return g }             // native size fits
-        let s = room / max(1, naturalH)
-        guard s >= 0.45 else { return nil }          // below this it's a smudge
-        let cols = max(8, Int((CGFloat(g.cols) * s).rounded(.down)))
-        let rows = max(4, Int((CGFloat(g.rows) * s).rounded(.down)))
-        let tuningTS = AlbumArtTuning.url.flatMap {
-            (try? FileManager.default.attributesOfItem(atPath: $0.path))?[
-                .modificationDate] as? Date
-        }
-        if let c = artFitCache, c.key == artKey, c.style == artStyle,
-           c.cols == cols, c.rows == rows, c.tuning == tuningTS,
-           c.published == artMTime {
+        guard let g = artGrid,
+              let box = artBox(cols: g.cols, rows: g.rows, room: room) else { return nil }
+        if box.cols == g.cols, box.rows == g.rows { return g }   // native size fits
+        if let c = artFitCache, c.key == artKey, c.cols == box.cols, c.rows == box.rows,
+           c.tuning == artTuningMTime, c.published == artMTime {
             return c.grid
         }
         // Re-render from what the PUBLISHED grid was rendered from: the
@@ -1669,7 +1705,7 @@ public final class CodeSaverView: ScreenSaverView {
         // the grid, so a fit-down in the tuning window tracks the sliders
         // and the picked cover, not the last-saved tuning and whatever track
         // is playing. The daemon's grids carry neither, and fall back to the
-        // saved tuning over the current track's art as before.
+        // saved tuning over the current track's art.
         var grid: AlbumArtGrid?
         let fm = FileManager.default
         let srcURL = g.sourcePath.flatMap { fm.isReadableFile(atPath: $0) ? URL(fileURLWithPath: $0) : nil }
@@ -1677,15 +1713,440 @@ public final class CodeSaverView: ScreenSaverView {
         if let srcURL,
            let isrc = CGImageSourceCreateWithURL(srcURL as CFURL, nil),
            let img = CGImageSourceCreateImageAtIndex(isrc, 0, nil) {
-            let tuning = g.tuning ?? AlbumArtTuning.load()
-            var p = AlbumArtRamp.Params(json: tuning["ramp"] ?? [:])
-            p.cols = Double(cols)
-            p.rows = Double(rows)
-            grid = AlbumArtRamp.render(img, params: p)
-                .flatMap { AlbumArtGrid(json: $0) }
+            var p = g.tuning.map { AlbumArtRamp.Params(json: $0["ramp"] ?? [:]) } ?? artParams
+            p.cols = Double(box.cols)
+            p.rows = Double(box.rows)
+            grid = AlbumArtRamp.render(img, params: p).flatMap { AlbumArtGrid(json: $0) }
         }
-        artFitCache = (artKey, artStyle, cols, rows, tuningTS, artMTime, grid)
+        artFitCache = (artKey, box.cols, box.rows, artTuningMTime, artMTime, grid)
         return grid
+    }
+
+    // MARK: Art box compositing — the phosphor field, the write position, the paused box
+
+    /// Per-cell jitter in 0..1, stable across frames: the lattice the field
+    /// is sampled from, and each cell's own rounding offset for tone.
+    private func artHash(_ i: Int, _ j: Int) -> Double {
+        var x = UInt32(truncatingIfNeeded: i &* 1619 &+ j &* 31337)
+        x ^= x >> 16; x &*= 0x7feb352d; x ^= x >> 15; x &*= 0x846ca68b; x ^= x >> 16
+        return Double(x & 0xffff) / 65535
+    }
+
+    /// Smoothed value noise over that lattice — four hashes and a cubic
+    /// fade, no trig.
+    private func artNoise(_ x: Double, _ y: Double) -> Double {
+        let x0 = floor(x), y0 = floor(y)
+        let fx = x - x0, fy = y - y0
+        let sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy)
+        let i0 = Int(x0), j0 = Int(y0)
+        let a = artHash(i0, j0), b = artHash(i0 + 1, j0)
+        let c = artHash(i0, j0 + 1), d = artHash(i0 + 1, j0 + 1)
+        let top = a + (b - a) * sx, bot = c + (d - c) * sx
+        return top + (bot - top) * sy
+    }
+
+    /// Measured ink per ramp glyph (ramp.py --measure), for colour
+    /// compensation: a sparse glyph is handed a brighter colour so the two
+    /// multiply back onto one tonal curve, exactly as the art does it.
+    private static let artInk: [Character: Double] =
+        Dictionary(uniqueKeysWithValues: AlbumArtRamp.ramp.map { ($0.glyph, $0.ink) })
+
+    /// The tone ramp for everything the box draws itself: the art ramp's
+    /// SYMBOLS only, in measured-ink order. A row of one letter — XXXXXXXX —
+    /// reads as type; a row of these reads as tone.
+    private static let artToneRamp: [Character] = [" ", "\u{00B7}", "-", ":", "!", "/", "+", "=", "*", "%", "#"]
+
+    /// Tone → glyph, dithered: each cell rounds with its own stable offset,
+    /// so a flat region is texture rather than a repeated character, and a
+    /// moving gradient changes glyph a few cells at a time instead of a
+    /// whole row at once.
+    private func artToneGlyph(_ tone: Double, _ i: Int, _ j: Int) -> Character {
+        let steps = Double(Self.artToneRamp.count)
+        let idx = Int(min(steps - 1, max(0, floor(tone * steps + artHash(i, j) - 0.5))))
+        return Self.artToneRamp[idx]
+    }
+
+    /// The box's three lights: the blue-grey the field sits in, the panel's
+    /// own accent for the sweep's body, near-white for its crest.
+    private static let artFieldC: SIMD3<Float> = [0.44, 0.52, 0.64]
+    private static let artBeamC: SIMD3<Float> = [0.66, 0.90, 1.0]
+    private static let artGlowC: SIMD3<Float> = [0.93, 0.98, 1.0]
+
+    /// The phosphor's clock. LOADING: the write position crosses the box
+    /// once every `artRoll` seconds, forever. REVEAL: the same beam, one
+    /// faster lap (`artPaint`) that leaves the cover behind it, then
+    /// `artSettle` for the rows it wrote last to cool off.
+    private static let artRoll = 2.0            // one full roll; shipped at 3.5, then 20% and 30% faster on Michel's asks
+    /// Loading breathes: the light the write position lays down swings
+    /// between these levels on a slow sine. Each row then decays from the
+    /// level it was WRITTEN at — the tail is the front's history scrolled
+    /// down — so nothing pulses as a whole. Slow, because the breath's
+    /// wavelength down the box is (breath / roll) box heights: at 4.3 s over
+    /// a 2 s roll well under half a cycle is ever in view, a tilt rather
+    /// than a band. Not a multiple of the roll, so no lap repeats exactly.
+    private static let artBreathLo: Float = 0.60
+    private static let artBreathHi: Float = 0.90
+    private static let artBreath = 4.3
+    private static let artPaint = 1.0
+    private static let artSettle = 0.30
+
+    /// The beam's spot, in rows: how far AHEAD of the write position the
+    /// phosphor is already lit. It is what turns the wrap from a cut into a
+    /// seam — and it makes the whole thing continuous in time as well as in
+    /// space, because a row rises to full over the last couple of rows
+    /// instead of flashing on when the beam arrives.
+    private static let artSpot = 1.0
+
+    /// The field's tone floor and ceiling. The floor is high enough that
+    /// every cell keeps a glyph — a blank cell in a dense field reads as a
+    /// hole. The ceiling stops SHORT of the ramp's top on purpose: at 1.0
+    /// every cell of the freshest rows clamps to '#' and they stack into a
+    /// slab; held here they dither across * % #, which reads as a surface
+    /// with light on it.
+    private static let artToneLo = 0.15
+    private static let artToneHi = 0.90
+    private static let artToneFloor = 0.14           // after grain: still at least ·
+
+    /// What the field lies at when there is no beam: the rest a coverless
+    /// track settles into, and the field under the paused box.
+    private static let artRestHot = 0.13
+
+    /// Measured ink for the tone ramp's own glyphs, in ramp order, so a
+    /// row's ink compensation can be interpolated ALONG the ramp instead of
+    /// stepping as the gradient rolls past a glyph boundary.
+    private static let artToneInk: [Double] =
+        CodeSaverView.artToneRamp.map { CodeSaverView.artInk[$0] ?? 0 }
+
+    /// Ink compensation from a measured coverage: a sparse glyph is handed
+    /// a brighter colour so glyph and colour multiply back onto one tonal
+    /// curve, exactly as the art's own compositing does it.
+    @inline(__always) private func artInkComp(_ ink: Double) -> Float {
+        Float(pow(AlbumArtRamp.aRef / max(ink, 1), 0.30))
+    }
+
+    /// Phosphor age → light, 0…1. Age is measured in LAPS of the box: 0
+    /// where the beam has just written, 1 for the row it is about to reach,
+    /// so the decay is spread over the whole box height — the box is the
+    /// beam. Behind the write position the light falls off continuously;
+    /// ahead of it the beam's own spot lifts the last rows back to full, so
+    /// the only place the gradient turns sharply is the write position
+    /// itself, and even there nothing jumps.
+    ///
+    /// A row the beam will never come back to — the reveal's wake — takes
+    /// `wrapped: false`: no spot (the beam is a whole lap away, not about to
+    /// arrive) and a gentler fall, so the cover it just printed stays
+    /// overexposed for a while and settles evenly instead of dropping into
+    /// its own blacks two rows behind the write position.
+    private func artPhosphor(_ age: Double, rows: Int, wrapped: Bool = true) -> Double {
+        let a = min(1, max(0, age))
+        guard wrapped else { return pow(1 - a, 0.85) }
+        // Two terms, because one will not do it. The exponential is the
+        // phosphor's own fall — steep for the first rows after the beam, so
+        // the crest stays a crest instead of stacking five bright rows —
+        // and the linear tail carries the rest of the ramp all the way down
+        // to · at the far side of the box.
+        let decay = 0.55 * exp(-3.8 * a) + 0.45 * pow(1 - a, 1.35)   // "slightly more aggressive" than 3.0 / 1.1
+        let ahead = (1 - a) * Double(rows) / Self.artSpot
+        let spot = exp(-ahead * ahead)
+        return decay + (1 - decay) * spot
+    }
+
+    /// A whole ROW's ink compensation, interpolated along the ramp from the
+    /// row's own tone. Per cell this would hand every glyph its own colour
+    /// and break the row into runs — and the eye reads those seams as
+    /// tearing; per row it still keeps the dim end of the gradient from
+    /// going thin, and the row stays one colour.
+    private func artRowComp(_ tone: Double) -> Float {
+        let n = Self.artToneRamp.count
+        let p = min(Double(n - 1), max(1, tone * Double(n) - 0.5))
+        let i0 = Int(p), i1 = min(n - 1, Int(p) + 1)
+        let ink = Self.artToneInk[i0] + (Self.artToneInk[i1] - Self.artToneInk[i0]) * (p - Double(i0))
+        return artInkComp(ink)
+    }
+
+    /// Everything a row's age decides, worked out once per row: the tone its
+    /// glyphs are picked from, the one colour every cell in it is drawn in,
+    /// and the halo under them.
+    private struct ArtRowLight { var tone: Double; var color: SIMD3<Float>; var glow: Float }
+
+    private func artRowLight(_ hot: Double, dim: Float) -> ArtRowLight {
+        let tone = Self.artToneLo + (Self.artToneHi - Self.artToneLo) * hot
+        let h = Float(hot)
+        var c = mix3(Self.artFieldC, Self.artBeamC, min(1, h * 1.40))
+        c = mix3(c, Self.artGlowC, max(0, min(1, (h - 0.75) / 0.25)))
+        let v = min(1, (0.30 + 0.70 * h) * artRowComp(tone))
+        // `dim` is the state's level — loading is held well under the reveal
+        // so it never demands attention — and the halo follows it.
+        return ArtRowLight(tone: tone, color: c * v * dim,
+                           glow: max(0, min(1, (h - 0.78) / 0.22)) * 0.85 * dim)
+    }
+
+    /// The grain the field is written with: each cell's own stable offset,
+    /// plus a slow swell over the lattice so the surface breathes. Together
+    /// they are worth about one ramp step. Grain moves the GLYPH only —
+    /// never the colour, never the halo — so the row is still one run and
+    /// there is nothing for the eye to tear along.
+    private func artGrain(_ i: Int, _ j: Int, t: Double) -> Double {
+        (artHash(i &+ 7, j &+ 131) - 0.5) * 0.085
+            + (artNoise(Double(i) * 0.30 + t * 0.13, Double(j) * 0.55 - t * 0.09) - 0.5) * 0.115
+    }
+
+    private struct ArtRunKey: Equatable { var r, g, b: UInt8; var glow: UInt8 }
+
+    /// Attributed rows from a per-cell (glyph, colour, glow) painter.
+    /// Neighbours sharing colour and glow merge into one run, so a flat
+    /// region costs one attributed run rather than one per cell. Glow is
+    /// phosphor bloom: a shadow of the run's own colour, blurred wider and
+    /// laid heavier the brighter the cell — the same trick the hero glyph
+    /// uses — in sixteen steps. (Eight was enough while glow varied per
+    /// cell and steps bought run merges; here glow is a whole row's, so the
+    /// only thing the steps cost is a visible tick in the halo as the
+    /// gradient rolls through one.)
+    private func artComposeRows(cols: Int, rows: Int, base: NSFont,
+                                _ cell: (Int, Int) -> (Character, SIMD3<Float>, Float))
+        -> [NSAttributedString] {
+        func q8(_ v: Float) -> UInt8 { UInt8(max(0, min(255, (v * 255).rounded()))) }
+        var out: [NSAttributedString] = []
+        out.reserveCapacity(rows)
+        for j in 0..<rows {
+            let row = NSMutableAttributedString()
+            var run = ""
+            var key: ArtRunKey?
+            func flush() {
+                guard let k = key, !run.isEmpty else { return }
+                let color = NSColor(deviceRed: CGFloat(k.r) / 255, green: CGFloat(k.g) / 255,
+                                    blue: CGFloat(k.b) / 255, alpha: 1)
+                var attrs: [NSAttributedString.Key: Any] = [.font: base, .foregroundColor: color]
+                if k.glow > 0 {
+                    // The typing cursor's halo, exactly: a near-white shadow
+                    // blur at 0.6 × the font size, its intensity the cell's
+                    // glow, drawn once under a crisp glyph. Wider, tinted,
+                    // or doubled it stops being a halo and becomes a smear.
+                    let g = CGFloat(k.glow) / 16
+                    let sh = NSShadow()
+                    sh.shadowColor = NSColor(deviceRed: CGFloat(Self.artGlowC.x),
+                                             green: CGFloat(Self.artGlowC.y),
+                                             blue: CGFloat(Self.artGlowC.z), alpha: 0.9 * g)
+                    sh.shadowBlurRadius = base.pointSize * 0.6
+                    sh.shadowOffset = .zero
+                    attrs[.shadow] = sh
+                }
+                row.append(NSAttributedString(string: run, attributes: attrs))
+                run = ""
+            }
+            for i in 0..<cols {
+                let (ch, c, glow) = cell(i, j)
+                let k = ArtRunKey(r: q8(c.x), g: q8(c.y), b: q8(c.z),
+                                  glow: UInt8(max(0, min(16, (glow * 16).rounded()))))
+                if k != key { flush(); key = k }
+                run.append(ch)
+            }
+            flush()
+            out.append(row)
+        }
+        return out
+    }
+
+    private static func artRGB(_ hex: String) -> SIMD3<Float> {
+        var h = Substring(hex)
+        if h.hasPrefix("#") { h = h.dropFirst() }
+        guard h.count == 6, let v = UInt32(h, radix: 16) else { return .zero }
+        return SIMD3<Float>(Float((v >> 16) & 0xFF), Float((v >> 8) & 0xFF), Float(v & 0xFF)) / 255
+    }
+
+    /// What the art box shows this frame. The plain cover is the cached
+    /// layout straight through; everything else — the phosphor field rolling
+    /// while the cover is on its way (12 s, or until the daemon says the
+    /// track has none), the same beam printing the cover as it lands, the
+    /// paused box over either — is composited per cell, animated states at a
+    /// quantised clock.
+    ///
+    /// The whole box is the beam. There is no band and no background: the
+    /// brightness of every row is the age of its phosphor, measured from the
+    /// last time the write position passed it, decaying over one full box
+    /// height. The gradient rolls down, and the only place it turns is the
+    /// write position itself.
+    private func artBoxRows(box: (cols: Int, rows: Int), grid: AlbumArtGrid?, key: String,
+                            paused: Bool, base: NSFont) -> [NSAttributedString] {
+        let cols = box.cols, rows = box.rows
+        let paint = Self.artPaint, settle = Self.artSettle   // the write lap, then its cooling
+        let revealing = grid != nil && (artShownSince.map { now - $0 } ?? 0) < paint + settle
+        let loading = grid == nil && artKey != key && now - npTrackSince < 12
+        if let grid, !revealing, !paused { return albumArtRows(grid) }
+
+        let live = loading || revealing
+        // One quantised clock for everything that moves, and it goes in the
+        // cache key: a frame inside a tick is a hit, and a state that isn't
+        // animated (tick 0, t 0) is built exactly once and then held. Paused
+        // is static — the cover held under its box — unless the cover is
+        // still on its way, when the field keeps shimmering beneath it.
+        let fps: Double = live ? 30 : 0
+        // The epsilon: a clock that advances in exact 1/30 s steps (the
+        // snapshot harness) lands a hair under a tick boundary every few
+        // frames, which repeats one build and then skips one — a stutter
+        // that read as tearing in the clips. Real frame times are never on
+        // the grid, but the nudge costs nothing there either.
+        let tick = fps > 0 ? Int(now * fps + 1e-6) : 0
+        let atQ = fps > 0 ? Double(tick) / fps : now
+        let t = fps > 0 ? atQ - npTrackSince : 0            // the panel's own clock
+        let el = artShownSince.map { atQ - $0 } ?? 0        // since the cover landed
+        let fxKey = "\(key)|\(cols)x\(rows)|\(grid != nil)|\(loading)|\(revealing)|\(paused)|\(tick)"
+        if let c = artFXCache, c.key == fxKey { return c.rows }
+
+        // The cover's cells, parsed once per build.
+        var art: [[(Character, SIMD3<Float>)]] = []
+        if let grid {
+            art = grid.chars.enumerated().map { j, line in
+                let cs = j < grid.colors.count ? grid.colors[j] : []
+                return Array(line).enumerated().map { i, ch in
+                    (ch, i < cs.count ? Self.artRGB(cs[i]) : .zero)
+                }
+            }
+        }
+
+        // Where the write position is, in rows, on a continuous scale.
+        // Loading: one lap every artRoll seconds, forever. Reveal: the same
+        // beam, picked up wherever the loading lap had it (`start`) and run
+        // one faster lap that leaves the cover behind it — nothing jumps
+        // when the cover lands. Paused, there is no beam: the field lies
+        // still under the box.
+        var head: Double?
+        var start: Double?
+        if paused {
+            head = nil
+        } else if revealing {
+            let s = Double(rows) * ((t - el) / Self.artRoll)
+            start = s
+            head = s + Double(rows) * (el / paint)
+        } else if loading {
+            head = Double(rows) * (t / Self.artRoll)
+        }
+        // What is left of the reveal's overexposure. Most of it is gone
+        // already — a row cools as it ages, and the lap takes a full box
+        // height — this walks the last-written rows the rest of the way
+        // into the plain cover.
+        let fade = Float(max(0, min(1, 1 - (el - paint) / settle)))
+
+        // Per ROW: how long ago the beam wrote it, and the light that
+        // follows. The whole box is one gradient — no band, no background —
+        // and the only place it turns is the write position. Colour and
+        // halo come from here and from nowhere else, so a row is one run.
+        var rowAge = [Double](repeating: 0, count: rows)
+        var rowPainted = [Bool](repeating: false, count: rows)
+        var rowOver = [Float](repeating: 0, count: rows)
+        var rowLight: [ArtRowLight] = []
+        rowLight.reserveCapacity(rows)
+        for j in 0..<rows {
+            var hot = Self.artRestHot
+            if let head {
+                let y = Double(j) + 0.5
+                var age: Double
+                if let start {
+                    // The reveal's lap: the first crossing at or after the
+                    // beam was handed over, so every row is written exactly
+                    // once and none is written twice.
+                    let cross = y + Double(rows) * ceil((start - y) / Double(rows))
+                    let u = head - cross
+                    if u >= 0 { age = u / Double(rows); rowPainted[j] = true }
+                    else       { age = 1 + u / Double(rows) }
+                } else {
+                    age = (head - y) / Double(rows)
+                    age -= floor(age)
+                }
+                rowAge[j] = age
+                hot = artPhosphor(age, rows: rows, wrapped: !rowPainted[j])
+            }
+            rowOver[j] = Float(hot) * fade
+            // Levels: the reveal at full — the cover arriving is the event —
+            // loading breathing between 60% and 90% at the write position
+            // (each row keeps the level it was written at), and a coverless
+            // rest quieter still.
+            let level: Float
+            if revealing {
+                level = 1
+            } else if loading {
+                let written = t - rowAge[j] * Self.artRoll
+                let breath = Float(0.5 + 0.5 * sin(2 * .pi * written / Self.artBreath))
+                level = Self.artBreathLo + (Self.artBreathHi - Self.artBreathLo) * breath
+            } else {
+                level = 0.58
+            }
+            rowLight.append(artRowLight(hot, dim: level))
+        }
+
+        // Paused, the way a terminal would say it: the cover steps back —
+        // part-desaturated, dimmed — and a small rounded box sits over its
+        // centre, cut out of the picture, with the word at full brightness:
+        //   ╭──────────╮
+        //   │ ■ PAUSED │      (the panel's own corners, at the label grey; a
+        //   ╰──────────╯       dim ■ — SF Mono's, centred on the caps' midline
+        //                      — then the bright word)
+        // Character cells only: nothing is drawn but glyphs, nothing blinks.
+        let word = Array(cols >= 16 ? " \u{25A0} PAUSED " : " PAUSED ")
+        let boxW = word.count + 2
+        let rule = [Character](repeating: "\u{2500}", count: boxW - 2)
+        let boxRows: [[Character]] = [["\u{256D}"] + rule + ["\u{256E}"],
+                                      ["\u{2502}"] + word + ["\u{2502}"],
+                                      ["\u{2570}"] + rule + ["\u{256F}"]]
+        let boxC0 = (cols - boxW) / 2
+        let boxR0 = rows / 2 - 1
+        let frame: SIMD3<Float> = [0.31, 0.34, 0.38]                 // the panel's label grey
+        let mark: SIMD3<Float> = [0.42, 0.46, 0.52]
+
+        let sweeping = head != nil
+        let out = artComposeRows(cols: cols, rows: rows, base: base) { i, j in
+            var ch: Character = " "
+            var c = SIMD3<Float>.zero
+            var glow: Float = 0
+            let lit = rowLight[j]
+            let hasArt = j < art.count && i < art[j].count
+            if hasArt, !revealing || !sweeping {
+                (ch, c) = art[j][i]
+            } else if hasArt, rowPainted[j] {
+                // Behind the write position the cover is there — the same
+                // gradient, now printing a picture: overexposed where the
+                // beam has just been, settling as the row ages. Where the
+                // cover is black the field dissolves out of it rather than
+                // snapping off.
+                let o = rowOver[j]
+                let (ac, acolor) = art[j][i]
+                if ac == " " {
+                    ch = artToneGlyph((lit.tone + artGrain(i, j, t: t)) * Double(o), i, j)
+                    c = lit.color
+                    glow = lit.glow * o
+                } else {
+                    ch = ac
+                    c = mix3(acolor, Self.artGlowC, 0.88 * o)
+                    glow = 0.85 * o
+                }
+            } else {
+                // The field: the row's tone, grained, rounded on this cell's
+                // own dither. Every cell carries a glyph, so it reads as a
+                // lit surface and not as a scatter.
+                ch = artToneGlyph(max(Self.artToneFloor, lit.tone + artGrain(i, j, t: t)), i, j)
+                c = lit.color
+                glow = lit.glow
+            }
+            if paused {
+                // The cover steps back: half its saturation, six tenths of
+                // its light. Still a picture, plainly not the live one.
+                let y = 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z
+                c = mix3(c, [y, y, y], 0.55) * 0.6
+                glow = 0
+                if j >= boxR0, j < boxR0 + 3, i >= boxC0, i < boxC0 + boxW {
+                    ch = boxRows[j - boxR0][i - boxC0]
+                    switch ch {
+                    case "\u{25A0}":              c = mark                             // the dim square
+                    case " ":                      c = .zero
+                    case "P", "A", "U", "S", "E", "D": c = Self.artGlowC                 // full brightness
+                    default:                       c = frame                            // the box itself
+                    }
+                }
+            }
+            return (ch, c, glow)
+        }
+        artFXCache = (fxKey, out)
+        return out
     }
 
     /// Terminal-style marquee: hold, walk one glyph at a time, hold at the
@@ -1848,8 +2309,7 @@ public final class CodeSaverView: ScreenSaverView {
                     // the art off the grid.
                     let totalCells = Int((width / charW).rounded())
                     let lead = CGFloat(max(1, (totalCells - art.cols) / 2))
-                    AlbumArtGrid.draw(rows: art.rows,
-                                      at: NSPoint(x: pad + lead * charW, y: y),
+                    AlbumArtGrid.draw(rows: art.rows, at: NSPoint(x: pad + lead * charW, y: y),
                                       step: art.step)
                 }
             }
@@ -2081,17 +2541,36 @@ public final class CodeSaverView: ScreenSaverView {
             [.font: base, .foregroundColor: c]
         }
 
+        let paused = widgetFeed.npState == "paused"
         let title0 = widgetFeed.npTitle, artist0 = widgetFeed.npArtist
-        // Without art the panel still needs some width; WITH art, the art
-        // alone decides it. Track metadata never widens the panel — a long
-        // feature credit used to stretch it halfway across the screen.
+        // Without art the panel still needs some width; WITH art, the art box
+        // alone decides it — and the box is there from a track's first frame,
+        // sized from the saved tuning, so the width never jumps when the
+        // cover lands. Track metadata never widens the panel — a long feature
+        // credit used to stretch it halfway across the screen.
         var inner = min(60, max(40, max(title0.count, artist0.count) + 6))
-        var art: AlbumArtGrid?
-        if artStyle != "none",
-           artKey == "\(app)|\(widgetFeed.npTitle)|\(widgetFeed.npArtist)" {
+        // The track the panel is on. A change restarts the placeholder's
+        // clock and forgets the reveal, so the next cover lands with its own.
+        let key = "\(app)|\(title0)|\(artist0)"
+        if key != npTrackKey {
+            npTrackKey = key
+            npTrackSince = now
+            artShownSince = nil
+            artFXCache = nil
+        }
+        var box: (cols: Int, rows: Int)?
+        var grid: AlbumArtGrid?
+        if artOn {
             let room = bounds.height - npMargin - chromeH - ceiling
-            art = fittedArtGrid(room: room)
-            if let g = art { inner = max(24, g.cols + 3) }
+            if artKey == key, let g = fittedArtGrid(room: room) {
+                grid = g
+                box = (g.cols, g.rows)
+                if artShownSince == nil { artShownSince = now }
+            } else {
+                box = artBox(cols: artParams.colCount, rows: artParams.rowCount, room: room)
+                artShownSince = nil
+            }
+            if let box { inner = max(24, box.cols + 3) }
         }
         // Title clips, artist scrolls — both bounded by the art-derived width
         // instead of being allowed to set it.
@@ -2103,10 +2582,20 @@ public final class CodeSaverView: ScreenSaverView {
         func timeMS(_ v: Double) -> String {
             let s = max(0, Int(v)); return "\(s / 60):" + String(format: "%02d", s % 60)
         }
-        let pos = min(widgetFeed.npDur, widgetFeed.npPos + (wall - widgetFeed.npTS))
+        // Paused: the clock stops where the player stopped it.
+        let pos = min(widgetFeed.npDur,
+                      paused ? widgetFeed.npPos : widgetFeed.npPos + (wall - widgetFeed.npTS))
         let posS = timeMS(pos), durS = timeMS(widgetFeed.npDur)
 
-        let head = "\u{266A} now playing"
+        // ♪ now playing — or ♪ paused 12m, the hold counting up so it reads
+        // as a held state rather than a live one.
+        var head = "\u{266A} now playing"
+        if paused {
+            head = "\u{266A} paused"
+            if let ps = widgetFeed.npPausedSince, wall - ps >= 60 {
+                head += " " + spanString(wall - ps)
+            }
+        }
         let topFill = max(0, inner - head.count - 4)
         let top = WidgetRow(runs: [
             ("\u{256D}\u{2500} ", run(railC)), (head, run(labelC)),
@@ -2131,7 +2620,7 @@ public final class CodeSaverView: ScreenSaverView {
         progRuns.append(("\u{2502} ", run(railC)))
         progRuns.append((posS + " ", run(NSColor(white: 0.40, alpha: 1))))
         progRuns.append((String(repeating: "\u{2500}", count: mark), run(NSColor(white: 0.30, alpha: 1))))
-        progRuns.append(("\u{25CF}", run(cursorColor)))
+        progRuns.append(("\u{25CF}", run(paused ? NSColor(white: 0.45, alpha: 1) : cursorColor)))
         progRuns.append((String(repeating: "\u{2500}", count: barW - mark - 1), run(NSColor(white: 0.22, alpha: 1))))
         progRuns.append((" " + durS, run(NSColor(white: 0.40, alpha: 1))))
         progRuns.append((" \u{2502}", run(railC)))
@@ -2147,14 +2636,16 @@ public final class CodeSaverView: ScreenSaverView {
         var rows = [top]
         var artPayload: (rows: [NSAttributedString], step: CGFloat,
                          cols: Int, afterRow: Int)?
-        if let g = art {
-            // Blank rows (│ + spaces + │) reserve the art's height AND supply
-            // its side rails; the art is drawn over them at NATIVE cell size.
-            let stepA = artRowStep(g)
-            let h = stepA * CGFloat(g.rows) + 4
+        if let box {
+            // Blank rows (│ + spaces + │) reserve the box's height AND supply
+            // its side rails; whatever the box shows is drawn over them at
+            // NATIVE cell size.
+            let stepA = AlbumArtGrid.rowStep(charW: charW)
+            let h = stepA * CGFloat(box.rows) + 4
             let n = max(1, Int((h / lineH).rounded(.up)))
             for _ in 0..<n { rows.append(padRow("", titleC)) }
-            artPayload = (albumArtRows(g, style: artStyle), stepA, g.cols, 0)
+            artPayload = (artBoxRows(box: box, grid: grid, key: key, paused: paused,
+                                     base: base), stepA, box.cols, 0)
         }
         rows += [titleRow, artistRow, progRow, bottom]
         let width = CGFloat(inner + 2) * charW * 1.0

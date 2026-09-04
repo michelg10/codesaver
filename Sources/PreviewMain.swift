@@ -49,11 +49,16 @@ struct PreviewMain {
             view.clockTopFrac = CGFloat(v)
         }
         let step = 1.0 / 30.0
-        var sim = 0.0
+        var steps = 0
         for target in times.sorted() {
-            while sim < target {
+            // Count steps rather than accumulating a running sum: the sum
+            // drifts by an ulp every few frames and lands a hair under or
+            // over a target requested on the same 1/30 grid, which renders
+            // one instant twice and then skips one — a stutter baked into
+            // every clip cut from these frames.
+            while Double(steps) * step < target - 1e-9 {
                 view.advance(by: step)
-                sim += step
+                steps += 1
             }
             // Metal is THE renderer: the snapshot is an offscreen GPU frame.
             guard let cg = view.metalDebugSnapshot() else {
