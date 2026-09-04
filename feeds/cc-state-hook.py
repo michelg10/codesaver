@@ -11,7 +11,7 @@ Contract: NEVER write to stdout (UserPromptSubmit/SessionStart stdout is
 injected into Claude's context), never exit non-zero, stay fast. Subagent
 events (payload has agent_id) are ignored -- one state per session.
 """
-import fcntl, json, os, sys, time
+import fcntl, json, os, sys, time, unicodedata
 
 DIR = os.path.expanduser("~/.claude/codesaver/sessions")
 
@@ -28,8 +28,13 @@ def locked(sid):
 
 
 def load(sid):
+    # encoding= is explicit on every open here: the hook inherits whatever
+    # environment Claude Code was launched from, and under LANG=C a bare
+    # open() would pick a non-UTF-8 codec, blow up on a CJK cwd, and be
+    # swallowed by the catch-all below -- the session would simply stop
+    # updating, with nothing to show for it.
     try:
-        with open(os.path.join(DIR, sid + ".json")) as f:
+        with open(os.path.join(DIR, sid + ".json"), encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
@@ -38,14 +43,24 @@ def load(sid):
 def store(sid, st):
     os.makedirs(DIR, exist_ok=True)
     tmp = os.path.join(DIR, f".{sid}.{os.getpid()}.tmp")
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(st, f)
     os.replace(tmp, os.path.join(DIR, sid + ".json"))
 
 
+def nfc(v):
+    """Compose a path before it goes on the wire. A directory named in
+    Hangul or kana arrives decomposed from an HFS+ volume (한 as three
+    jamo), and the saver's panel measures its width one Character at a
+    time -- a decomposed syllable counts as several."""
+    return unicodedata.normalize("NFC", v) if isinstance(v, str) else v
+
+
 def main():
     try:
-        data = json.load(sys.stdin)
+        # Read bytes and decode UTF-8 ourselves rather than trusting
+        # sys.stdin's locale-derived codec, for the same reason as above.
+        data = json.loads(sys.stdin.buffer.read().decode("utf-8"))
     except Exception:
         return
     now = time.time()
@@ -57,8 +72,8 @@ def main():
         lk = locked(sid)
         st = load(sid)
         st["session_id"] = sid
-        st["cwd"] = data.get("cwd") or (data.get("workspace") or {}).get(
-            "current_dir") or st.get("cwd")
+        st["cwd"] = nfc(data.get("cwd") or (data.get("workspace") or {}).get(
+            "current_dir") or st.get("cwd"))
         st["model"] = (data.get("model") or {}).get("display_name") or st.get("model")
         cw = data.get("context_window") or {}
         out = cw.get("total_output_tokens")
@@ -97,7 +112,7 @@ def main():
     st = load(sid)
     st["session_id"] = sid
     if data.get("cwd"):
-        st["cwd"] = data["cwd"]
+        st["cwd"] = nfc(data["cwd"])
     st["hook_ts"] = now
     pid = os.environ.get("CLAUDE_PID") or ""
     if pid.isdigit():               # the CLI's pid: the daemon checks liveness

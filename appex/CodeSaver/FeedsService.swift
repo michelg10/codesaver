@@ -526,7 +526,11 @@ enum FeedsService {
 
             var entry: [String: Any] = ["id": sid, "state": state,
                                         "state_since": since]
-            entry["cwd"] = h.cwd ?? s?.cwd ?? "?"
+            // Composed: a project directory named in Hangul or kana reaches
+            // the hook decomposed whenever it came off an HFS+ volume or a
+            // path the shell normalised, and the panel measures its cells per
+            // Character — a decomposed syllable is several of those.
+            entry["cwd"] = (h.cwd ?? s?.cwd ?? "?").precomposedStringWithCanonicalMapping
             if let tool, state == "toolcall" || state == "waiting_tool"
                         || state == "permission" { entry["tool"] = tool }
             if let ts = h.turn_started { entry["turn_started"] = ts }
@@ -646,10 +650,18 @@ enum FeedsService {
                 end tell
             end timeout
             """
-            guard let data = runProcess("/usr/bin/osascript", ["-e", src], deadline: 5),
-                  let text = String(data: data, encoding: .utf8)?
-                      .trimmingCharacters(in: .whitespacesAndNewlines),
-                  !text.isEmpty else { continue }
+            // osascript writes its result to stdout as UTF-8 regardless of
+            // locale (verified with LANG unset and LC_ALL=C, which is what
+            // this LaunchAgent actually runs under), so a CJK track name
+            // arrives intact. The lossy fallback is for the day some player
+            // hands AppleScript a string it can't encode: better a panel with
+            // one mangled character than no panel at all, which is what the
+            // bare `String(data:encoding:)` nil did.
+            guard let data = runProcess("/usr/bin/osascript", ["-e", src], deadline: 5) else { continue }
+            let text = (String(data: data, encoding: .utf8)
+                        ?? String(decoding: data, as: UTF8.self))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { continue }
             let parts = text.components(separatedBy: "\n")
             guard parts.count >= 5 else { continue }
             // AppleScript numbers can arrive comma-decimal under some locales.
@@ -660,7 +672,17 @@ enum FeedsService {
             // seconds. Music returns seconds for both. The feed carries
             // seconds — the saver clocks the progress bar against it.
             if p.name == "Spotify" { dur /= 1000 }
-            return NowPlaying(app: p.name, state: parts[0], title: parts[1], artist: parts[2],
+            // Compose HERE, once, at the only place track text enters the
+            // daemon. Music hands back whatever the file's tags hold, and tags
+            // written on macOS are routinely decomposed (한 as ᄒ+ᅡ+ᆫ, が as
+            // か+゛) — which the saver's cell grid then measures a jamo at a
+            // time. Normalising at the source also keeps the album-art key and
+            // the feed's title/artist derived from the SAME string: they are
+            // compared for equality across two processes, so they must never
+            // be normalised on only one side.
+            return NowPlaying(app: p.name, state: parts[0],
+                              title: parts[1].precomposedStringWithCanonicalMapping,
+                              artist: parts[2].precomposedStringWithCanonicalMapping,
                               position: num(parts[3]) ?? 0, duration: dur,
                               pausedSince: nil, polledAt: Date().timeIntervalSince1970)
         }

@@ -139,8 +139,21 @@ enum CorpusIngest {
             // all match) directly assigned — bare (API_KEY = …), or quoted /
             // subscripted the way dict, JSON and header literals spell it
             // ("api_key": …, 'password': …, config["token"] = …)
+            //
+            // The punctuation classes carry the FULLWIDTH forms too. CJK source
+            // is written with them — `api_key ："…"`, `密钥＝"…"`, 「token」 for
+            // quotes — and an ASCII-only [:=] walked straight past every one of
+            // those, leaving the literal on screen. Same reason the identifier
+            // list names the words a Chinese, Japanese or Korean codebase
+            // actually uses; `\w` is already Unicode-aware in ICU, so the tail
+            // matches 密钥_测试 as happily as api_key_test. A false positive
+            // still only blanks one line of screensaver background.
             ("(api[_-]?key|passw|passwd|pwd|secret|token|credential"
-             + "|private[_-]?key|access[_-]?key|signing[_-]?key|auth)[\\w-]*[\\s\"'\\]]*[:=]", [.caseInsensitive]),
+             + "|private[_-]?key|access[_-]?key|signing[_-]?key|auth"
+             + "|密码|密碼|密钥|密鑰|口令|令牌|秘密|凭证|憑證"
+             + "|パスワード|トークン|秘密鍵|認証"
+             + "|비밀번호|암호|토큰|인증)"
+             + "[\\w-]*[\\s\"'\\]”’」』）］]*[:=：＝]", [.caseInsensitive]),
             // value-shaped: known token prefixes, JWTs, creds-in-URL
             ("AKIA[0-9A-Z]{16}", []),
             ("\\bghp_[A-Za-z0-9]{20,}|\\bgithub_pat_[A-Za-z0-9_]{20,}", []),
@@ -154,8 +167,15 @@ enum CorpusIngest {
     }()
     static let pemRegex = try! NSRegularExpression(pattern: "-----BEGIN [A-Z ]*PRIVATE KEY-----")
 
+    /// Cc/Cf/illegal, MINUS the two zero-width joiners. `controlCharacters` is
+    /// Cc *and Cf*, and U+200D ZWJ is Cf: stripping it shattered every ZWJ
+    /// emoji sequence into its pieces (👨‍👩‍👧‍👦 became four glyphs, four cells
+    /// wide instead of two) and broke ZWNJ-dependent scripts. Everything else
+    /// Cf still goes — BOM, bidi overrides, the invisible separators a
+    /// screensaver must never render.
     private static let unprintable = CharacterSet.controlCharacters
         .union(.newlines).union(.illegalCharacters)
+        .subtracting(CharacterSet(charactersIn: "\u{200C}\u{200D}"))
 
     static func wanted(relPath: String, size: Int) -> Bool {
         let parts = relPath.split(separator: "/").map(String.init)
@@ -195,15 +215,27 @@ enum CorpusIngest {
         try fm.createDirectory(at: dest, withIntermediateDirectories: true)  // marker even for repos with no source files
 
         var kept = 0, written = 0
-        let keys: [URLResourceKey] = [.isRegularFileKey, .fileSizeKey]
-        let enumerator = fm.enumerator(at: extractDir, includingPropertiesForKeys: keys)
-        while let url = enumerator?.nextObject() as? URL {
-            guard let vals = try? url.resourceValues(forKeys: Set(keys)),
-                  vals.isRegularFile == true else { continue }
-            let size = vals.fileSize ?? 0
-            let rel = String(url.path.dropFirst(extractDir.path.count + 1))
+        // Walk by RELATIVE path. The old walk took the absolute URL the
+        // enumerator handed back and trimmed `extractDir.path.count + 1`
+        // Characters off the front — two counts that have to agree and don't:
+        // `enumerator(at:)` returns symlink-RESOLVED paths (/private/tmp/… for
+        // a /tmp base), and on an HFS+ volume it returns decomposed filenames
+        // while the URL we built holds composed ones, where 한 is three
+        // Characters on one side and one on the other. Either mismatch slices
+        // the relative path in the wrong place, and every file then fails
+        // `wanted` or lands at a bogus depth in the mirror.
+        // `enumerator(atPath:)` yields the relative path itself — nothing to
+        // measure. Its attributes come from lstat, so a symlink is not a
+        // regular file and is skipped, which is also what we want: copying one
+        // only ever put a dangling link in the mirror.
+        let enumerator = fm.enumerator(atPath: extractDir.path)
+        while let rel = enumerator?.nextObject() as? String {
+            guard let attrs = enumerator?.fileAttributes,
+                  attrs[.type] as? FileAttributeType == .typeRegular else { continue }
+            let size = (attrs[.size] as? NSNumber)?.intValue ?? 0
             guard wanted(relPath: rel, size: size) else { continue }
             if written + size > maxRepoBytes { break }
+            let url = extractDir.appendingPathComponent(rel)
             let target = dest.appendingPathComponent(rel)
             try? fm.createDirectory(at: target.deletingLastPathComponent(),
                                     withIntermediateDirectories: true)
@@ -242,6 +274,41 @@ enum CorpusIngest {
 
     // MARK: Line cleaning
 
+    /// Cells one character occupies in a terminal — 2 for East Asian Wide and
+    /// Fullwidth (UAX #11 W/F) and for emoji presentation, 1 otherwise. There
+    /// is no East-Asian-Width in `Unicode.Scalar.Properties`, and this file
+    /// runs with no font loaded, so it classifies by scalar range. The saver's
+    /// renderer measures the real glyph instead; the two agree on everything
+    /// that matters here (tab stops), and this side never needs to be exact —
+    /// only to stop counting 漢 as one column.
+    static func cells(_ ch: Character) -> Int {
+        guard let u = ch.unicodeScalars.first, u.value >= 0x1100 else { return 1 }
+        switch u.value {
+        case 0x1100...0x115F,            // Hangul Jamo initial
+             0x2E80...0x303E,            // CJK radicals, Kangxi, CJK symbols
+             0x3041...0x33FF,            // kana, Hangul compat jamo, CJK compat
+             0x3400...0x4DBF,            // CJK ext A
+             0x4E00...0x9FFF,            // CJK unified
+             0xA000...0xA4CF,            // Yi
+             0xAC00...0xD7A3,            // Hangul syllables
+             0xF900...0xFAFF,            // CJK compat ideographs
+             0xFE10...0xFE19,            // vertical forms
+             0xFE30...0xFE6F,            // CJK compat forms, small forms
+             0xFF00...0xFF60,            // fullwidth forms
+             0xFFE0...0xFFE6,            // fullwidth signs
+             0x1F300...0x1F64F,          // emoji
+             0x1F900...0x1F9FF,
+             0x20000...0x3FFFD:          // CJK ext B+
+            return 2
+        default:
+            return 1
+        }
+    }
+
+    /// Tab stops the way the author's editor set them: a wide character
+    /// advances the column by two. Counting every character as one column put
+    /// the stops in the wrong place for every CJK-bearing line, so indentation
+    /// that lined up in the repo arrived ragged.
     private static func expandTabs(_ s: some StringProtocol, width: Int = 4) -> String {
         guard s.contains("\t") else { return String(s) }
         var out = ""
@@ -253,7 +320,7 @@ enum CorpusIngest {
                 col += pad
             } else {
                 out.append(ch)
-                col += 1
+                col += cells(ch)
             }
         }
         return out
@@ -263,9 +330,40 @@ enum CorpusIngest {
         regex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) != nil
     }
 
+    /// A source file's text, or nil when nothing can read it confidently.
+    ///
+    /// `String(decoding:as: UTF8.self)` NEVER fails — it substitutes U+FFFD
+    /// for every byte it can't parse — so a Shift-JIS or GB18030 source (still
+    /// common in CJK repos) used to be packed into the corpus as a solid wall
+    /// of replacement characters and typed across the screen as ����. It also
+    /// sailed through every filter below, U+FFFD being a perfectly printable
+    /// character.
+    ///
+    /// So: decode strictly, and only then guess. The guess is Foundation's own
+    /// detector (what TextEdit's "guess encoding" runs) — the legacy CJK
+    /// codecs overlap far too much to pick between by trial decode, since
+    /// Shift-JIS happily accepts GB18030 bytes and returns fluent-looking
+    /// nonsense. A file that neither path can read is dropped rather than
+    /// shipped as mojibake.
+    static func decodeSource(_ data: Data) -> String? {
+        if let s = String(data: data, encoding: .utf8) { return s }
+        var converted: NSString?
+        var lossy = ObjCBool(false)
+        let enc = NSString.stringEncoding(for: data, encodingOptions: nil,
+                                          convertedString: &converted,
+                                          usedLossyConversion: &lossy)
+        guard enc != 0, !lossy.boolValue, let s = converted as String?,
+              !s.unicodeScalars.contains("\u{FFFD}") else { return nil }
+        return s
+    }
+
     /// nil = drop the whole file.
     static func cleanLines(_ raw: String) -> [String]? {
-        let normalized = raw.replacingOccurrences(of: "\r\n", with: "\n")
+        // NFC first. Music metadata, HFS+ paths and plenty of repos carry
+        // decomposed text (한 as ᄒ+ᅡ+ᆫ, が as か+゛); composed is the form the
+        // renderer measures cleanly and the one every other stage assumes.
+        let normalized = raw.precomposedStringWithCanonicalMapping
+            .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
         var lines: [String] = []
         var longCount = 0, secretHits = 0
@@ -284,6 +382,14 @@ enum CorpusIngest {
                 secretHits += 1
                 line = ""
             }
+            // CHARACTERS, deliberately — not bytes and not cells. Bytes would
+            // reject a CJK line at a third of the length of an ASCII one and
+            // cut it mid-sequence; cells would make the "too many long lines →
+            // minified" heuristic below fire on ordinary Chinese source and
+            // throw the file away. `prefix` on a String walks grapheme
+            // clusters, so the cut can never split a character or an emoji
+            // sequence. Over-long lines are the writer's problem, and it
+            // already clips to the screen by measured cell width.
             if line.count > maxLineLength {
                 longCount += 1
                 line = String(line.prefix(maxLineLength))
@@ -344,7 +450,7 @@ enum CorpusIngest {
                 let digest = Data(Insecure.SHA1.hash(data: data))
                 guard !seen.contains(digest) else { continue }
                 seen.insert(digest)
-                guard let lines = cleanLines(String(decoding: data, as: UTF8.self)) else { continue }
+                guard let text = decodeSource(data), let lines = cleanLines(text) else { continue }
                 let block = Data((lines.joined(separator: "\n") + "\n").utf8)
                 try out.write(contentsOf: block)
                 index[repo, default: []].append([offset, block.count])

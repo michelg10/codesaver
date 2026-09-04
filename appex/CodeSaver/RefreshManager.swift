@@ -31,7 +31,7 @@ final class RefreshManager: ObservableObject {
         owner = RefreshService.configuredOwner ?? ""
         adoptAgentStatus(RefreshAgent.status, FeedsAgent.status)
         customVerbCount = CorpusStore.verbsURL
-            .flatMap { try? String(contentsOf: $0, encoding: .utf8) }
+            .flatMap(Self.readVerbFile)
             .map(Self.verbCount)
             .flatMap { $0 > 0 ? $0 : nil }
     }
@@ -69,12 +69,25 @@ final class RefreshManager: ObservableObject {
 
     // MARK: Spinner verbs
 
+    /// Whitespace plus the invisibles a hand-edited list carries in: a BOM
+    /// that survived a re-encode, and the zero-width space some CJK input
+    /// methods emit. Neither is whitespace to Foundation, and both would ride
+    /// into the spinner as a phantom leading cell.
+    private static let verbTrim = CharacterSet.whitespacesAndNewlines
+        .union(CharacterSet(charactersIn: "\u{FEFF}\u{200B}"))
+
     /// The saver's format: "Gerund<TAB>Past" per line, tabs only — verbs are
     /// free to contain commas.
+    ///
+    /// Split on `isNewline`, NOT on "\n": Swift makes CRLF a single Character,
+    /// so `split(separator: "\n")` finds no separator at all in a CRLF file
+    /// and hands back the WHOLE FILE as one line — a single bogus verb whose
+    /// past tense is every remaining byte. Any list saved by a Windows editor
+    /// (the likely origin of a hand-written CJK list) landed exactly there.
     static func parseVerbs(_ text: String) -> [(ing: String, past: String)] {
-        text.split(separator: "\n").compactMap { line in
+        text.split(whereSeparator: \.isNewline).compactMap { line in
             let parts = line.split(separator: "\t", maxSplits: 1)
-                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .map { $0.trimmingCharacters(in: verbTrim).precomposedStringWithCanonicalMapping }
             guard parts.count == 2, !parts[0].isEmpty, !parts[1].isEmpty else { return nil }
             return (ing: parts[0], past: parts[1])
         }
@@ -82,10 +95,20 @@ final class RefreshManager: ObservableObject {
 
     static func verbCount(_ text: String) -> Int { parseVerbs(text).count }
 
+    /// UTF-8 first, then whatever Foundation can work out. A list typed in a
+    /// Windows editor and saved as "Unicode" is UTF-16, which the strict UTF-8
+    /// read rejects outright — the user got "couldn't read" for a perfectly
+    /// good file. The import re-writes it as UTF-8 either way.
+    static func readVerbFile(_ url: URL) -> String? {
+        if let s = try? String(contentsOf: url, encoding: .utf8) { return s }
+        var used = String.Encoding.utf8
+        return try? String(contentsOf: url, usedEncoding: &used)
+    }
+
     func importVerbs(from url: URL) {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        guard let text = try? String(contentsOf: url, encoding: .utf8) else {
+        guard let text = Self.readVerbFile(url) else {
             lastActionError = "couldn't read \(url.lastPathComponent)"
             return
         }
