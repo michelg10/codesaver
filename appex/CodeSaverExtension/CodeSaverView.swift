@@ -1807,6 +1807,21 @@ public final class CodeSaverView: ScreenSaverView {
     /// The pause wave: the paused look closes in from the box's edges over
     /// this many seconds, and opens back out from the centre on resume.
     private static let artPauseWave = 0.9
+    /// The card's choreography, the spinner's teleport in miniature. On the
+    /// way in (the wave has closed on the centre): a single-cell blip, a
+    /// beat of nothing, then the card under a decaying arrival flash. On the
+    /// way out (the wave starts to open): the card lifts under a departure
+    /// flash, and a blip closes the spot.
+    private static let artCardBlipIn = 0.06, artCardGapIn = 0.12, artCardFlashIn = 0.26
+    private static let artCardFlashOut = 0.16, artCardBlipOut = 0.10
+
+    /// The ■ PAUSED card's cells inside the art box: origin column and row,
+    /// width, and its three rows. One definition for the glyphs and for the
+    /// flash drawn over them.
+    private func artCardRect(cols: Int, rows: Int) -> (x: Int, y: Int, w: Int, h: Int) {
+        let w = (cols >= 16 ? " \u{25A0} PAUSED " : " PAUSED ").count + 2
+        return ((cols - w) / 2, rows / 2 - 1, w, 3)
+    }
     private static let artSettle = 0.30
 
     /// The beam's spot, in rows: how far AHEAD of the write position the
@@ -1986,7 +2001,7 @@ public final class CodeSaverView: ScreenSaverView {
     /// height. The gradient rolls down, and the only place it turns is the
     /// write position itself.
     private func artBoxRows(box: (cols: Int, rows: Int), grid: AlbumArtGrid?, key: String,
-                            paused: Bool, pauseChangedAt: Double?,
+                            paused: Bool, pauseChangedAt: Double?, cardOn: Bool,
                             base: NSFont) -> [NSAttributedString] {
         let cols = box.cols, rows = box.rows
         let paint = Self.artPaint, settle = Self.artSettle   // the write lap, then its cooling
@@ -2029,7 +2044,7 @@ public final class CodeSaverView: ScreenSaverView {
         let t = fps > 0 ? atQ - npTrackSince : 0            // the panel's own clock
         let el = revealAt.map { t - $0 } ?? 0               // since the wave began (negative: waiting)
         let pauseP = pauseChangedAt.map { min(1, (atQ - $0) / Self.artPauseWave) } ?? 1
-        let fxKey = "\(key)|\(cols)x\(rows)|\(grid != nil)|\(loading)|\(revealing)|\(paused)|\(tick)"
+        let fxKey = "\(key)|\(cols)x\(rows)|\(grid != nil)|\(loading)|\(revealing)|\(paused)|\(cardOn)|\(tick)"
         if let c = artFXCache, c.key == fxKey { return c.rows }
 
         // The cover's cells, parsed once per build.
@@ -2121,13 +2136,12 @@ public final class CodeSaverView: ScreenSaverView {
         //                      — then the bright word)
         // Character cells only: nothing is drawn but glyphs, nothing blinks.
         let word = Array(cols >= 16 ? " \u{25A0} PAUSED " : " PAUSED ")
-        let boxW = word.count + 2
+        let card = artCardRect(cols: cols, rows: rows)
+        let boxW = card.w, boxC0 = card.x, boxR0 = card.y
         let rule = [Character](repeating: "\u{2500}", count: boxW - 2)
         let boxRows: [[Character]] = [["\u{256D}"] + rule + ["\u{256E}"],
                                       ["\u{2502}"] + word + ["\u{2502}"],
                                       ["\u{2570}"] + rule + ["\u{256F}"]]
-        let boxC0 = (cols - boxW) / 2
-        let boxR0 = rows / 2 - 1
         let frame: SIMD3<Float> = [0.31, 0.34, 0.38]                 // the panel's label grey
         let mark: SIMD3<Float> = [0.42, 0.46, 0.52]
 
@@ -2172,23 +2186,31 @@ public final class CodeSaverView: ScreenSaverView {
             // pausing and opening out from the centre when resuming. Weight
             // 1 is the settled paused look.
             var w: Float = paused ? 1 : 0
+            var glint: Float = 0
             if pauseP < 1 {
                 let dx = min(Double(i) + 0.5, Double(cols) - Double(i) - 0.5) / (Double(cols) / 2)
                 let dy = min(Double(j) + 0.5, Double(rows) - Double(j) - 0.5) / (Double(rows) / 2)
                 let d = min(dx, dy)                      // 0 at the rim … 1 at the centre
                 let front = pauseP * 1.2                 // runs past 1 so the centre finishes
-                let sEdge = paused ? (front - d) / 0.2 : (front - (1 - d)) / 0.2
-                let k = Float(max(0, min(1, sEdge)))
+                let along = paused ? d : 1 - d           // where this cell sits on the wave's path
+                let k = Float(max(0, min(1, (front - along) / 0.2)))
                 w = paused ? k : 1 - k
+                // The front shimmers: a glint of the accent riding the edge,
+                // sparkling cell to cell, fading as the wave completes.
+                glint = Float(max(0, 1 - abs(front - along) / 0.12))
+                    * Float(0.7 + 0.3 * artHash(i, j)) * Float(pow(1 - pauseP, 0.3))
             }
             if w > 0 {
                 let y = 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z
                 c = mix3(c, mix3(c, [y, y, y], 0.55) * 0.6, w)
                 glow *= 1 - w
             }
-            // The card arrives once the wave has closed on the centre, and
-            // leaves the moment it starts to open.
-            let cardOn = paused ? pauseP >= 0.92 : pauseP < 0.08
+            if glint > 0 {
+                c = mix3(c, Self.artBeamC, 0.6 * glint)
+                glow = max(glow, 0.9 * glint)
+            }
+            // The card: when it is on is the caller's call (its arrival and
+            // departure are choreographed against the flash drawn over it).
             if cardOn {
                 if j >= boxR0, j < boxR0 + 3, i >= boxC0, i < boxC0 + boxW {
                     ch = boxRows[j - boxR0][i - boxC0]
@@ -2421,7 +2443,9 @@ public final class CodeSaverView: ScreenSaverView {
                                  key: String, rows: [WidgetRow],
                                  bottomLeft origin: NSPoint, mask: Bool,
                                  art: (rows: [NSAttributedString], step: CGFloat,
-                                       cols: Int, afterRow: Int)? = nil) {
+                                       cols: Int, afterRow: Int,
+                                       card: (x: Int, y: Int, w: Int, h: Int,
+                                              flash: CGFloat, blip: Bool)?)? = nil) {
         let step = lineH
         var width: CGFloat = 0
         let built: [NSAttributedString] = rows.map { row in
@@ -2451,8 +2475,27 @@ public final class CodeSaverView: ScreenSaverView {
                     // the art off the grid.
                     let totalCells = Int((width / charW).rounded())
                     let lead = CGFloat(max(1, (totalCells - art.cols) / 2))
-                    AlbumArtGrid.draw(rows: art.rows, at: NSPoint(x: pad + lead * charW, y: y),
-                                      step: art.step)
+                    let ox = pad + lead * charW
+                    AlbumArtGrid.draw(rows: art.rows, at: NSPoint(x: ox, y: y), step: art.step)
+                    if let card = art.card, card.flash > 0 || card.blip {
+                        // The spinner's own flash and blip, over the card's
+                        // cells, in screen space (the panel's top-left plus
+                        // this raster's offsets), drawn late — over the quad.
+                        let px = origin.x + ox + CGFloat(card.x) * charW
+                        let py = origin.y - size.height + y + CGFloat(card.y) * art.step
+                        let rect = NSRect(x: px, y: py, width: CGFloat(card.w) * charW,
+                                          height: CGFloat(card.h) * art.step)
+                        if card.flash > 0 {
+                            appendTeleportFlash(&frame.lateFills, rect: rect.insetBy(dx: -2, dy: -1),
+                                                alpha: card.flash, scale: scale)
+                        }
+                        if card.blip {
+                            appendBlip(&frame.lateFills,
+                                       cell: NSRect(x: px + CGFloat(card.w / 2) * charW,
+                                                    y: py + art.step, width: charW, height: art.step),
+                                       scale: scale)
+                        }
+                    }
                 }
             }
         }) else { return }
@@ -2786,7 +2829,8 @@ public final class CodeSaverView: ScreenSaverView {
 
         var rows = [top]
         var artPayload: (rows: [NSAttributedString], step: CGFloat,
-                         cols: Int, afterRow: Int)?
+                         cols: Int, afterRow: Int,
+                         card: (x: Int, y: Int, w: Int, h: Int, flash: CGFloat, blip: Bool)?)?
         if let box {
             // Blank rows (│ + spaces + │) reserve the box's height AND supply
             // its side rails; whatever the box shows is drawn over them at
@@ -2795,9 +2839,35 @@ public final class CodeSaverView: ScreenSaverView {
             let h = stepA * CGFloat(box.rows) + 4
             let n = max(1, Int((h / lineH).rounded(.up)))
             for _ in 0..<n { rows.append(padRow("", titleC)) }
+            // The card's choreography against the wave: it arrives once the
+            // wave has closed on the centre — blip, a beat, then the card
+            // under an arrival flash — and leaves the moment the wave starts
+            // to open: a departure flash, then a blip. First sight of a
+            // paused track: the card is simply there.
+            var cardOn = paused, flash: CGFloat = 0, blip = false
+            if let t0 = npPauseChangedAt {
+                if paused {
+                    let tz = now - (t0 + 0.92 * Self.artPauseWave)
+                    cardOn = tz >= Self.artCardGapIn
+                    blip = tz >= 0 && tz < Self.artCardBlipIn
+                    if tz >= Self.artCardGapIn, tz < Self.artCardFlashIn {
+                        flash = (Self.artCardFlashIn - tz) / (Self.artCardFlashIn - Self.artCardGapIn) * 0.55
+                    }
+                } else {
+                    let tz = now - (t0 + 0.08 * Self.artPauseWave)
+                    cardOn = tz < 0
+                    if tz >= 0, tz < Self.artCardFlashOut {
+                        let a = 1 - tz / Self.artCardFlashOut
+                        flash = 0.85 * a * a
+                        blip = tz >= Self.artCardBlipOut
+                    }
+                }
+            }
+            let cr = artCardRect(cols: box.cols, rows: box.rows)
             artPayload = (artBoxRows(box: box, grid: grid, key: key, paused: paused,
-                                     pauseChangedAt: npPauseChangedAt, base: base),
-                          stepA, box.cols, 0)
+                                     pauseChangedAt: npPauseChangedAt, cardOn: cardOn, base: base),
+                          stepA, box.cols, 0,
+                          flash > 0 || blip ? (cr.x, cr.y, cr.w, cr.h, flash, blip) : nil)
         }
         rows += [titleRow, artistRow, progRow, bottom]
         let width = CGFloat(inner + 2) * charW * 1.0
