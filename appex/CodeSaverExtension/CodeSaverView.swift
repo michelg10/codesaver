@@ -1806,7 +1806,7 @@ public final class CodeSaverView: ScreenSaverView {
     private static let artPaint = artRoll        // the reveal IS the next wave: one lap at the roll's speed
     /// The pause wave: the paused look closes in from the box's edges over
     /// this many seconds, and opens back out from the centre on resume.
-    private static let artPauseWave = 0.9
+    private static let artPauseWave = 0.6              // was 0.9; Michel: "50% faster"
     /// The card's choreography, the spinner's teleport in miniature. On the
     /// way in (the wave has closed on the centre): a single-cell blip, a
     /// beat of nothing, then the card under a decaying arrival flash. On the
