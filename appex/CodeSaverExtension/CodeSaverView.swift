@@ -413,7 +413,7 @@ public final class CodeSaverView: ScreenSaverView {
     // uses these defaults.
 
     // Values hand-tuned with the preview harness's sliders (2026-07-11).
-    public var clockPadCells: CGFloat = 4      // blank cells each side of the digits
+    public var clockPadCells: CGFloat = 5      // blank cells each side of the digits
     public var clockTopFrac: CGFloat = 0.0887  // box top, fraction of screen height
     public var clockScale: CGFloat = 0.026     // cell font size, fraction of screen height
     public var clockBackdropAlpha: CGFloat = 0.375
@@ -701,11 +701,19 @@ public final class CodeSaverView: ScreenSaverView {
             return nil
         }
 
-        // Verbs: "Gerund<TAB>Past" per line.
+        // Verbs: "Gerund<TAB>Past" per line. Split on `isNewline`, not on
+        // "\n" — Swift makes CRLF ONE Character, so a CRLF list has no "\n"
+        // separator at all and came back as a single verb holding the whole
+        // file. Trim the invisibles (BOM, ZWSP) a hand-edited list carries,
+        // and compose: a Hangul or kana verb typed on macOS can arrive
+        // decomposed, which the cell grid then measures a jamo at a time.
         let verbText = readFirst("spinner-verbs.txt")
             ?? "Coding\tCoded\nCompiling\tCompiled\nRefactoring\tRefactored\nShipping\tShipped"
-        verbs = verbText.split(separator: "\n").compactMap { line in
-            let parts = line.split(separator: "\t", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+        let verbTrim = CharacterSet.whitespacesAndNewlines
+            .union(CharacterSet(charactersIn: "\u{FEFF}\u{200B}"))
+        verbs = verbText.split(whereSeparator: \.isNewline).compactMap { line in
+            let parts = line.split(separator: "\t", maxSplits: 1)
+                .map { $0.trimmingCharacters(in: verbTrim).precomposedStringWithCanonicalMapping }
             guard parts.count == 2, !parts[0].isEmpty, !parts[1].isEmpty else { return nil }
             return (ing: parts[0], past: parts[1])
         }
@@ -1113,8 +1121,12 @@ public final class CodeSaverView: ScreenSaverView {
 
         func emit(_ ch: Character, cells: Int, x: Float, y: Float,
                   color: SIMD4<Float>, halo: SIMD4<Float>? = nil) {
-            guard let slot = metal.glyphSlot(for: ch, cells: cells) else { return }
-            let size = SIMD2(cw * Float(cells), lh)
+            // Zero-width characters claim no column and draw nothing.
+            guard cells > 0, let slot = metal.glyphSlot(for: ch, cells: cells)
+            else { return }
+            // Size from the slot the atlas actually built, never from what we
+            // asked for: a clamped request would otherwise stretch the glyph.
+            let size = SIMD2(cw * Float(slot.cells), lh)
             if let halo {
                 frame.glyphs.append(.init(origin: SIMD2(x, y), size: size,
                                           color: halo, uvRect: slot.uv,
@@ -1530,6 +1542,10 @@ public final class CodeSaverView: ScreenSaverView {
     private var npTrackKey = ""
     private var npTrackSince: Double = 0
     private var artShownSince: Double?
+    /// Pause/play as the panel last saw it, and when it changed — the dimming
+    /// wave's clock. nil until the first sight, which is never animated.
+    private var npPauseKnown: Bool?
+    private var npPauseChangedAt: Double?
     /// Composited art rows (placeholder, reveal, paused overlay), keyed on
     /// everything they were built from: a static state costs one build, an
     /// animated one a build per quantised tick.
@@ -1787,7 +1803,10 @@ public final class CodeSaverView: ScreenSaverView {
     private static let artBreathLo: Float = 0.60
     private static let artBreathHi: Float = 0.90
     private static let artBreath = 4.3
-    private static let artPaint = 1.0
+    private static let artPaint = artRoll        // the reveal IS the next wave: one lap at the roll's speed
+    /// The pause wave: the paused look closes in from the box's edges over
+    /// this many seconds, and opens back out from the centre on resume.
+    private static let artPauseWave = 0.9
     private static let artSettle = 0.30
 
     /// The beam's spot, in rows: how far AHEAD of the write position the
@@ -1957,9 +1976,9 @@ public final class CodeSaverView: ScreenSaverView {
     /// What the art box shows this frame. The plain cover is the cached
     /// layout straight through; everything else — the phosphor field rolling
     /// while the cover is on its way (12 s, or until the daemon says the
-    /// track has none), the same beam printing the cover as it lands, the
-    /// paused box over either — is composited per cell, animated states at a
-    /// quantised clock.
+    /// track has none), the roll's next wave printing the cover from the top
+    /// once it has landed, the paused box over either — is composited per
+    /// cell, animated states at a quantised clock.
     ///
     /// The whole box is the beam. There is no band and no background: the
     /// brightness of every row is the age of its phosphor, measured from the
@@ -1967,14 +1986,33 @@ public final class CodeSaverView: ScreenSaverView {
     /// height. The gradient rolls down, and the only place it turns is the
     /// write position itself.
     private func artBoxRows(box: (cols: Int, rows: Int), grid: AlbumArtGrid?, key: String,
-                            paused: Bool, base: NSFont) -> [NSAttributedString] {
+                            paused: Bool, pauseChangedAt: Double?,
+                            base: NSFont) -> [NSAttributedString] {
         let cols = box.cols, rows = box.rows
         let paint = Self.artPaint, settle = Self.artSettle   // the write lap, then its cooling
-        let revealing = grid != nil && (artShownSince.map { now - $0 } ?? 0) < paint + settle
+        // The cover is handed over whenever the daemon lands it, but the beam
+        // only writes it from the TOP: the reveal waits for the roll's next
+        // wrap and is the next wave down, at the roll's own speed. Until then
+        // the field keeps rolling exactly as it was, cover in hand — the
+        // handover is invisible. A lap started mid-box at another speed read
+        // as the picture's opacity coming up, not as a wave writing it. If
+        // the roll had already stopped (a coverless rest), the wave starts
+        // at once.
+        let shownT = artShownSince.map { $0 - npTrackSince }
+        let revealAt: Double? = shownT.map { s in
+            let wait = s < 12
+                ? (Self.artRoll - s.truncatingRemainder(dividingBy: Self.artRoll))
+                    .truncatingRemainder(dividingBy: Self.artRoll)
+                : 0
+            return s + wait
+        }
+        let revealing = grid != nil
+            && (revealAt.map { (now - npTrackSince) - $0 < paint + settle } ?? false)
         let loading = grid == nil && artKey != key && now - npTrackSince < 12
-        if let grid, !revealing, !paused { return albumArtRows(grid) }
+        let waving = pauseChangedAt.map { now - $0 < Self.artPauseWave } ?? false
+        if let grid, !revealing, !paused, !waving { return albumArtRows(grid) }
 
-        let live = loading || revealing
+        let live = loading || revealing || waving
         // One quantised clock for everything that moves, and it goes in the
         // cache key: a frame inside a tick is a hit, and a state that isn't
         // animated (tick 0, t 0) is built exactly once and then held. Paused
@@ -1989,7 +2027,8 @@ public final class CodeSaverView: ScreenSaverView {
         let tick = fps > 0 ? Int(now * fps + 1e-6) : 0
         let atQ = fps > 0 ? Double(tick) / fps : now
         let t = fps > 0 ? atQ - npTrackSince : 0            // the panel's own clock
-        let el = artShownSince.map { atQ - $0 } ?? 0        // since the cover landed
+        let el = revealAt.map { t - $0 } ?? 0               // since the wave began (negative: waiting)
+        let pauseP = pauseChangedAt.map { min(1, (atQ - $0) / Self.artPauseWave) } ?? 1
         let fxKey = "\(key)|\(cols)x\(rows)|\(grid != nil)|\(loading)|\(revealing)|\(paused)|\(tick)"
         if let c = artFXCache, c.key == fxKey { return c.rows }
 
@@ -2005,20 +2044,19 @@ public final class CodeSaverView: ScreenSaverView {
         }
 
         // Where the write position is, in rows, on a continuous scale.
-        // Loading: one lap every artRoll seconds, forever. Reveal: the same
-        // beam, picked up wherever the loading lap had it (`start`) and run
-        // one faster lap that leaves the cover behind it — nothing jumps
-        // when the cover lands. Paused, there is no beam: the field lies
-        // still under the box.
+        // Rolling (loading, or the cover in hand and waiting for the wrap):
+        // one lap every artRoll seconds. The wave: from the top, one lap at
+        // the same speed, leaving the cover behind it — it begins at a wrap,
+        // so it IS the roll's next lap and nothing jumps. Paused, there is
+        // no beam: the field lies still under the box.
         var head: Double?
         var start: Double?
-        if paused {
+        if paused, pauseP >= 1 {
             head = nil
-        } else if revealing {
-            let s = Double(rows) * ((t - el) / Self.artRoll)
-            start = s
-            head = s + Double(rows) * (el / paint)
-        } else if loading {
+        } else if revealing, el >= 0 {
+            start = 0
+            head = Double(rows) * (el / paint)
+        } else if loading || revealing {
             head = Double(rows) * (t / Self.artRoll)
         }
         // What is left of the reveal's overexposure. Most of it is gone
@@ -2062,9 +2100,9 @@ public final class CodeSaverView: ScreenSaverView {
             // (each row keeps the level it was written at), and a coverless
             // rest quieter still.
             let level: Float
-            if revealing {
+            if revealing, rowPainted[j] {
                 level = 1
-            } else if loading {
+            } else if loading || revealing {
                 let written = t - rowAge[j] * Self.artRoll
                 let breath = Float(0.5 + 0.5 * sin(2 * .pi * written / Self.artBreath))
                 level = Self.artBreathLo + (Self.artBreathHi - Self.artBreathLo) * breath
@@ -2127,12 +2165,31 @@ public final class CodeSaverView: ScreenSaverView {
                 c = lit.color
                 glow = lit.glow
             }
-            if paused {
-                // The cover steps back: half its saturation, six tenths of
-                // its light. Still a picture, plainly not the live one.
+            // The paused look — half its saturation, six tenths of its light;
+            // still a picture, plainly not the live one — carried by a wave:
+            // a rectangular front (the cell's distance to the nearest edge,
+            // each axis on its own scale) closing in from the rim when
+            // pausing and opening out from the centre when resuming. Weight
+            // 1 is the settled paused look.
+            var w: Float = paused ? 1 : 0
+            if pauseP < 1 {
+                let dx = min(Double(i) + 0.5, Double(cols) - Double(i) - 0.5) / (Double(cols) / 2)
+                let dy = min(Double(j) + 0.5, Double(rows) - Double(j) - 0.5) / (Double(rows) / 2)
+                let d = min(dx, dy)                      // 0 at the rim … 1 at the centre
+                let front = pauseP * 1.2                 // runs past 1 so the centre finishes
+                let sEdge = paused ? (front - d) / 0.2 : (front - (1 - d)) / 0.2
+                let k = Float(max(0, min(1, sEdge)))
+                w = paused ? k : 1 - k
+            }
+            if w > 0 {
                 let y = 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z
-                c = mix3(c, [y, y, y], 0.55) * 0.6
-                glow = 0
+                c = mix3(c, mix3(c, [y, y, y], 0.55) * 0.6, w)
+                glow *= 1 - w
+            }
+            // The card arrives once the wave has closed on the centre, and
+            // leaves the moment it starts to open.
+            let cardOn = paused ? pauseP >= 0.92 : pauseP < 0.08
+            if cardOn {
                 if j >= boxR0, j < boxR0 + 3, i >= boxC0, i < boxC0 + boxW {
                     ch = boxRows[j - boxR0][i - boxC0]
                     switch ch {
@@ -2154,8 +2211,13 @@ public final class CodeSaverView: ScreenSaverView {
     /// sane panel width, and clipping them drops the collaborators entirely.
     private func marqueeText(_ text: String, width: Int) -> String {
         let chars = Array(text)
-        guard width > 0, chars.count > width else { return text }
-        let over = chars.count - width
+        let cells = chars.map { widgetGlyph($0).cells }
+        let total = cells.reduce(0, +)
+        guard width > 0, total > width else { return text }
+        // Walk one glyph at a time until the remainder fits the field — a
+        // wide glyph is one step like any other, it just frees two cells.
+        var over = 0, rest = total
+        while over < chars.count, rest > width { rest -= cells[over]; over += 1 }
         let glyph = 0.34            // seconds per glyph
         let hold = 2.2              // pause at each end
         let cycle = hold * 2 + Double(over) * glyph
@@ -2165,7 +2227,12 @@ public final class CodeSaverView: ScreenSaverView {
         else if t < hold + Double(over) * glyph { off = Int((t - hold) / glyph) }
         else { off = over }
         let start = min(over, max(0, off))
-        return String(chars[start..<min(chars.count, start + width)])
+        var used = 0, out = ""
+        for k in start..<chars.count {
+            if used + cells[k] > width { break }
+            used += cells[k]; out.append(chars[k])
+        }
+        return out
     }
 
     /// "~/Desktop/codesaver" from an absolute cwd.
@@ -2180,6 +2247,81 @@ public final class CodeSaverView: ScreenSaverView {
     private func widgetSplitLastDir(_ path: String) -> (String, String) {
         guard path.count > 1, let slash = path.lastIndex(of: "/") else { return ("", path) }
         return (String(path[...slash]), String(path[path.index(after: slash)...]))
+    }
+
+    // MARK: Cell widths — CJK and other wide glyphs on the panel grid
+
+    /// Per-glyph (cells, kern) at the current font size. SF Mono's own glyphs
+    /// are one cell and need no kern; anything it falls back for — CJK,
+    /// fullwidth forms, emoji, even ♪ — is measured once and rounded to whole
+    /// cells, with the kern that makes its advance exactly that many cells.
+    /// Counting `String.count` put a Chinese title's right rail wherever the
+    /// fallback glyphs happened to end; the panel is a grid, and every glyph
+    /// has to sit on it.
+    private var widgetGlyphCache: [Character: (cells: Int, kern: CGFloat)] = [:]
+    private var widgetGlyphCachePt: CGFloat = 0
+
+    private func widgetGlyph(_ ch: Character) -> (cells: Int, kern: CGFloat) {
+        if ch.isASCII { return (1, 0) }
+        if widgetGlyphCachePt != font!.pointSize {
+            widgetGlyphCache = [:]
+            widgetGlyphCachePt = font!.pointSize
+        }
+        if let g = widgetGlyphCache[ch] { return g }
+        let w = NSAttributedString(string: String(ch), attributes: [.font: font!]).size().width
+        let n = max(1, Int((w / charW).rounded()))
+        var kern = CGFloat(n) * charW - w
+        if abs(kern) < 0.05 { kern = 0 }
+        let g = (cells: n, kern: kern)
+        widgetGlyphCache[ch] = g
+        return g
+    }
+
+    /// Cells a string takes on the panel grid.
+    private func widgetCells(_ s: String) -> Int { s.reduce(0) { $0 + widgetGlyph($1).cells } }
+
+    /// The longest prefix / suffix of `s` that fits in `cells` cells.
+    private func widgetPrefix(_ s: String, cells: Int) -> String {
+        var used = 0, out = ""
+        for ch in s {
+            let n = widgetGlyph(ch).cells
+            if used + n > cells { break }
+            used += n; out.append(ch)
+        }
+        return out
+    }
+    private func widgetSuffix(_ s: String, cells: Int) -> String {
+        var used = 0, out: [Character] = []
+        for ch in s.reversed() {
+            let n = widgetGlyph(ch).cells
+            if used + n > cells { break }
+            used += n; out.append(ch)
+        }
+        return String(out.reversed())
+    }
+
+    /// `text` as attributed text with every glyph snapped to its cells: a
+    /// wide fallback glyph is kerned out to exactly n × charW, so the rail
+    /// after it lands where the fill arithmetic says it will.
+    private func widgetRun(_ text: String, _ attrs: [NSAttributedString.Key: Any]) -> NSAttributedString {
+        if text.allSatisfy({ $0.isASCII }) { return NSAttributedString(string: text, attributes: attrs) }
+        let out = NSMutableAttributedString()
+        var plain = ""
+        func flush() {
+            guard !plain.isEmpty else { return }
+            out.append(NSAttributedString(string: plain, attributes: attrs))
+            plain = ""
+        }
+        for ch in text {
+            let g = widgetGlyph(ch)
+            if g.kern == 0 { plain.append(ch); continue }
+            flush()
+            var a = attrs
+            a[.kern] = g.kern
+            out.append(NSAttributedString(string: String(ch), attributes: a))
+        }
+        flush()
+        return out
     }
 
     private func widgetStateLabel(_ w: WidgetSession) -> String {
@@ -2285,7 +2427,7 @@ public final class CodeSaverView: ScreenSaverView {
         let built: [NSAttributedString] = rows.map { row in
             let line = NSMutableAttributedString()
             for (text, attrs) in row.runs {
-                line.append(NSAttributedString(string: text, attributes: attrs))
+                line.append(widgetRun(text, attrs))
             }
             width = max(width, line.size().width)
             return line
@@ -2372,7 +2514,7 @@ public final class CodeSaverView: ScreenSaverView {
             let bottom = w.sessionTokens.map {
                 "session \(countString(Double($0))) tokens" } ?? ""
             let contentLen = 2 + 2 + label.count + (paren.map { $0.count + 1 } ?? 0) + 2
-            innerMax = max(innerMax, contentLen, cwd.count + 6, bottom.count + 6)
+            innerMax = max(innerMax, contentLen, widgetCells(cwd) + 6, bottom.count + 6)
         }
         let inner = min(innerMax, 72)
         for w in sessions {
@@ -2427,8 +2569,8 @@ public final class CodeSaverView: ScreenSaverView {
 
             // Top rail: ╭─ cwd ────╮ (truncate cwd from the left if huge)
             var cwd = c.cwd
-            if cwd.count > inner - 6 { cwd = "\u{2026}" + cwd.suffix(inner - 7) }
-            let topFill = max(0, inner - cwd.count - 4)
+            if widgetCells(cwd) > inner - 6 { cwd = "\u{2026}" + widgetSuffix(cwd, cells: inner - 7) }
+            let topFill = max(0, inner - widgetCells(cwd) - 4)
             // The parents rest at the label weight; the final directory — the
             // name a project is actually recognised by — is the bright one.
             let (cwdHead, cwdTail) = widgetSplitLastDir(cwd)
@@ -2542,13 +2684,22 @@ public final class CodeSaverView: ScreenSaverView {
         }
 
         let paused = widgetFeed.npState == "paused"
+        // A change of state starts the wave: in from the edges when pausing,
+        // out from the centre when resuming. The first sight of a track is
+        // never animated — there is nothing to transition from.
+        if npPauseKnown == nil {
+            npPauseKnown = paused
+        } else if npPauseKnown != paused {
+            npPauseKnown = paused
+            npPauseChangedAt = now
+        }
         let title0 = widgetFeed.npTitle, artist0 = widgetFeed.npArtist
         // Without art the panel still needs some width; WITH art, the art box
         // alone decides it — and the box is there from a track's first frame,
         // sized from the saved tuning, so the width never jumps when the
         // cover lands. Track metadata never widens the panel — a long feature
         // credit used to stretch it halfway across the screen.
-        var inner = min(60, max(40, max(title0.count, artist0.count) + 6))
+        var inner = min(60, max(40, max(widgetCells(title0), widgetCells(artist0)) + 6))
         // The track the panel is on. A change restarts the placeholder's
         // clock and forgets the reveal, so the next cover lands with its own.
         let key = "\(app)|\(title0)|\(artist0)"
@@ -2572,11 +2723,11 @@ public final class CodeSaverView: ScreenSaverView {
             }
             if let box { inner = max(24, box.cols + 3) }
         }
-        // Title clips, artist scrolls — both bounded by the art-derived width
-        // instead of being allowed to set it.
+        // Title and artist both scroll when they overrun the field — bounded
+        // by the art-derived width instead of being allowed to set it, and a
+        // clipped title lost the half that names the song.
         let field = max(4, inner - 3)
-        var title = title0
-        if title.count > field { title = String(title.prefix(field - 1)) + "\u{2026}" }
+        let title = marqueeText(title0, width: field)
         let artist = marqueeText(artist0, width: field)
 
         func timeMS(_ v: Double) -> String {
@@ -2596,14 +2747,14 @@ public final class CodeSaverView: ScreenSaverView {
                 head += " " + spanString(wall - ps)
             }
         }
-        let topFill = max(0, inner - head.count - 4)
+        let topFill = max(0, inner - widgetCells(head) - 4)
         let top = WidgetRow(runs: [
             ("\u{256D}\u{2500} ", run(railC)), (head, run(labelC)),
             (" " + String(repeating: "\u{2500}", count: topFill) + "\u{256E}", run(railC)),
         ])
         // Row-width invariant: every row is exactly inner+1 cells wide.
         func padRow(_ text: String, _ c: NSColor) -> WidgetRow {
-            let fill = max(0, inner - text.count - 3)
+            let fill = max(0, inner - widgetCells(text) - 3)
             return WidgetRow(runs: [
                 ("\u{2502} ", run(railC)), (text, run(c)),
                 (String(repeating: " ", count: fill) + " \u{2502}", run(railC)),
@@ -2645,7 +2796,8 @@ public final class CodeSaverView: ScreenSaverView {
             let n = max(1, Int((h / lineH).rounded(.up)))
             for _ in 0..<n { rows.append(padRow("", titleC)) }
             artPayload = (artBoxRows(box: box, grid: grid, key: key, paused: paused,
-                                     base: base), stepA, box.cols, 0)
+                                     pauseChangedAt: npPauseChangedAt, base: base),
+                          stepA, box.cols, 0)
         }
         rows += [titleRow, artistRow, progRow, bottom]
         let width = CGFloat(inner + 2) * charW * 1.0
@@ -3078,6 +3230,7 @@ public final class CodeSaverView: ScreenSaverView {
         } else {
             slice = block
         }
+        slice = slice.map(Self.expandTabs)
         while let f = slice.first, f.trimmingCharacters(in: .whitespaces).isEmpty { slice.removeFirst() }
         while let l = slice.last, l.trimmingCharacters(in: .whitespaces).isEmpty { slice.removeLast() }
         // De-dent: strip the indentation every non-empty line shares, so a
@@ -3092,19 +3245,58 @@ public final class CodeSaverView: ScreenSaverView {
         return slice.map { Array($0) }
     }
 
+    /// Tabs → spaces on the terminal's own 4-column stops. A tab has no cell
+    /// width (it paints nothing) so left in place it would silently swallow a
+    /// line's indentation. The corpus CodeSaver.app fetches is already
+    /// expanded; this covers the legacy corpus.txt path, the built-in
+    /// fallback, and any corpus handed in through CODESAVER_RESOURCES.
+    private static func expandTabs(_ line: String) -> String {
+        guard line.contains("\t") else { return line }
+        var out = ""
+        out.reserveCapacity(line.count + 8)
+        var col = 0
+        for ch in line {
+            if ch == "\t" {
+                let pad = 4 - (col % 4)
+                out += String(repeating: " ", count: pad)
+                col += pad
+            } else {
+                out.append(ch)
+                col += 1
+            }
+        }
+        return out
+    }
+
     // MARK: Cell widths
     // The layout is a character-cell model, but CJK/emoji glyphs paint wider
     // than one cell. Widths are MEASURED per character (so the model matches
-    // whatever font fallback actually draws) and ceil'd — over-claiming is
-    // safe (spans clear enough, truncation stays inside the margin); under-
-    // claiming is what causes text painting over its neighbors.
+    // whatever font fallback actually draws) and quantized to the terminal's
+    // own vocabulary: 0 (zero-width), 1 (narrow) or 2 (East Asian wide). The
+    // glyph atlas then FITS the character into exactly that many cells, so
+    // what is counted and what is painted can never disagree.
+    //
+    // The 2-cell ceiling matters. SF Mono has no CJK, so PingFang answers at
+    // ~1.62 cells and Apple Color Emoji at ~2.11; a bare ceil() made every
+    // emoji claim THREE cells — a blank column after each one, and the glyph
+    // adrift in an over-wide atlas slot. Two is what a terminal gives them.
+    //
+    // Measured once per Character and cached (the cache is dropped when the
+    // font changes), so the Metal path stays free of per-frame CoreText.
     private var cellWidthCache: [Character: Int] = [:]
 
     private func cellWidth(_ ch: Character) -> Int {
-        if ch.isASCII { return 1 }
+        // Fast path: printable ASCII is always exactly one cell. Control
+        // characters are NOT — a tab measures three-and-a-bit cells but
+        // paints nothing — so they take no column here; corpus decode
+        // expands tabs to spaces before layout ever sees one.
+        if let a = ch.asciiValue { return (a >= 0x20 && a != 0x7F) ? 1 : 0 }
         if let cached = cellWidthCache[ch] { return cached }
         let advance = (String(ch) as NSString).size(withAttributes: [.font: font!]).width
-        let w = max(1, Int(ceil(advance / charW - 0.05)))
+        // Zero-advance characters (ZWSP, BOM, a lone joiner or variation
+        // selector) take no column either: claiming one would open a phantom
+        // gap and shift the whole rest of the line off the grid.
+        let w = advance < 0.05 ? 0 : min(2, max(1, Int(ceil(advance / charW - 0.05))))
         cellWidthCache[ch] = w
         return w
     }
@@ -3855,12 +4047,24 @@ public final class CodeSaverView: ScreenSaverView {
     }
 
     /// Real code for the boom's spots, straight from the session corpus.
+    ///
+    /// The boom field is a one-byte-per-cell ASCII grid — it has no way to
+    /// carry a CJK glyph, and BoomCore drops any scalar outside 33…126. A
+    /// line of Chinese comment would therefore stamp as a scatter of holes
+    /// rather than code, so lines that are mostly non-ASCII are left out and
+    /// the ASCII ones (every corpus has plenty) carry the spots.
     private func boomCodeLines() -> [String] {
         var lines: [String] = []
         for _ in 0..<6 {
             lines += randomChunk().map { String($0) }
         }
         lines = lines.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        let stampable = lines.filter { line in
+            let ink = line.unicodeScalars.filter { $0 != " " }
+            guard !ink.isEmpty else { return false }
+            return ink.filter { $0.value >= 33 && $0.value < 127 }.count * 4 >= ink.count * 3
+        }
+        if stampable.count >= 4 { return stampable }
         return lines.isEmpty ? BoomCore.fallbackCodeLines : lines
     }
 

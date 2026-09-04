@@ -1392,10 +1392,29 @@ final class BoomMetalRenderer {
 /// twin holding the same glyph as a baked shadow blur (the typing-head glow
 /// and cursor halo; intensity scales via instance alpha rather than radius).
 /// A full atlas resets and glyphs lazily re-enter.
+///
+/// A slot is exactly `cells × cellW` wide and the glyph is FITTED into it —
+/// centered, and shrunk horizontally if the fallback font's advance is wider
+/// than the claimed cells. SF Mono carries no CJK, so those characters come
+/// from PingFang/Apple SD Gothic at ~1.6–1.4 cells and emoji from Apple Color
+/// Emoji at ~2.11 cells; drawing them at the origin of a 2-cell box left CJK
+/// runs visibly loose (a gap after every glyph) and let emoji spill. Both the
+/// glyph and its halo go through the same transform, so the halo can never
+/// drift off its glyph.
 final class TerminalGlyphAtlas {
     struct Slot {
         let uv: SIMD4<Float>     // x, y, w, h in atlas px
         let isColor: Bool        // emoji: the sample carries its own color
+        let cells: Int           // cells this slot was rasterized for
+    }
+
+    /// A slot is only reusable for a quad drawn at the same cell width —
+    /// keying on the Character alone would silently stretch the cached
+    /// bitmap the first time a caller asked for the same glyph at a
+    /// different width.
+    private struct Key: Hashable {
+        let ch: Character
+        let cells: Int
     }
 
     private let device: MTLDevice
@@ -1406,7 +1425,7 @@ final class TerminalGlyphAtlas {
     private let haloRadius: CGFloat
     private(set) var texture: MTLTexture?
     private(set) var haloTexture: MTLTexture?
-    private var slots: [Character: Slot] = [:]
+    private var slots: [Key: Slot] = [:]
     private var shelfX = 0
     private var shelfY = 0
     private var shelfH = 0
@@ -1423,9 +1442,13 @@ final class TerminalGlyphAtlas {
         self.haloRadius = fontBase * 0.6
     }
 
+    /// The returned slot carries the cell width it was actually built for;
+    /// callers must size the quad from THAT, never from what they asked for,
+    /// or a clamped request would paint a stretched glyph.
     func slot(for ch: Character, cells: Int) -> Slot? {
-        if let s = slots[ch] { return s }
-        return rasterize(ch, cells: max(1, min(3, cells)))
+        let n = max(1, min(3, cells))
+        if let s = slots[Key(ch: ch, cells: n)] { return s }
+        return rasterize(ch, cells: n)
     }
 
     private func ensureTextures() -> Bool {
@@ -1460,7 +1483,19 @@ final class TerminalGlyphAtlas {
                                  bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
                                      | CGBitmapInfo.byteOrder32Little.rawValue)
         else { return nil }
-        let isColor = ch.unicodeScalars.contains { $0.properties.isEmojiPresentation }
+        let text = String(ch)
+        // Colour-ness comes from the font CoreText ACTUALLY resolves, not
+        // from Emoji_Presentation: ❤️ / ⚠️ / ▶️ (base scalar + VS16) have no
+        // scalar with that property, yet render out of Apple Color Emoji —
+        // and being flagged monochrome had the shader multiply the sample by
+        // the code tint, painting them grey-blue instead of their own colour.
+        let isColor = Self.usesColorGlyphs(text, font: font)
+        // Fit the glyph in its cells-wide box: centre it, and squeeze it in
+        // if the fallback face is wider than the cells we claimed.
+        let advance = (text as NSString).size(withAttributes: [.font: font]).width
+        let boxW = cellW * CGFloat(cells)
+        let squeeze = advance > boxW + 0.01 ? boxW / advance : 1
+        let xInset = max(0, (boxW - advance * squeeze) / 2)
         let baseline = NSPoint(x: 0, y: lineH - (font.ascender - font.descender))
 
         func draw(_ attrs: [NSAttributedString.Key: Any], at p: NSPoint) {
@@ -1469,7 +1504,9 @@ final class TerminalGlyphAtlas {
             NSGraphicsContext.current = g
             cg.saveGState()
             cg.scaleBy(x: scale, y: scale)
-            NSAttributedString(string: String(ch), attributes: attrs).draw(at: p)
+            cg.translateBy(x: xInset, y: 0)
+            if squeeze < 1 { cg.scaleBy(x: squeeze, y: 1) }
+            NSAttributedString(string: text, attributes: attrs).draw(at: p)
             cg.restoreGState()
             NSGraphicsContext.restoreGraphicsState()
         }
@@ -1480,7 +1517,9 @@ final class TerminalGlyphAtlas {
                     withBytes: data, bytesPerRow: cg.bytesPerRow)
 
         // Halo: draw far off-slot with the shadow offset back in, so only
-        // the blur lands in the texture.
+        // the blur lands in the texture. Offset and draw point live in the
+        // same (inset, squeezed) user space, so they cancel exactly and the
+        // halo stays registered with the glyph it belongs to.
         cg.clear(CGRect(x: 0, y: 0, width: CGFloat(w), height: CGFloat(h)))
         let shadow = NSShadow()
         shadow.shadowColor = .white
@@ -1494,10 +1533,30 @@ final class TerminalGlyphAtlas {
         }
 
         let s = Slot(uv: SIMD4(Float(shelfX), Float(shelfY), Float(w), Float(h)),
-                     isColor: isColor)
-        slots[ch] = s
+                     isColor: isColor, cells: cells)
+        slots[Key(ch: ch, cells: cells)] = s
         shelfX += w
         shelfH = max(shelfH, h)
         return s
+    }
+
+    /// True when CoreText resolves this text to a colour-glyph face (Apple
+    /// Color Emoji). Runs once per (character, width) at rasterization time —
+    /// never per frame.
+    private static func usesColorGlyphs(_ text: String, font: NSFont) -> Bool {
+        let attr = NSAttributedString(string: text, attributes: [.font: font])
+        guard let runs = CTLineGetGlyphRuns(CTLineCreateWithAttributedString(attr))
+                as? [CTRun] else { return false }
+        for run in runs {
+            let attrs = CTRunGetAttributes(run) as NSDictionary
+            // NSFont and CTFont are toll-free bridged; a conditional cast
+            // keeps a surprise attribute value from trapping the saver.
+            guard let runFont = attrs[kCTFontAttributeName as String] as? NSFont
+            else { continue }
+            if CTFontGetSymbolicTraits(runFont as CTFont).contains(.traitColorGlyphs) {
+                return true
+            }
+        }
+        return false
     }
 }
