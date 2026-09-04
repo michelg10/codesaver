@@ -2013,7 +2013,11 @@ public final class CodeSaverView: ScreenSaverView {
         // as the picture's opacity coming up, not as a wave writing it. If
         // the roll had already stopped (a coverless rest), the wave starts
         // at once.
-        let shownT = artShownSince.map { $0 - npTrackSince }
+        // No wave for a cover that was there at first sight — the saver
+        // starting with music already on, a track whose art was cached —
+        // the picture is simply shown. The wave is for a cover that lands
+        // after the panel has been waiting for it.
+        let shownT = artShownSince.map { $0 - npTrackSince }.flatMap { $0 > 0.05 ? $0 : nil }
         let revealAt: Double? = shownT.map { s in
             let wait = s < 12
                 ? (Self.artRoll - s.truncatingRemainder(dividingBy: Self.artRoll))
