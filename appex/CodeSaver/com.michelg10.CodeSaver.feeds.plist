@@ -4,7 +4,12 @@
      Keeps `CodeSaver --feeds` alive: the widget feed daemon that merges
      Claude Code hook state + bifrocate CoT spools + now-playing into
      widgets/feed.json in the app-group container. Cheap by construction
-     (1s tick over tiny files) and niced below interactive work. -->
+     (a 1s merge over tiny files, ~4% of a core) — and run at STANDARD
+     priority on purpose: as a Background/nice/low-I/O job it was starved
+     outright whenever normal-priority work saturated the machine (one
+     publish in 45 s at load 130), the feed went stale, and the saver
+     dropped every panel. The corpus refresh agent stays Background; this
+     one has a 20-second deadline to meet every second. -->
 <plist version="1.0">
 <dict>
 	<key>Label</key>
@@ -21,11 +26,7 @@
 	<key>KeepAlive</key>
 	<true/>
 	<key>ProcessType</key>
-	<string>Background</string>
-	<key>LowPriorityIO</key>
-	<true/>
-	<key>Nice</key>
-	<integer>10</integer>
+	<string>Standard</string>
 	<key>AssociatedBundleIdentifiers</key>
 	<array>
 		<string>com.michelg10.CodeSaver</string>

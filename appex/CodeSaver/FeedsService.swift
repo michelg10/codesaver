@@ -213,22 +213,39 @@ enum FeedsService {
         // poll that stalled the old serial loop. It can take as long as it
         // likes here.
         var pausedSince: Double?                     // wall time the player was first seen paused
+        var lastKnown: NowPlaying?                   // carried through polls that couldn't complete
         let nowPlaying = Publisher("nowplaying", every: 3.0) { () -> NowPlaying? in
-            // Paused music stays on the panel for half an hour — long
-            // enough to come back to, short enough that a player left
-            // paused overnight doesn't hold the corner all night. The
-            // clock starts at the first paused poll; only a resume or a
-            // stop resets it, so once it runs out the entry stays gone.
-            guard var np = pollNowPlaying() else { pausedSince = nil; return nil }
-            if np.state == "paused" {
-                let since = pausedSince ?? np.polledAt
-                pausedSince = since
-                if np.polledAt - since > 1800 { return nil }
-                np.pausedSince = since
-            } else {
+            switch pollNowPlaying() {
+            case .unknown:
+                // A poll that could not complete — osascript starved past its
+                // deadline under load, a spawn that failed — says nothing
+                // about the player. Treating it as "nothing playing" made
+                // the panel vanish for as long as the machine was busy. Keep
+                // what we knew, polledAt and all: the subscriber carries the
+                // position forward and lets go only after a minute and a
+                // half without a completed poll.
+                return lastKnown
+            case .idle:
                 pausedSince = nil
+                lastKnown = nil
+                return nil
+            case .player(var np):
+                // Paused music stays on the panel for half an hour — long
+                // enough to come back to, short enough that a player left
+                // paused overnight doesn't hold the corner all night. The
+                // clock starts at the first paused poll; only a resume or a
+                // stop resets it, so once it runs out the entry stays gone.
+                if np.state == "paused" {
+                    let since = pausedSince ?? np.polledAt
+                    pausedSince = since
+                    if np.polledAt - since > 1800 { lastKnown = nil; return nil }
+                    np.pausedSince = since
+                } else {
+                    pausedSince = nil
+                }
+                lastKnown = np
+                return np
             }
-            return np
         }
 
         // Album art subscribes to now-playing and publishes a FILE. On a
@@ -573,13 +590,12 @@ enum FeedsService {
         }
 
         var root: [String: Any] = ["updated": now, "sessions": sessions]
-        if let snap = nowPlaying, let np = snap.value,
-           now - snap.polledAt.timeIntervalSince1970 < 60 {
+        if let snap = nowPlaying, let np = snap.value, now - np.polledAt < 90 {
             // Carried to THIS second: the position runs forward while
             // playing (and holds while paused), and `ts` is now — so the
             // saver's freshness gate sees a live entry for as long as the
             // poll is recent. A slow poll ages the value; it doesn't blank
-            // the panel. Sixty seconds without a completed poll and the
+            // the panel. Ninety seconds without a completed poll and the
             // entry goes: by then nobody knows what the player is doing.
             var pos = np.position
             if np.state == "playing" {
@@ -605,36 +621,55 @@ enum FeedsService {
         ("com.spotify.client", "Spotify"),
     ]
 
+    /// What a poll of the players came back with. `.idle` is a definite
+    /// answer — no player running, or one that is stopped; `.unknown` is no
+    /// answer at all — a spawn that failed or a query that ran out its
+    /// deadline — and must not be mistaken for the former.
+    private enum NowPlayingPoll {
+        case player(NowPlaying)
+        case idle
+        case unknown
+    }
+
     /// Player-running check via pgrep: NSRunningApplication is a
     /// LaunchServices query and this daemon must never speak to LS at all
-    /// (its process shares the app bundle's identity).
-    private static func playerRunning(_ name: String) -> Bool {
+    /// (its process shares the app bundle's identity). nil when pgrep itself
+    /// could not answer (spawn failure, or an exit that isn't yes/no).
+    private static func playerRunning(_ name: String) -> Bool? {
         let t = Process()
         t.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
         t.arguments = ["-xq", name]
         t.standardOutput = FileHandle.nullDevice
         t.standardError = FileHandle.nullDevice
-        guard (try? t.run()) != nil else { return false }
+        guard (try? t.run()) != nil else { return nil }
         t.waitUntilExit()
-        return t.terminationStatus == 0
+        switch t.terminationStatus {
+        case 0: return true
+        case 1: return false
+        default: return nil
+        }
     }
 
-    private static func pollNowPlaying() -> NowPlaying? {
+    private static func pollNowPlaying() -> NowPlayingPoll {
+        var unknown = false
         for p in players {
-            guard playerRunning(p.name) else { continue }
+            switch playerRunning(p.name) {
+            case .some(true): break
+            case .some(false): continue
+            case .none: unknown = true; continue
+            }
             // One script, newline-joined fields; empty when stopped.
             // Executed via /usr/bin/osascript: the daemon must never
             // initialize the AppleEvents machinery in-process (it registers
             // an ASN that makes LaunchServices treat this process as the
             // running app). TCC attributes the child to CodeSaver anyway.
-            // Nothing waits on this poll, but it still shouldn't hang on
-            // a wedged player: `with timeout` caps the Apple-event wait
-            // (default 60s) and the process deadline below is the
-            // backstop for the one case that ignores it — an unanswered
-            // Automation prompt. A player that can't answer in time is
-            // treated as not playing until it can.
+            // Nothing waits on this poll, so it can afford to: the
+            // Apple-event timeout and the process deadline are generous —
+            // under load, just spawning osascript has been measured at
+            // 10–16 s — and a poll that still runs out is reported as
+            // unknown, not as silence.
             let src = """
-            with timeout of 3 seconds
+            with timeout of 8 seconds
                 tell application "\(p.name)"
                     if player state is playing or player state is paused then
                         -- `ps`, not `st`: Music's dictionary claims `st`.
@@ -657,13 +692,15 @@ enum FeedsService {
             // hands AppleScript a string it can't encode: better a panel with
             // one mangled character than no panel at all, which is what the
             // bare `String(data:encoding:)` nil did.
-            guard let data = runProcess("/usr/bin/osascript", ["-e", src], deadline: 5) else { continue }
+            guard let data = runProcess("/usr/bin/osascript", ["-e", src], deadline: 15) else {
+                unknown = true; continue
+            }
             let text = (String(data: data, encoding: .utf8)
                         ?? String(decoding: data, as: UTF8.self))
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { continue }
             let parts = text.components(separatedBy: "\n")
-            guard parts.count >= 5 else { continue }
+            guard parts.count >= 5 else { unknown = true; continue }
             // AppleScript numbers can arrive comma-decimal under some locales.
             func num(_ s: String) -> Double? { Double(s.replacingOccurrences(of: ",", with: ".")) }
             var dur = num(parts[4]) ?? 0
@@ -680,13 +717,13 @@ enum FeedsService {
             // the feed's title/artist derived from the SAME string: they are
             // compared for equality across two processes, so they must never
             // be normalised on only one side.
-            return NowPlaying(app: p.name, state: parts[0],
-                              title: parts[1].precomposedStringWithCanonicalMapping,
-                              artist: parts[2].precomposedStringWithCanonicalMapping,
-                              position: num(parts[3]) ?? 0, duration: dur,
-                              pausedSince: nil, polledAt: Date().timeIntervalSince1970)
+            return .player(NowPlaying(app: p.name, state: parts[0],
+                                      title: parts[1].precomposedStringWithCanonicalMapping,
+                                      artist: parts[2].precomposedStringWithCanonicalMapping,
+                                      position: num(parts[3]) ?? 0, duration: dur,
+                                      pausedSince: nil, polledAt: Date().timeIntervalSince1970))
         }
-        return nil
+        return unknown ? .unknown : .idle
     }
 
     // MARK: Album art
@@ -712,7 +749,17 @@ enum FeedsService {
         guard (try? t.run()) != nil else { return nil }
         var reaper: DispatchWorkItem?
         if let deadline {
-            let w = DispatchWorkItem { if t.isRunning { t.terminate() } }
+            // SIGTERM at the deadline; SIGKILL a beat later if it was
+            // ignored — a child blocked in an Apple-event wait can be — so
+            // the read below can never hang this thread for good.
+            let w = DispatchWorkItem {
+                guard t.isRunning else { return }
+                t.terminate()
+                let pid = t.processIdentifier
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1.5) {
+                    if t.isRunning { kill(pid, SIGKILL) }
+                }
+            }
             DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + deadline, execute: w)
             reaper = w
         }

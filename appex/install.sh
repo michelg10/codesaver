@@ -86,11 +86,20 @@ fi
 
 # The feeds daemon is KeepAlive: it survived the bundle swap above on the
 # unlinked inode, and re-registering an already-enabled agent never re-execs
-# it — so without a kick it keeps running the PREVIOUS build until logout.
+# it — nor does it reload the plist, so a changed ProcessType would never
+# take effect. Unregister + register loads the bundle's current plist and
+# starts the daemon on the new build; the kickstart is the fallback for a
+# job that was left loaded but not running.
 # (The refresh agent needs none: StartInterval re-execs it every hour.)
 FEEDS_LABEL="$(/usr/libexec/PlistBuddy -c 'Print :Label' \
   CodeSaver/com.michelg10.CodeSaver.feeds.plist 2>/dev/null || echo com.michelg10.CodeSaver.feeds)"
-if launchctl kickstart -k "gui/$(id -u)/$FEEDS_LABEL" 2>/dev/null; then
+if /Applications/CodeSaver.app/Contents/MacOS/CodeSaver --reregister-feeds 2>/dev/null; then
+  echo "── feeds daemon re-registered from the bundle's plist"
+fi
+sleep 1
+if launchctl print "gui/$(id -u)/$FEEDS_LABEL" 2>/dev/null | grep -q "state = running"; then
+  echo "── feeds daemon running on the new build"
+elif launchctl kickstart -k "gui/$(id -u)/$FEEDS_LABEL" 2>/dev/null; then
   echo "── restarted the feeds daemon on the new build"
 else
   echo "── feeds daemon not loaded yet (it starts with “Refresh automatically” / next login)"

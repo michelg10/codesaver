@@ -48,6 +48,17 @@ if args.contains("--refresh") {
     RunLoop.main.run()
 }
 
+// Called by install.sh when the feeds agent's plist has changed: registering
+// an already-enabled agent is a no-op and launchd keeps the job definition it
+// first loaded, so the only way a new ProcessType (or anything else in the
+// plist) takes effect is to unregister and register again.
+if args.contains("--reregister-feeds") {
+    FeedsAgent.unregister()
+    let s = FeedsAgent.register(interactive: false)
+    print("feeds agent: \(RefreshAgent.describe(s))")
+    exit(s == .enabled || s == .requiresApproval ? 0 : 1)
+}
+
 // Called by install.sh once the app is at its stable /Applications path.
 if args.contains("--register-agent") {
     let s1 = RefreshAgent.register(interactive: false)
