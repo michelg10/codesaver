@@ -3,7 +3,7 @@
 //  CodeSaver
 //
 //  The widget feed daemon: `CodeSaver --feeds`, kept alive by the
-//  com.michelg10.CodeSaver.feeds LaunchAgent. Merges three sources into
+//  com.michelg10.CodeSaver.feeds LaunchAgent. Merges four sources into
 //  one widgets/feed.json in the app-group container (the only place the
 //  sandboxed saver can read):
 //
@@ -15,11 +15,26 @@
 //       fine-grained thinking / toolcall-writing states and interrupt
 //       (`superseded`) markers, ~1s off the wire.
 //    3. Now playing — Music.app / Spotify via AppleScript, polled only
-//       while the player is actually running.
+//       while the player is actually running; a paused track is held for
+//       half an hour.
 //    4. ~/.bifrocate/pins.json + pins.state.json — bifrocate's pin daemon:
 //       which sessions are pinned (kept warm with keep-alive pings) and,
 //       per pin, what the daemon will do next. A pinned session stays on
 //       the rack while its pin lives, even past the hour.
+//
+//  Publish/subscribe. Each source is polled by its own PUBLISHER thread at
+//  its own cadence, and the result — an immutable snapshot, stamped with
+//  when the poll began — replaces that publisher's `latest` under a lock.
+//  The main thread is the one SUBSCRIBER: every second it reads whatever is
+//  latest from every publisher, merges, and writes feed.json. Nothing on
+//  its path can block: it spawns no process and writes no file but the
+//  feed. That is the point of the split. The daemon runs as a Background /
+//  Nice / LowPriorityIO LaunchAgent, and under load one osascript spawn on
+//  the old serial tick loop was measured stalling 10–16 s, holding every
+//  publish behind it; past 20 s the saver blanked the whole rack. Now a
+//  slow poll only ages its own value. Album art is a publisher too — one
+//  that subscribes to now-playing and publishes a file (albumart.json)
+//  rather than a snapshot.
 //
 //  The merge rule is recency: the freshest signal wins, except a
 //  PermissionRequest holds until any newer event for that session.
@@ -86,54 +101,145 @@ enum FeedsService {
         }
     }
 
+    // MARK: Publisher
+
+    /// One data source on its own thread. `poll` runs every `interval`
+    /// (measured from the start of the previous run) and its result becomes
+    /// `latest`, stamped with when that poll began. A poll that blocks — a
+    /// starved osascript spawn, a wedged player, throttled I/O — delays only
+    /// this publisher's next value; nobody waits on it, and a subscriber
+    /// reading `latest` gets the newest complete snapshot without ever
+    /// touching the source.
+    private final class Publisher<Value> {
+        struct Snapshot {
+            let value: Value
+            let polledAt: Date
+        }
+        private let lock = NSLock()
+        private var snapshot: Snapshot?
+
+        init(_ name: String, every interval: TimeInterval, _ poll: @escaping () -> Value) {
+            let thread = Thread { [self] in
+                while true {
+                    let started = Date()
+                    let value = poll()
+                    lock.lock()
+                    snapshot = Snapshot(value: value, polledAt: started)
+                    lock.unlock()
+                    Thread.sleep(forTimeInterval:
+                        max(0.05, interval - Date().timeIntervalSince(started)))
+                }
+            }
+            thread.name = "feeds.\(name)"
+            thread.qualityOfService = .utility
+            thread.start()
+        }
+
+        var latest: Snapshot? {
+            lock.lock(); defer { lock.unlock() }
+            return snapshot
+        }
+    }
+
+    // MARK: Snapshots
+
+    /// A session file, read and decoded — what the sessions publisher hands
+    /// the merge.
+    private struct HookRecord {
+        let sid: String
+        let h: HookState
+    }
+
+    /// bifrocate's pins: which sessions are pinned, what its daemon last
+    /// reported per pin, and whether that report is fresh (written at least
+    /// every 30 s while the daemon runs; older than 90 s means nobody is
+    /// pinging).
+    private struct PinsSnapshot {
+        var pins: [String: Any] = [:]
+        var entries: [String: Any] = [:]
+        var fresh = false
+    }
+
+    /// The player as last polled. `polledAt` is when the answer came back,
+    /// so the subscriber can carry a playing position forward to the second
+    /// it publishes.
+    private struct NowPlaying {
+        var app: String
+        var state: String            // playing | paused
+        var title: String
+        var artist: String
+        var position: Double
+        var duration: Double
+        var pausedSince: Double?
+        var polledAt: Double
+    }
+
     // MARK: Daemon
 
     static func runDaemon() -> Never {
-        var offsets: [String: UInt64] = [:]          // spool path -> bytes consumed
-        var spool: [String: SpoolState] = [:]        // session id -> spool view
-        var stateSince: [String: (String, Double)] = [:]   // session id -> (state, since)
-        var lastArtKey = ""                          // "app|title|artist" of last art run
-        var artBusy = false                          // single in-flight art job
-        var lastTuningMTime: Date?                   // widgets/albumart-tuning.json
-        var lastFeed = ""
-        var tick = 0
-        var nowPlaying: [String: Any]?
-        var pausedSince: Double?                     // wall time the player was first seen paused
-        var lastPrune = Date.distantPast
-
         if let dir = widgetsDir {
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         }
 
-        while true {
-            let started = Date()
-            if started.timeIntervalSince(lastPrune) > 3600 {
-                lastPrune = started
+        // Publishers. Each owns whatever its source needs across polls —
+        // captured here, touched only from its own thread.
+        var lastPrune = Date.distantPast
+        let sessions = Publisher("sessions", every: 1.0) { () -> [HookRecord] in
+            if Date().timeIntervalSince(lastPrune) > 3600 {
+                lastPrune = Date()
                 pruneSessionFiles()
             }
+            return readSessionFiles()
+        }
+
+        var offsets: [String: UInt64] = [:]          // spool path -> bytes consumed
+        var spool: [String: SpoolState] = [:]        // session id -> spool view
+        let spools = Publisher("spools", every: 1.0) { () -> [String: SpoolState] in
             tailSpools(offsets: &offsets, spool: &spool)
-            if tick % 3 == 0 {
-                // Paused music stays on the panel for half an hour — long
-                // enough to come back to, short enough that a player left
-                // paused overnight doesn't hold the corner all night. The
-                // clock starts at the first paused poll; only a resume or a
-                // stop resets it, so once it runs out the entry stays gone.
-                var np = pollNowPlaying()
-                if (np?["state"] as? String) == "paused" {
-                    let t = Date().timeIntervalSince1970
-                    let since = pausedSince ?? t
-                    pausedSince = since
-                    if t - since > 1800 { np = nil } else { np?["paused_since"] = since }
-                } else {
-                    pausedSince = nil
-                }
-                nowPlaying = np
+            return spool
+        }
+
+        var pinsCache = JSONCache()
+        var pinStateCache = JSONCache()
+        let pins = Publisher("pins", every: 1.0) { () -> PinsSnapshot in
+            let state = cachedJSON(pinStateURL, &pinStateCache)
+            return PinsSnapshot(
+                pins: (cachedJSON(pinsURL, &pinsCache)["pins"] as? [String: Any]) ?? [:],
+                entries: (state["sessions"] as? [String: Any]) ?? [:],
+                fresh: Date().timeIntervalSince1970 - ((state["updated_at"] as? Double) ?? 0) < 90)
+        }
+
+        // The one publisher that spawns processes (pgrep, osascript) — the
+        // poll that stalled the old serial loop. It can take as long as it
+        // likes here.
+        var pausedSince: Double?                     // wall time the player was first seen paused
+        let nowPlaying = Publisher("nowplaying", every: 3.0) { () -> NowPlaying? in
+            // Paused music stays on the panel for half an hour — long
+            // enough to come back to, short enough that a player left
+            // paused overnight doesn't hold the corner all night. The
+            // clock starts at the first paused poll; only a resume or a
+            // stop resets it, so once it runs out the entry stays gone.
+            guard var np = pollNowPlaying() else { pausedSince = nil; return nil }
+            if np.state == "paused" {
+                let since = pausedSince ?? np.polledAt
+                pausedSince = since
+                if np.polledAt - since > 1800 { return nil }
+                np.pausedSince = since
+            } else {
+                pausedSince = nil
             }
-            // Album art: on track change, extract + render on a worker
-            // thread (extraction ~1s, the render ~1s — never in a tick).
-            // A tuning edit re-renders the playing track: the tuning window
-            // saves, this notices within a tick, and the saver shows the new
-            // art — the whole point of keeping the knobs out of the binary.
+            return np
+        }
+
+        // Album art subscribes to now-playing and publishes a FILE. On a
+        // track change it extracts + renders (extraction ~1s, the render
+        // ~1s) right here, on a thread where that is fine. A tuning edit
+        // re-renders the playing track: the tuning window saves, this
+        // notices within a second, and the saver shows the new art — the
+        // whole point of keeping the knobs out of the binary.
+        var lastArtKey = ""                          // "app|title|artist" of last art run
+        var lastTuningMTime: Date?                   // widgets/albumart-tuning.json
+        _ = Publisher("albumart", every: 1.0) { () -> String in
             if let tu = AlbumArtTuning.url {
                 // Compare the OPTIONAL: a deleted tuning file means "back to
                 // defaults" and must re-render too, which a plain `if let`
@@ -145,20 +251,34 @@ enum FeedsService {
                     lastArtKey = ""
                 }
             }
-            if let np = nowPlaying,
-               let app = np["app"] as? String, let title = np["title"] as? String {
-                let key = "\(app)|\(title)|\(np["artist"] as? String ?? "")"
-                if key != lastArtKey && !artBusy {
-                    lastArtKey = key
-                    artBusy = true
-                    Thread.detachNewThread {
-                        refreshAlbumArt(app: app, key: key)
-                        artBusy = false
-                    }
-                }
+            guard let np = nowPlaying.latest?.value else { return lastArtKey }
+            let key = "\(np.app)|\(np.title)|\(np.artist)"
+            if key != lastArtKey {
+                lastArtKey = key
+                refreshAlbumArt(app: np.app, key: key)
             }
-            let feed = buildFeed(spool: spool, stateSince: &stateSince,
-                                 nowPlaying: nowPlaying)
+            return lastArtKey
+        }
+
+        // The subscriber: once a second, merge whatever is latest and write.
+        // Pure memory plus one small rename — never a spawn, never a wait on
+        // a source.
+        var stateSince: [String: (String, Double)] = [:]   // session id -> (state, since)
+        var lastFeed = ""
+        // Let the two local-file publishers land their first snapshot before
+        // the first publish, so a daemon bounce doesn't flash an empty rack
+        // for a second. Bounded: a stuck source must not hold the feed.
+        let ready = Date().addingTimeInterval(3)
+        while (sessions.latest == nil || spools.latest == nil), Date() < ready {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        while true {
+            let started = Date()
+            let feed = buildFeed(hooks: sessions.latest?.value ?? [],
+                                 spool: spools.latest?.value ?? [:],
+                                 pins: pins.latest?.value ?? PinsSnapshot(),
+                                 nowPlaying: nowPlaying.latest,
+                                 stateSince: &stateSince)
             if feed != lastFeed, let dir = widgetsDir {
                 let tmp = dir.appendingPathComponent(".feed.json.tmp")
                 let dst = dir.appendingPathComponent("feed.json")
@@ -173,9 +293,32 @@ enum FeedsService {
                     lastFeed = feed
                 }
             }
-            tick += 1
             Thread.sleep(forTimeInterval: max(0.2, 1.0 - Date().timeIntervalSince(started)))
         }
+    }
+
+    // MARK: Session files
+
+    /// Every session file that could still matter, decoded. Untouched for
+    /// 2h -> nothing inside can still be within the hour (every hook event
+    /// and the 5s statusline heartbeat rewrite the file), so skip the read +
+    /// decode: a stat is all a dead session costs per poll, and the
+    /// directory holds every session ever run.
+    private static func readSessionFiles() -> [HookRecord] {
+        let fm = FileManager.default
+        let names = (try? fm.contentsOfDirectory(atPath: hookDir.path)) ?? []
+        let untouched = Date().addingTimeInterval(-2 * 3600)
+        var out: [HookRecord] = []
+        for name in names where name.hasSuffix(".json") && !name.hasPrefix(".") {
+            let url = hookDir.appendingPathComponent(name)
+            if let m = (try? fm.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date,
+               m < untouched { continue }
+            guard let data = try? Data(contentsOf: url),
+                  let h = try? JSONDecoder().decode(HookState.self, from: data),
+                  let sid = h.session_id else { continue }
+            out.append(HookRecord(sid: sid, h: h))
+        }
+        return out
     }
 
     // MARK: Spool tailing
@@ -286,10 +429,8 @@ enum FeedsService {
 
     /// A decoded JSON object cached by mtime. Both pin files are tiny and
     /// rewritten rarely — pins.json on a toggle, pins.state.json on change or
-    /// every ~30s — so a stat per tick is all they cost.
+    /// every ~30s — so a stat per poll is all they cost.
     private struct JSONCache { var mtime: Date?; var obj: [String: Any] = [:] }
-    private static var pinsCache = JSONCache()
-    private static var pinStateCache = JSONCache()
 
     private static func cachedJSON(_ url: URL, _ cache: inout JSONCache) -> [String: Any] {
         let m = (try? FileManager.default.attributesOfItem(atPath: url.path))?[
@@ -305,34 +446,18 @@ enum FeedsService {
 
     // MARK: Merge + feed
 
-    private static func buildFeed(spool: [String: SpoolState],
-                                  stateSince: inout [String: (String, Double)],
-                                  nowPlaying: [String: Any]?) -> String {
-        let fm = FileManager.default
+    /// The subscriber's merge: the latest snapshot from every publisher into
+    /// the feed document. Nothing here touches a source.
+    private static func buildFeed(hooks: [HookRecord], spool: [String: SpoolState],
+                                  pins pinsSnap: PinsSnapshot,
+                                  nowPlaying: Publisher<NowPlaying?>.Snapshot?,
+                                  stateSince: inout [String: (String, Double)]) -> String {
         let now = Date().timeIntervalSince1970
         var sessions: [[String: Any]] = []
+        let pins = pinsSnap.pins, pinEntries = pinsSnap.entries, pinStateFresh = pinsSnap.fresh
 
-        // bifrocate's pins: desired state, and what its daemon last reported.
-        // The state file is written at least every 30s while the daemon
-        // runs; older than 90s means nobody is pinging.
-        let pins = (cachedJSON(pinsURL, &pinsCache)["pins"] as? [String: Any]) ?? [:]
-        let pinState = cachedJSON(pinStateURL, &pinStateCache)
-        let pinStateFresh = now - ((pinState["updated_at"] as? Double) ?? 0) < 90
-        let pinEntries = (pinState["sessions"] as? [String: Any]) ?? [:]
-
-        let names = (try? fm.contentsOfDirectory(atPath: hookDir.path)) ?? []
-        // Untouched for 2h -> nothing inside can still be within the hour
-        // (every hook event and the 5s statusline heartbeat rewrite the
-        // file), so skip the read + decode: a stat is all a dead session
-        // costs per tick, and the directory holds every session ever run.
-        let untouched = Date().addingTimeInterval(-2 * 3600)
-        for name in names where name.hasSuffix(".json") && !name.hasPrefix(".") {
-            let url = hookDir.appendingPathComponent(name)
-            if let m = (try? fm.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date,
-               m < untouched { continue }
-            guard let data = try? Data(contentsOf: url),
-                  let h = try? JSONDecoder().decode(HookState.self, from: data),
-                  let sid = h.session_id else { continue }
+        for rec in hooks {
+            let h = rec.h, sid = rec.sid
             if h.hook_state == "gone" { continue }
             // A dead CLI is a gone session whether or not SessionEnd ran:
             // a killed process or force-closed terminal never fires it,
@@ -444,7 +569,25 @@ enum FeedsService {
         }
 
         var root: [String: Any] = ["updated": now, "sessions": sessions]
-        if let nowPlaying { root["nowplaying"] = nowPlaying }
+        if let snap = nowPlaying, let np = snap.value,
+           now - snap.polledAt.timeIntervalSince1970 < 60 {
+            // Carried to THIS second: the position runs forward while
+            // playing (and holds while paused), and `ts` is now — so the
+            // saver's freshness gate sees a live entry for as long as the
+            // poll is recent. A slow poll ages the value; it doesn't blank
+            // the panel. Sixty seconds without a completed poll and the
+            // entry goes: by then nobody knows what the player is doing.
+            var pos = np.position
+            if np.state == "playing" {
+                pos += now - np.polledAt
+                if np.duration > 0 { pos = min(pos, np.duration) }
+            }
+            var o: [String: Any] = ["app": np.app, "state": np.state, "title": np.title,
+                                    "artist": np.artist, "position": pos,
+                                    "duration": np.duration, "ts": now]
+            if let ps = np.pausedSince { o["paused_since"] = ps }
+            root["nowplaying"] = o
+        }
         let opts: JSONSerialization.WritingOptions = [.sortedKeys]
         guard let data = try? JSONSerialization.data(withJSONObject: root, options: opts),
               let str = String(data: data, encoding: .utf8) else { return "{}" }
@@ -472,7 +615,7 @@ enum FeedsService {
         return t.terminationStatus == 0
     }
 
-    private static func pollNowPlaying() -> [String: Any]? {
+    private static func pollNowPlaying() -> NowPlaying? {
         for p in players {
             guard playerRunning(p.name) else { continue }
             // One script, newline-joined fields; empty when stopped.
@@ -480,8 +623,8 @@ enum FeedsService {
             // initialize the AppleEvents machinery in-process (it registers
             // an ASN that makes LaunchServices treat this process as the
             // running app). TCC attributes the child to CodeSaver anyway.
-            // This runs inside the 1s tick, so it must not wait on a
-            // wedged player: `with timeout` caps the Apple-event wait
+            // Nothing waits on this poll, but it still shouldn't hang on
+            // a wedged player: `with timeout` caps the Apple-event wait
             // (default 60s) and the process deadline below is the
             // backstop for the one case that ignores it — an unanswered
             // Automation prompt. A player that can't answer in time is
@@ -517,9 +660,9 @@ enum FeedsService {
             // seconds. Music returns seconds for both. The feed carries
             // seconds — the saver clocks the progress bar against it.
             if p.name == "Spotify" { dur /= 1000 }
-            return ["app": p.name, "state": parts[0], "title": parts[1], "artist": parts[2],
-                    "position": num(parts[3]) ?? 0, "duration": dur,
-                    "ts": Date().timeIntervalSince1970]
+            return NowPlaying(app: p.name, state: parts[0], title: parts[1], artist: parts[2],
+                              position: num(parts[3]) ?? 0, duration: dur,
+                              pausedSince: nil, polledAt: Date().timeIntervalSince1970)
         }
         return nil
     }
@@ -531,7 +674,7 @@ enum FeedsService {
     /// (2,500+ pipes) until Process.run() itself started failing, silently,
     /// because that path guards with try?. That lesson is law in this file.
     /// A `deadline` kills the child (SIGTERM) after that many seconds, for
-    /// callers that cannot afford to block — the tick.
+    /// callers that shouldn't hang on a wedged player.
     private static func runProcess(_ path: String, _ args: [String],
                                    deadline: TimeInterval? = nil) -> Data? {
         let t = Process()
