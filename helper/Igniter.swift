@@ -259,8 +259,16 @@ func captureDisplays(completion: @escaping ([CGDirectDisplayID: CGImage], String
                 group.leave()
             }
             if #available(macOS 15.2, *) {
-                SCScreenshotManager.captureImage(in: CGDisplayBounds(display.displayID)) {
-                    image, _ in store(image)
+                let balance = rectCaptureLeaks(on: display.displayID)
+                SCScreenshotManager.captureImage(in: CGDisplayBounds(display.displayID)) { image, _ in
+                    // macOS 26.6: this form's completion block hands the CGImage
+                    // over at +1 and never releases it, so every capture leaks a
+                    // full-display IOSurface — charged to WindowServer, not to us.
+                    // Balance it, but only when the probe below has seen the leak
+                    // on this OS, so a fixed OS can't be over-released. Full story
+                    // at "captureImage(in:) leak probe".
+                    if balance, let image { Unmanaged.passUnretained(image).release() }
+                    store(image)
                 }
             } else {
                 let config = SCStreamConfiguration()
@@ -280,6 +288,96 @@ func captureDisplays(completion: @escaping ([CGDirectDisplayID: CGImage], String
                 : nil)
         }
     }
+}
+
+
+// MARK: - captureImage(in:) leak probe
+//
+// Found 2026-09-05 on macOS 26.6.2 (25G83), chasing "WindowServer uses 16 GB":
+//
+//   • WindowServer's footprint was 13 GB of "Owned physical footprint
+//     (unmapped)": 435 IOSurfaces named "SL.205:CaptureSurface", 3456x2234
+//     BGRA, 29.5 MiB each — one per rect-form capture this agent had taken in
+//     three days. WindowServer creates every ScreenCaptureKit screenshot
+//     surface and stays its memory-ledger owner, so a client that leaks
+//     screenshots inflates WindowServer while its own footprint sits at
+//     ~5 MB. Restarting this agent dropped WindowServer to 2.8 GB instantly.
+//     (The hundreds of "Packages Display N Shield" windows people blame are a
+//     separate, byte-sized leak — five per display sleep — a red herring.)
+//   • `leaks` on a 30-line reproducer: the CGImage is a ROOT LEAK, retain
+//     count 1, no referrers, owning CGDataProvider → IOSurface. Disassembly of
+//     __60+[SCScreenshotManager captureImageInRect:completionHandler:]_block_invoke:
+//     bl SLSDisplayCreateImage (SkyLight, returns +1) → mov x1, x0 → tear
+//     down the frame → braa into the completion handler. A tail call: nothing
+//     runs after the handler, so nothing can release. The nil-handler path
+//     returns without releasing either.
+//   • dtrace on every retain/release of that pointer: SkyLight balances its
+//     own array bookkeeping and returns +1 correctly; the Swift handler
+//     thunk's retain/release pair is balanced; nobody touches it afterwards.
+//     The filter form (captureImageWithFilter:configuration: — an XPC round
+//     trip to replayd, composited from each window's own surface, hence no
+//     shadows) calls CFRelease right after its handler returns. Two unrelated
+//     implementations; only the rect one — the shadowed one we want — has the
+//     bug.
+//   • Reported to Apple via Feedback Assistant (reproducer, evidence and the
+//     analysis above in ~/Desktop/FB-SCK-leak).
+//
+// So the fix on our side is exactly one release — the +1 the block owes —
+// done from inside the handler. It is gated by a runtime probe rather than an
+// OS-version check: the day Apple adds the missing release, an unconditional
+// extra one would be an over-release and a crash. The probe costs one capture
+// and, on an affected OS, one leaked surface per process lifetime.
+
+/// Mapped IOSurface regions >= 8 MB in this process — a leaked rect capture is
+/// one full-display surface, so a probe capture that leaks shows up as +1 here.
+/// Plain Mach VM introspection of our own task; no privileges needed.
+private func bigIOSurfaceRegionCount() -> Int {
+    var addr: mach_vm_address_t = 0
+    var n = 0
+    while true {
+        var size: mach_vm_size_t = 0
+        var depth: UInt32 = 0
+        var info = vm_region_submap_info_data_64_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<vm_region_submap_info_data_64_t>.size / MemoryLayout<Int32>.size)
+        let kr = withUnsafeMutablePointer(to: &info) { p in
+            p.withMemoryRebound(to: Int32.self, capacity: Int(count)) {
+                mach_vm_region_recurse(mach_task_self_, &addr, &size, &depth, $0, &count)
+            }
+        }
+        if kr != KERN_SUCCESS { break }
+        if info.user_tag == UInt32(VM_MEMORY_IOSURFACE), size >= 8 * 1024 * 1024 { n += 1 }
+        addr += size
+    }
+    return n
+}
+
+private var rectCaptureLeakVerdict: Bool?
+
+/// Does SCScreenshotManager.captureImage(in:) leak its image on this OS?
+/// Probed once per process: one capture, released at once, then check whether
+/// a full-display IOSurface mapping stuck around. Costs one capture (~50 ms)
+/// and, on an affected OS, one leaked surface for the life of the process.
+/// An inconclusive probe (no image — lock screen, no permission) is retried
+/// on the next call rather than cached.
+@available(macOS 15.2, *)
+private func rectCaptureLeaks(on display: CGDirectDisplayID) -> Bool {
+    if let known = rectCaptureLeakVerdict { return known }
+    let before = bigIOSurfaceRegionCount()
+    let sem = DispatchSemaphore(value: 0)
+    var got = false
+    autoreleasepool {
+        SCScreenshotManager.captureImage(in: CGDisplayBounds(display)) { image, _ in
+            got = image != nil
+            sem.signal()
+        }
+        sem.wait()
+    }
+    guard got else { return false }
+    let leaks = bigIOSurfaceRegionCount() > before
+    rectCaptureLeakVerdict = leaks
+    igniterLog("captureImage(in:) leak probe: \(leaks ? "leaks on this OS — balancing releases enabled" : "clean")")
+    return leaks
 }
 
 /// Both places the sandboxed appex and the unsandboxed harness can read.
