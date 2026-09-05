@@ -1429,7 +1429,22 @@ final class TerminalGlyphAtlas {
     private var shelfX = 0
     private var shelfY = 0
     private var shelfH = 0
-    private static let size = 2048
+    /// The atlas is a vector of glyphs: it starts small and DOUBLES when the
+    /// working set outgrows it — a one-time hitch (a CPU round trip of the
+    /// rows in use) instead of the old wholesale reset, which overwrote
+    /// slots that instances already emitted this frame still pointed at
+    /// and, for a working set larger than the atlas, did so every frame.
+    /// Growth keeps every slot valid: the shader reads slots by pixel
+    /// coordinate, top-left anchored, so nothing is remapped. Capped at
+    /// 8192² (256 MB per texture, glyph + halo) — past that the reset
+    /// remains as the last resort. CODESAVER_ATLAS_SIZE sets the starting
+    /// size, which is how the growth path is exercised in the harness.
+    private(set) var size: Int = {
+        if let v = ProcessInfo.processInfo.environment["CODESAVER_ATLAS_SIZE"].flatMap(Int.init),
+           v >= 64, v <= 8192 { return v }
+        return 2048
+    }()
+    private static let maxSize = 8192
 
     init(device: MTLDevice, fontBase: CGFloat, charW: CGFloat, lineH: CGFloat,
          scale: CGFloat) {
@@ -1453,31 +1468,68 @@ final class TerminalGlyphAtlas {
 
     private func ensureTextures() -> Bool {
         if texture == nil {
-            let d = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat: .bgra8Unorm, width: Self.size, height: Self.size,
-                mipmapped: false)
-            d.usage = .shaderRead
-            texture = device.makeTexture(descriptor: d)
-            haloTexture = device.makeTexture(descriptor: d)
+            texture = makeAtlasTexture(size)
+            haloTexture = makeAtlasTexture(size)
         }
         return texture != nil && haloTexture != nil
     }
 
+    private func makeAtlasTexture(_ px: Int) -> MTLTexture? {
+        let d = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm, width: px, height: px, mipmapped: false)
+        d.usage = .shaderRead
+        return device.makeTexture(descriptor: d)
+    }
+
+    /// Double the atlas, carrying the rows in use across. The shelf cursor
+    /// and every slot stay as they are — coordinates are absolute pixels
+    /// from the top-left — so packing simply continues into the new room.
+    private func grow() -> Bool {
+        let newSize = min(Self.maxSize, size * 2)
+        guard newSize > size, let tex = texture, let halo = haloTexture,
+              let nt = makeAtlasTexture(newSize), let nh = makeAtlasTexture(newSize) else { return false }
+        let used = min(size, shelfY + shelfH)
+        if used > 0 {
+            var buf = [UInt8](repeating: 0, count: size * used * 4)
+            for (src, dst) in [(tex, nt), (halo, nh)] {
+                buf.withUnsafeMutableBytes { raw in
+                    src.getBytes(raw.baseAddress!, bytesPerRow: size * 4,
+                                 from: MTLRegionMake2D(0, 0, size, used), mipmapLevel: 0)
+                    dst.replace(region: MTLRegionMake2D(0, 0, size, used), mipmapLevel: 0,
+                                withBytes: raw.baseAddress!, bytesPerRow: size * 4)
+                }
+            }
+        }
+        BoomDiag.log("glyph atlas grew \(size) → \(newSize) px (\(slots.count) glyphs carried)")
+        texture = nt
+        haloTexture = nh
+        size = newSize
+        return true
+    }
+
     private func rasterize(_ ch: Character, cells: Int) -> Slot? {
-        guard ensureTextures(), let tex = texture, let halo = haloTexture else { return nil }
+        guard ensureTextures() else { return nil }
         let w = max(1, Int(ceil(cellW * CGFloat(cells) * scale)))
         let h = max(1, Int(ceil(lineH * scale)))
-        if shelfX + w > Self.size {
+        if shelfX + w > size {
             shelfY += shelfH
             shelfX = 0
             shelfH = 0
         }
-        if shelfY + h > Self.size {
+        if shelfY + h > size, !grow() {
+            // Only past the cap: the wholesale reset, with its one glitchy
+            // frame (and its per-frame thrash if the working set is really
+            // that large — at 8192² that means more than ~40k wide glyphs).
             slots.removeAll()
             shelfX = 0
             shelfY = 0
             shelfH = 0
         }
+        // Bind the textures AFTER the shelf logic: a growth above swaps them,
+        // and a glyph written into the handles taken before it lands in the
+        // abandoned atlas — one missing glyph per growth, exactly the cells
+        // that differed when the harness started the atlas at 128 px.
+        guard let tex = texture, let halo = haloTexture else { return nil }
         guard let cg = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8,
                                  bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
                                  bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
