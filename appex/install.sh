@@ -61,20 +61,34 @@ rm -rf "$APP" "$(dirname "$APP")/CodeSaverExtension.appex"
 # selection makes the saver launch as pure black — so retry with the
 # registration nudged in between.
 if [[ ${NO_ACTIVATE:-0} != 1 ]]; then
+  # Wait for pluginkit to actually list the /Applications appex — under load
+  # registration can take well over the old 2 s — re-adding it each round.
+  APPEX=/Applications/CodeSaver.app/Contents/PlugIns/CodeSaverExtension.appex
+  for attempt in $(seq 1 10); do
+    pluginkit -m -v -i com.michelg10.CodeSaver.Extension 2>/dev/null | grep -q "^.*/Applications/CodeSaver.app" && break
+    pluginkit -a "$APPEX" 2>/dev/null || true
+    sleep 1.5
+  done
+  pluginkit -m -v -i com.michelg10.CodeSaver.Extension 2>/dev/null | grep -q "/Applications/CodeSaver.app" \
+    || echo "── WARNING: pluginkit does not list the installed appex yet"
   ACTIVATED=0
-  for attempt in 1 2 3; do
+  for attempt in 1 2 3 4 5; do
     if /Applications/CodeSaver.app/Contents/MacOS/CodeSaver --activate 2>/dev/null; then
       ACTIVATED=1
       break
     fi
-    pluginkit -a /Applications/CodeSaver.app/Contents/PlugIns/CodeSaverExtension.appex 2>/dev/null || true
+    pluginkit -a "$APPEX" 2>/dev/null || true
     sleep 2
   done
   if [[ $ACTIVATED == 1 ]]; then
     echo "── re-activated as the current screensaver"
   else
-    echo "── auto-activation failed — click “Enable as Screensaver” in the app"
-    echo "   (until then the system saver selection is unbound and shows BLACK)"
+    # Loud, and fatal: an unbound selection means macOS quietly shows one of
+    # its own savers instead. This is not a warning to scroll past.
+    echo "!! AUTO-ACTIVATION FAILED — the system screensaver selection is now unbound."
+    echo "!! Run: /Applications/CodeSaver.app/Contents/MacOS/CodeSaver --activate"
+    echo "!! or click “Enable as Screensaver” in the app."
+    exit 1
   fi
 fi
 
