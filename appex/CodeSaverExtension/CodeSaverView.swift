@@ -1542,6 +1542,10 @@ public final class CodeSaverView: ScreenSaverView {
     private var npTrackKey = ""
     private var npTrackSince: Double = 0
     private var artShownSince: Double?
+    /// Whether the track on the panel replaced an earlier one in this saver
+    /// session. The first track the saver sees is shown as it is; a change
+    /// always earns the wave, even when title and cover land in one frame.
+    private var npTrackChanged = false
     /// Pause/play as the panel last saw it, and when it changed — the dimming
     /// wave's clock. nil until the first sight, which is never animated.
     private var npPauseKnown: Bool?
@@ -2013,11 +2017,15 @@ public final class CodeSaverView: ScreenSaverView {
         // as the picture's opacity coming up, not as a wave writing it. If
         // the roll had already stopped (a coverless rest), the wave starts
         // at once.
-        // No wave for a cover that was there at first sight — the saver
-        // starting with music already on, a track whose art was cached —
-        // the picture is simply shown. The wave is for a cover that lands
-        // after the panel has been waiting for it.
-        let shownT = artShownSince.map { $0 - npTrackSince }.flatMap { $0 > 0.05 ? $0 : nil }
+        // No wave for the first track the saver sees when its cover is
+        // already there — the saver starting with music on — the picture is
+        // simply shown. Every later track change earns the wave, even when
+        // title and cover land in the same frame: the daemon publishes them
+        // about a second apart and the saver polls the feed once a second,
+        // so "cover present at first sight" is the COMMON case for a change,
+        // not a sign that nothing happened.
+        let shownT = artShownSince.map { $0 - npTrackSince }
+            .flatMap { $0 > 0.05 || npTrackChanged ? $0 : nil }
         let revealAt: Double? = shownT.map { s in
             let wait = s < 12
                 ? (Self.artRoll - s.truncatingRemainder(dividingBy: Self.artRoll))
@@ -2751,6 +2759,7 @@ public final class CodeSaverView: ScreenSaverView {
         // clock and forgets the reveal, so the next cover lands with its own.
         let key = "\(app)|\(title0)|\(artist0)"
         if key != npTrackKey {
+            npTrackChanged = !npTrackKey.isEmpty
             npTrackKey = key
             npTrackSince = now
             artShownSince = nil
