@@ -242,51 +242,69 @@ func captureDisplays(completion: @escaping ([CGDirectDisplayID: CGImage], String
             DispatchQueue.main.async { completion([:], why) }
             return
         }
-        // An empty display list is what the lock screen looks like — not an
-        // error, and `captureImage` is never even called.
-        let why = content.displays.isEmpty ? "shareable content lists no displays" : nil
-        var result: [CGDirectDisplayID: CGImage] = [:]
-        let lock = NSLock()
-        let group = DispatchGroup()
-        for display in content.displays {
-            group.enter()
-            let store: (CGImage?) -> Void = { image in
-                if let image {
-                    lock.lock()
-                    result[display.displayID] = image
-                    lock.unlock()
-                }
-                group.leave()
-            }
-            if #available(macOS 15.2, *) {
-                let balance = rectCaptureLeaks(on: display.displayID)
-                SCScreenshotManager.captureImage(in: CGDisplayBounds(display.displayID)) { image, _ in
-                    // macOS 26.6: this form's completion block hands the CGImage
-                    // over at +1 and never releases it, so every capture leaks a
-                    // full-display IOSurface — charged to WindowServer, not to us.
-                    // Balance it, but only when the probe below has seen the leak
-                    // on this OS, so a fixed OS can't be over-released. Full story
-                    // at "captureImage(in:) leak probe".
-                    if balance, let image { Unmanaged.passUnretained(image).release() }
-                    store(image)
-                }
-            } else {
-                let config = SCStreamConfiguration()
-                let mode = CGDisplayCopyDisplayMode(display.displayID)
-                config.width = mode.map(\.pixelWidth) ?? display.width
-                config.height = mode.map(\.pixelHeight) ?? display.height
-                config.showsCursor = false
-                SCScreenshotManager.captureImage(
-                    contentFilter: SCContentFilter(display: display, excludingWindows: []),
-                    configuration: config
-                ) { image, _ in store(image) }
-            }
+        // This handler arrives on ScreenCaptureKit's replayd XPC queue
+        // (com.apple.NSXPCConnection.m-user.com.apple.replayd), and the rect
+        // capture below needs that same queue to deliver. Anything that blocks
+        // it — the leak probe's semaphore did — makes captureImage(in:) give
+        // up after ~5 s with a nil image and no error, which read as "probe
+        // inconclusive, retry next time" forever: two days of unbalanced
+        // captures (46 leaked surfaces) with the fix "installed". So the
+        // captures run off this queue. Verified 2026-09-07 with a standalone
+        // test: same probe, 5.09 s → nil on the callback queue, 0.13 s → image
+        // (+1 leaked region) from a global queue.
+        DispatchQueue.global(qos: .userInitiated).async {
+            captureListedDisplays(content, completion: completion)
         }
-        group.notify(queue: .main) {
-            completion(result, result.isEmpty
-                ? (why ?? "\(content.displays.count) display(s) listed, every capture came back nil")
-                : nil)
+    }
+}
+
+/// The per-display half of `captureDisplays`, on a queue of our own.
+private func captureListedDisplays(_ content: SCShareableContent,
+                                   completion: @escaping ([CGDirectDisplayID: CGImage], String?) -> Void) {
+    // An empty display list is what the lock screen looks like — not an
+    // error, and `captureImage` is never even called.
+    let why = content.displays.isEmpty ? "shareable content lists no displays" : nil
+    var result: [CGDirectDisplayID: CGImage] = [:]
+    let lock = NSLock()
+    let group = DispatchGroup()
+    for display in content.displays {
+        group.enter()
+        let store: (CGImage?) -> Void = { image in
+            if let image {
+                lock.lock()
+                result[display.displayID] = image
+                lock.unlock()
+            }
+            group.leave()
         }
+        if #available(macOS 15.2, *) {
+            let balance = rectCaptureLeaks(on: display.displayID)
+            SCScreenshotManager.captureImage(in: CGDisplayBounds(display.displayID)) { image, _ in
+                // macOS 26.6: this form's completion block hands the CGImage
+                // over at +1 and never releases it, so every capture leaks a
+                // full-display IOSurface — charged to WindowServer, not to us.
+                // Balance it, but only when the probe below has seen the leak
+                // on this OS, so a fixed OS can't be over-released. Full story
+                // at "captureImage(in:) leak probe".
+                if balance, let image { Unmanaged.passUnretained(image).release() }
+                store(image)
+            }
+        } else {
+            let config = SCStreamConfiguration()
+            let mode = CGDisplayCopyDisplayMode(display.displayID)
+            config.width = mode.map(\.pixelWidth) ?? display.width
+            config.height = mode.map(\.pixelHeight) ?? display.height
+            config.showsCursor = false
+            SCScreenshotManager.captureImage(
+                contentFilter: SCContentFilter(display: display, excludingWindows: []),
+                configuration: config
+            ) { image, _ in store(image) }
+        }
+    }
+    group.notify(queue: .main) {
+        completion(result, result.isEmpty
+            ? (why ?? "\(content.displays.count) display(s) listed, every capture came back nil")
+            : nil)
     }
 }
 
@@ -327,6 +345,12 @@ func captureDisplays(completion: @escaping ([CGDirectDisplayID: CGImage], String
 // OS-version check: the day Apple adds the missing release, an unconditional
 // extra one would be an over-release and a crash. The probe costs one capture
 // and, on an affected OS, one leaked surface per process lifetime.
+//
+// The probe waits on a semaphore, so it must not run on ScreenCaptureKit's own
+// callback queue: the rect capture is delivered through that queue and, when
+// it is blocked, comes back nil (no error) after ~5 s — an "inconclusive"
+// probe every time. `captureDisplays` hops to a global queue before calling
+// it; keep it that way.
 
 /// Mapped IOSurface regions >= 8 MB in this process — a leaked rect capture is
 /// one full-display surface, so a probe capture that leaks shows up as +1 here.
