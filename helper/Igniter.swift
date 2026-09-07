@@ -18,12 +18,13 @@ import ScreenCaptureKit
 //     corner-kind manifest and detonates immediately, no countdown.
 //   • Custom corner (config app → cornerTL/TR/BL/BR in this agent's defaults
 //     domain; bit 0 armed, bits 1–4 required ⌘/⌥/⌃/⇧): CodeSaver's OWN
-//     trigger. On a true corner hit — with the required modifiers held —
-//     the agent captures (or rides a just-taken approach capture) and then
-//     starts the saver itself via ScreenSaverEngine — capture strictly
-//     precedes launch, so the boom's desktop can never be stale. Meant to
-//     replace the macOS hot corner entirely (turn macOS's off; it would
-//     race this one).
+//     trigger, with macOS's grammar — hold the modifier FIRST, then drive
+//     the cursor into the corner (CornerGesture). On a hit the agent
+//     captures (or rides a just-taken approach capture) and then starts
+//     the saver itself via ScreenSaverEngine — capture strictly precedes
+//     launch, so the boom's desktop can never be stale. Meant to replace
+//     the macOS hot corner entirely (turn macOS's off; it would race this
+//     one).
 //
 //   codesaver-igniter                 watcher mode (what the LaunchAgent runs)
 //   codesaver-igniter --capture       capture + write manifest once, then exit
@@ -193,6 +194,70 @@ func customCorners(_ defaults: UserDefaults?) -> [CustomCorner] {
 /// Modifiers currently held — HID state, no permissions required.
 func heldModifiers() -> CGEventFlags {
     CGEventSource.flagsState(.combinedSessionState)
+}
+
+/// The hot-corner recognizer, with the grammar macOS's own hot corners
+/// use: hold the modifier FIRST, then drive the cursor into the corner.
+/// Fed one sample at a time (cursor, modifiers held right now, armed
+/// corners); answers with at most one event, and a hit at most once per
+/// visit — the cursor has to leave by `rearm` before the next.
+///
+/// The accident this rules out: the cursor already rests in or beside a
+/// corner (the Apple menu, the clock, a close box) and the hand reaches for
+/// ⌘ — ⌘Tab, ⌘Q, ⌘C. Contact and modifier both hold, and a recognizer that
+/// only asks "chord down while the cursor is in the corner?" fires. macOS
+/// never does, because it reads the modifier off the mouse-moved event that
+/// ENTERS the corner: a key pressed while the cursor rests is not a move.
+/// So the chord's press is placed. A chord that lands with the cursor
+/// already within `vicinity` of the corner is not the start of a gesture;
+/// that corner stays cold until the cursor has left the vicinity (the
+/// modifier may stay held — going out and coming back in is the gesture)
+/// or the chord is released. A corner bound without modifiers ("instant")
+/// has no chord to place and fires on contact as it always did.
+struct CornerGesture {
+    /// Contact: the cursor is pinned in the corner (the edges clamp it there).
+    static let contact: CGFloat = 5
+    /// A chord pressed with the cursor this close to the corner is no gesture.
+    static let vicinity: CGFloat = 70
+    /// One shot per visit: the cursor must leave by this much to re-arm.
+    static let rearm: CGFloat = 100
+
+    enum Event {
+        case hit(CustomCorner)
+        /// The corner's chord went down `distance` points from it — ignored.
+        case vetoed(CustomCorner, distance: CGFloat)
+    }
+
+    private var armed = true
+    /// The nearest corner's chord was held at the previous sample.
+    private var chordHeld = false
+    /// The chord landed inside the vicinity: cold until it lifts or the
+    /// cursor leaves.
+    private var vetoed = false
+
+    mutating func sample(mouse: CGPoint, held: CGEventFlags,
+                         corners: [CustomCorner]) -> Event? {
+        guard let nearest = corners
+            .map({ ($0, hypot($0.point.x - mouse.x, $0.point.y - mouse.y)) })
+            .min(by: { $0.1 < $1.1 })
+        else {
+            self = CornerGesture()
+            return nil
+        }
+        let (corner, distance) = nearest
+        let chord = held.contains(corner.flags)
+        let pressed = chord && !chordHeld
+        chordHeld = chord
+        if distance > Self.rearm { armed = true }
+        if !chord || distance >= Self.vicinity { vetoed = false }
+        if pressed, !corner.flags.isEmpty, distance < Self.vicinity {
+            vetoed = true
+            return .vetoed(corner, distance: distance)
+        }
+        guard armed, chord, !vetoed, distance < Self.contact else { return nil }
+        armed = false
+        return .hit(corner)
+    }
 }
 
 /// True while a screensaver is on screen — the capture scout must never
@@ -555,9 +620,9 @@ final class Igniter {
     private var corners: [CGPoint] = []
     private var custom: [CustomCorner] = []
     private var cornersReadAt = Date.distantPast
-    /// One shot per corner visit: fires on entry, re-arms only after the
-    /// cursor has properly left (>100 px from every armed corner).
-    private var cornerArmed = true
+    private var gesture = CornerGesture()
+    /// The recognizer's own clock; runs only while a custom corner is armed.
+    private var gestureTimer: Timer?
     private var lastLaunch = Date.distantPast
     private var pendingLaunch = false
     private var saverWasRunning = false
@@ -638,6 +703,7 @@ final class Igniter {
             corners = saverHotCorners()
             custom = customCorners(defaults)
             cornersReadAt = Date()
+            pollGesture(!custom.isEmpty)
         }
         let m = mouseCG()
 
@@ -657,26 +723,41 @@ final class Igniter {
                 capture(kind: "corner")
             }
         }
+    }
 
-        // Custom-corner HIT — CodeSaver's own trigger, replacing the macOS
-        // hot corner. Requires the corner's modifiers held at the moment of
-        // contact.
-        if !custom.isEmpty {
-            let nearest = custom.map { hypot($0.point.x - m.x, $0.point.y - m.y) }
-                .min() ?? .infinity
-            if nearest > 100 { cornerArmed = true }
-            if cornerArmed, Date().timeIntervalSince(lastLaunch) > 3 {
-                let held = heldModifiers()
-                let hit = custom.contains {
-                    hypot($0.point.x - m.x, $0.point.y - m.y) < 5
-                        && held.contains($0.flags)
-                }
-                if hit {
-                    cornerArmed = false
-                    lastLaunch = Date()
-                    triggerSaver(kind: "corner")
-                }
+    /// Custom-corner HIT — CodeSaver's own trigger, replacing the macOS hot
+    /// corner — runs on its own clock, not the scout's. The grammar rests
+    /// on ORDER: the chord must be seen down before the cursor arrives, and
+    /// at 5 Hz a flick from the vicinity into the corner fits inside one
+    /// tick, so a ⌘ pressed with the cursor at rest in the corner and a ⌘
+    /// held on the way in look the same. Cursor and modifier state are
+    /// shared-memory reads (well under a microsecond each), so 50 Hz costs
+    /// nothing and places the press within a few points of where it
+    /// happened — and a real hit answers in 20 ms instead of 200.
+    private func pollGesture(_ on: Bool) {
+        if on, gestureTimer == nil {
+            let t = Timer.scheduledTimer(withTimeInterval: 0.02, repeats: true) { [weak self] _ in
+                self?.gestureTick()
             }
+            t.tolerance = 0.005
+            gestureTimer = t
+        } else if !on, let t = gestureTimer {
+            t.invalidate()
+            gestureTimer = nil
+            gesture = CornerGesture()
+        }
+    }
+
+    private func gestureTick() {
+        switch gesture.sample(mouse: mouseCG(), held: heldModifiers(), corners: custom) {
+        case .hit?:
+            guard Date().timeIntervalSince(lastLaunch) > 3 else { return }
+            lastLaunch = Date()
+            triggerSaver(kind: "corner")
+        case .vetoed(_, let distance)?:
+            igniterLog(String(format: "corner ignored: modifier pressed with the cursor already %.0f pt from it (hold the modifier first, then enter)", distance))
+        case nil:
+            break
         }
     }
 
