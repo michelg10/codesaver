@@ -2485,31 +2485,34 @@ public final class CodeSaverView: ScreenSaverView {
         return out
     }
 
-    /// Terminal-style marquee: hold, walk one glyph at a time, hold at the
-    /// far end, snap back. Featured-artist credits routinely run past any
-    /// sane panel width, and clipping them drops the collaborators entirely.
+    /// Terminal-style marquee: rest at the head, then one continuous lap —
+    /// the text walks out on the left and, after a gap of blank cells, comes
+    /// back in on the right — then rest again. Featured-artist credits
+    /// routinely run past any sane panel width, and clipping them drops the
+    /// collaborators entirely. The earlier walk-to-the-end-and-snap-back read
+    /// as a stutter; Michel tuned this in build/marquee-tuner (2026-09-07).
+    /// The clock is the track's own, so a new track starts at rest instead of
+    /// somewhere mid-lap.
     private func marqueeText(_ text: String, width: Int) -> String {
         let chars = Array(text)
         let cells = chars.map { widgetGlyph($0).cells }
         let total = cells.reduce(0, +)
         guard width > 0, total > width else { return text }
-        // Walk one glyph at a time until the remainder fits the field — a
-        // wide glyph is one step like any other, it just frees two cells.
-        var over = 0, rest = total
-        while over < chars.count, rest > width { rest -= cells[over]; over += 1 }
-        let glyph = 0.19            // seconds per glyph — 0.34 read as a crawl on a long title
-        let hold = 1.8              // pause at each end
-        let cycle = hold * 2 + Double(over) * glyph
-        let t = now.truncatingRemainder(dividingBy: cycle)
-        let off: Int
-        if t < hold { off = 0 }
-        else if t < hold + Double(over) * glyph { off = Int((t - hold) / glyph) }
-        else { off = over }
-        let start = min(over, max(0, off))
+        let glyph = 0.13            // seconds per glyph
+        let hold = 4.0              // rest at the head before each lap
+        let gap = 7                 // blank cells between the tail and the head again
+        // The ring is the text followed by the gap; a lap walks every glyph
+        // of it once — a wide glyph is one step like any other.
+        let ring = chars + Array(repeating: Character(" "), count: gap)
+        let ringCells = cells + Array(repeating: 1, count: gap)
+        let cycle = hold + Double(ring.count) * glyph
+        let t = (now - npTrackSince).truncatingRemainder(dividingBy: cycle)
+        let off = t < hold ? 0 : min(ring.count - 1, Int((t - hold) / glyph))
         var used = 0, out = ""
-        for k in start..<chars.count {
-            if used + cells[k] > width { break }
-            used += cells[k]; out.append(chars[k])
+        for k in 0..<ring.count {
+            let i = (off + k) % ring.count
+            if used + ringCells[i] > width { break }
+            used += ringCells[i]; out.append(ring[i])
         }
         return out
     }
