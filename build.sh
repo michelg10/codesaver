@@ -21,7 +21,7 @@ swiftc -O -parse-as-library -module-name CodeSaverPreview \
   appex/CodeSaver/AlbumArtRamp.swift \
   Sources/PreviewMain.swift \
   -framework ScreenSaver -framework AppKit -framework QuartzCore -framework Metal \
-  -framework ScreenCaptureKit -framework ImageIO \
+  -framework ScreenCaptureKit -framework ImageIO -framework IOKit \
   -o build/preview
 echo "── built build/preview  (run it for a live window)"
 

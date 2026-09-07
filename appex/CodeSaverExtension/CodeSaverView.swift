@@ -1,5 +1,6 @@
 import AppKit
 import ImageIO
+import IOKit.ps
 import ScreenSaver
 import QuartzCore
 import os.log
@@ -1229,6 +1230,7 @@ public final class CodeSaverView: ScreenSaverView {
         // wiped cells like the clock; the feed was parsed while armed.
         buildWidgetQuads(&frame, metal: metal, scale: scale)
         if clockVisible { buildClockQuad(&frame, metal: metal) }
+        buildBatteryQuad(&frame, metal: metal, scale: scale)
         buildPanelQuads(&frame, metal: metal, scale: scale)
     }
 
@@ -1450,6 +1452,249 @@ public final class CodeSaverView: ScreenSaverView {
         frame.quads.append(.init(key: "clock", rect: cache.blitRect,
                                  maskToWipedCells: intro == .boom))
         clockBottom = cache.bottom
+    }
+
+
+    // MARK: - Battery meter (top right, on the clock's rail line)
+    //
+    // A light-box panel of the session / now-playing family — same grid
+    // (`font`, `charW`, `lineH`), same rounded backdrop, same rails — set on
+    // the clock's top rail and on the now-playing panel's right edge, so the
+    // two labelled rails read as one line across the top of the screen. The
+    // gauge inside is twenty character cells of `#` over `-` between
+    // brackets: five percent a cell, quantised, ASCII. Not a drawn bar; not
+    // a solid block run either, which at this size stops reading as type.
+    //
+    // Every state speaks in the TUI vocabulary: the estimate breaks the
+    // bottom rail the way `session N tokens` does, charging reverse-videos
+    // the fill's leading cell and blinks it at 0.5 Hz on whole seconds, and
+    // ≤10% reverse-videos the percentage (steady — a screensaver should not
+    // flash at you). No battery at all (a desktop) shows nothing.
+
+    private struct BatteryReading {
+        var pct: Int        // 0…100
+        var ac: Bool
+        var charging: Bool
+        var mins: Int       // to empty / to full; -1 = still calculating
+    }
+
+    /// CODESAVER_BATTERY="pct=54 src=battery charging=0 mins=252" replaces the
+    /// IOKit read entirely — the snapshot harness renders every state through
+    /// it. pct=-1 is "no battery present", and the widget stays away.
+    private static let batteryOverride: BatteryReading? = {
+        guard let spec = ProcessInfo.processInfo.environment["CODESAVER_BATTERY"] else { return nil }
+        var kv: [String: String] = [:]
+        for field in spec.split(whereSeparator: { $0 == " " || $0 == "," }) {
+            let p = field.split(separator: "=", maxSplits: 1)
+            if p.count == 2 { kv[String(p[0])] = String(p[1]) }
+        }
+        return BatteryReading(pct: kv["pct"].flatMap { Int($0) } ?? -1,
+                              ac: kv["src"] != "battery",
+                              charging: kv["charging"] == "1",
+                              mins: kv["mins"].flatMap { Int($0) } ?? -1)
+    }()
+
+    private var batteryReading: BatteryReading?
+    private var batteryPolledAt: Double = -1
+
+    /// Live override for the preview harness's battery knobs: while enabled,
+    /// these replace the IOKit read (and the env override) so every state
+    /// can be dialled in by hand. Doubles because the harness's knobs are
+    /// sliders. present < 0.5 = no battery (a desktop); mins < 0.5 = unknown.
+    public var batteryDebugEnabled = false
+    public var batteryDebugPresent: Double = 1
+    public var batteryDebugPct: Double = 54
+    public var batteryDebugAC: Double = 0
+    public var batteryDebugCharging: Double = 0
+    public var batteryDebugMins: Double = 252
+
+    /// One power-source read a second, wall-clock stamped — never per frame.
+    /// (The frame path only ever asks for the cached value.)
+    private func currentBattery(wall: Double) -> BatteryReading? {
+        if batteryDebugEnabled {
+            guard batteryDebugPresent >= 0.5 else { return nil }
+            return BatteryReading(pct: min(100, max(0, Int(batteryDebugPct.rounded()))),
+                                  ac: batteryDebugAC >= 0.5,
+                                  charging: batteryDebugCharging >= 0.5,
+                                  mins: batteryDebugMins < 0.5 ? -1 : Int(batteryDebugMins.rounded()))
+        }
+        if let o = Self.batteryOverride { return o.pct >= 0 ? o : nil }
+        if batteryPolledAt < 0 || wall - batteryPolledAt >= 1 {
+            batteryPolledAt = wall
+            batteryReading = Self.readPowerSource()
+        }
+        return batteryReading
+    }
+
+    /// The internal battery only: a UPS or a Bluetooth mouse is also a power
+    /// source, and neither is what the top right corner is claiming to show.
+    private static func readPowerSource() -> BatteryReading? {
+        guard let blob = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+              let list = IOPSCopyPowerSourcesList(blob)?.takeRetainedValue() as? [CFTypeRef]
+        else { return nil }
+        for source in list {
+            guard let d = IOPSGetPowerSourceDescription(blob, source)?
+                .takeUnretainedValue() as? [String: Any] else { continue }
+            guard (d[kIOPSTypeKey] as? String) == kIOPSInternalBatteryType,
+                  let cur = d[kIOPSCurrentCapacityKey] as? Int,
+                  let cap = d[kIOPSMaxCapacityKey] as? Int, cap > 0 else { continue }
+            // "Charged" wins over "charging": at 100% on the mains macOS
+            // leaves IsCharging true for a while, and a leading edge blinking
+            // on a full bar is a lie.
+            let charged = (d[kIOPSIsChargedKey] as? Bool) ?? false
+            let charging = ((d[kIOPSIsChargingKey] as? Bool) ?? false) && !charged
+            let ac = (d[kIOPSPowerSourceStateKey] as? String) == kIOPSACPowerValue
+            let mins = (charging ? d[kIOPSTimeToFullChargeKey]
+                                 : d[kIOPSTimeToEmptyKey]) as? Int ?? -1
+            let pct = Int((Double(cur) / Double(cap) * 100).rounded())
+            return BatteryReading(pct: min(100, max(0, pct)), ac: ac,
+                                  charging: charging, mins: mins)
+        }
+        return nil
+    }
+
+    /// What breaks the bottom rail: an estimate when there is one, the power
+    /// source when there isn't. "still calculating" is not worth a word of
+    /// its own — the rail simply says where the current is coming from.
+    /// Split like `session 86.1k tokens`: the figure carries the weight, the
+    /// words rest at the label grey.
+    private func batteryRailLabel(_ b: BatteryReading) -> (figure: String, words: String) {
+        func span(_ m: Int) -> String { m >= 60 ? "\(m / 60)h \(m % 60)m" : "\(m)m" }
+        if b.charging { return b.mins > 0 ? (span(b.mins), " to full") : ("", "charging") }
+        if b.ac { return ("", b.pct >= 95 ? "charged \u{2219} on AC" : "on AC") }
+        return b.mins > 0 ? (span(b.mins), " left") : ("", "on battery")
+    }
+
+    // Content changes once a second at most (the poll, or the charge blink),
+    // so the whole build sits behind a content key and the per-frame cost is
+    // one blit — the clock's arrangement, at a twentieth of its size.
+    private struct BatteryCache {
+        let key: String
+        let image: CGImage
+        let blitRect: NSRect
+    }
+    private var batteryCache: BatteryCache?
+
+    /// Ink centre of a box-drawing rule below the top of a drawn line, so a
+    /// rail set in one size can be laid on a rail set in another.
+    private func railDrop(_ f: NSFont) -> CGFloat { f.pointSize * 0.67 }
+
+    private func buildBatteryQuad(_ frame: inout BoomMetalRenderer.FrameInput,
+                                  metal: BoomMetalRenderer, scale: CGFloat) {
+        guard !Self.widgetsDisabled, let base = font else { return }
+        guard let b = currentBattery(wall: Date().timeIntervalSince1970) else { return }
+        let label = batteryRailLabel(b)
+        // Quantised to whole seconds of the same clock the saver animates on:
+        // one second lit, one second dark, never a fade. The epsilon is the
+        // 1/30 accumulation drift PreviewMain warns about — without it a
+        // frame asked for at exactly t=3s lands in the previous second.
+        let lit = b.charging && Int((now + 1e-6).rounded(.down)) % 2 == 0
+        let key = "\(b.pct)|\(b.ac)|\(b.charging)|\(label.figure)|\(label.words)|\(lit)|" +
+            "\(Int(bounds.width))x\(Int(bounds.height))|\(scale)|\(base.pointSize)|\(clockTopFrac)"
+        if batteryCache?.key != key {
+            batteryCache = buildBatteryCache(key: key, b, label: label, lit: lit, scale: scale)
+        }
+        guard let cache = batteryCache else { return }
+        metal.setUITexture("battery", image: cache.image)   // ≤1 Hz re-upload
+        frame.quads.append(.init(key: "battery", rect: cache.blitRect,
+                                 maskToWipedCells: intro == .boom))
+    }
+
+    private func buildBatteryCache(key: String, _ b: BatteryReading,
+                                   label: (figure: String, words: String),
+                                   lit: Bool, scale: CGFloat) -> BatteryCache? {
+        guard let base = font else { return nil }
+        let cells = 20                       // one cell = five percent
+        // Every row is exactly this many cells:
+        //   │ + sp + [ + bar + ] + sp + 5-cell value + sp + │
+        let rowW = cells + 12
+        let fillCh = "#", emptyCh = "-"
+
+        let railC = NSColor(white: 0.26, alpha: 1)
+        let labelC = NSColor(deviceRed: 0.31, green: 0.35, blue: 0.39, alpha: 1)   // the clock's date grey
+        let valueC = NSColor(deviceRed: 0.43, green: 0.48, blue: 0.53, alpha: 1)
+        let fillC = NSColor(white: 0.46, alpha: 1)
+        let emptyC = NSColor(white: 0.18, alpha: 1)
+        let edgeC = NSColor(white: 0.62, alpha: 1)      // reverse-video field
+        let holeC = NSColor(white: 0.04, alpha: 1)      // the glyph punched out of it
+        func run(_ s: String, _ c: NSColor, on bg: NSColor? = nil) -> NSAttributedString {
+            var a: [NSAttributedString.Key: Any] = [.font: base, .foregroundColor: c]
+            if let bg { a[.backgroundColor] = bg }
+            return NSAttributedString(string: s, attributes: a)
+        }
+
+        // ── ╭─ /* battery */ ────╮ — the clock's comment style, because this
+        // box shares the clock's line; the light rails keep it panel family.
+        let head = "/* battery */"
+        let top = NSMutableAttributedString()
+        top.append(run("\u{256D}\u{2500} ", railC))
+        top.append(run(head, labelC))
+        top.append(run(" " + String(repeating: "\u{2500}", count: max(0, rowW - 5 - head.count))
+                       + "\u{256E}", railC))
+
+        // ── │ [##########----------]  54% │
+        // At least one cell of fill while there is any charge at all: an
+        // empty bracket is what "no battery" would look like.
+        var k = Int((Double(b.pct) / 100 * Double(cells)).rounded())
+        if b.pct > 0 { k = max(1, k) }
+        k = min(cells, k)
+        let mid = NSMutableAttributedString()
+        mid.append(run("\u{2502} [", railC))
+        if b.charging {
+            // The leading edge: the last filled cell (or the first empty one
+            // at zero), reverse video on the lit second.
+            let lead = max(0, k - 1)
+            mid.append(run(String(repeating: fillCh, count: lead), fillC))
+            let edge = k > 0 ? fillCh : emptyCh
+            mid.append(lit ? run(edge, holeC, on: edgeC) : run(edge, k > 0 ? fillC : emptyC))
+            mid.append(run(String(repeating: fillCh, count: max(0, k - lead - 1)), fillC))
+            mid.append(run(String(repeating: emptyCh, count: cells - max(k, lead + 1)), emptyC))
+        } else {
+            mid.append(run(String(repeating: fillCh, count: k), fillC))
+            mid.append(run(String(repeating: emptyCh, count: cells - k), emptyC))
+        }
+        mid.append(run("] ", railC))
+        // Five cells of value field, right aligned; ≤10% turns it inside out.
+        let value = "\(b.pct)%"
+        if b.pct <= 10 && !b.ac {
+            mid.append(run(String(repeating: " ", count: max(0, 3 - value.count)), valueC))
+            mid.append(run(" " + value + " ", holeC, on: valueC))
+        } else {
+            mid.append(run(String(repeating: " ", count: max(0, 5 - value.count)) + value, valueC))
+        }
+        mid.append(run(" \u{2502}", railC))
+
+        // ── ╰──────── 4h 12m left ─╯
+        let bot = NSMutableAttributedString()
+        let labelLen = label.figure.count + label.words.count
+        bot.append(run("\u{2570}" + String(repeating: "\u{2500}",
+                                           count: max(0, rowW - 5 - labelLen)) + " ", railC))
+        bot.append(run(label.figure, valueC))
+        bot.append(run(label.words, labelC))
+        bot.append(run(" \u{2500}\u{256F}", railC))
+
+        let rows = [top, mid, bot]
+        let pad: CGFloat = 6
+        let width = rows.reduce(CGFloat(0)) { max($0, $1.size().width) }
+        let size = NSSize(width: width + pad * 2, height: lineH * CGFloat(rows.count) + pad * 2)
+        guard let img = rasterUI(size: size, scale: scale, {
+            NSColor.black.withAlphaComponent(0.87).setFill()
+            NSBezierPath(roundedRect: NSRect(origin: .zero, size: size),
+                         xRadius: 3, yRadius: 3).fill()
+            for (i, row) in rows.enumerated() {
+                row.draw(at: NSPoint(x: pad, y: pad + CGFloat(i) * lineH))
+            }
+        }) else { return nil }
+
+        // Right edge: the now-playing panel's, to the pixel. Top: the clock's
+        // top rail — matched on the RULE's ink, not on the line box, or two
+        // rails set fourteen points apart in size would sit visibly astray.
+        let x = bounds.width - leftInset - CGFloat(rowW + 1) * charW - 12
+        let clockRail = bounds.height * clockTopFrac
+            + railDrop(monoFont(bounds.height * clockScale, .regular))
+        let y = clockRail - railDrop(base) - pad
+        return BatteryCache(key: key, image: img,
+                            blitRect: NSRect(x: x, y: y, width: size.width, height: size.height))
     }
 
     // MARK: - Widget panels (live Claude Code sessions + now playing)

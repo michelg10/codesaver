@@ -110,9 +110,32 @@ struct PreviewMain {
     static func runWindow() {
         let app = NSApplication.shared
         app.setActivationPolicy(.regular)
+        // A menu bar, so ⌘Q always quits (an app without a Quit item has no
+        // ⌘Q at all) and ⌘H hides the saver windows.
         tuner = Tuner()
+        let menubar = NSMenu()
+        let appItem = NSMenuItem(); menubar.addItem(appItem)
+        let appMenu = NSMenu()
+        let hide = NSMenuItem(title: "Hide saver windows", action: #selector(Tuner.hideScreensMenu(_:)),
+                              keyEquivalent: "h")
+        hide.target = tuner
+        appMenu.addItem(hide)
+        appMenu.addItem(withTitle: "Quit preview", action: #selector(NSApplication.terminate(_:)),
+                        keyEquivalent: "q")
+        appItem.submenu = appMenu
+        app.mainMenu = menubar
         tuner?.show()
         app.activate(ignoringOtherApps: true)
+        // Activation is cooperative: launched from a parent that isn't
+        // frontmost, the first request is often refused and every keystroke
+        // (esc included) keeps going to whatever was in front — under a
+        // window that covers the screen. Keep asking for a few seconds.
+        for delay in [0.3, 0.8, 1.5, 3.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                app.activate(ignoringOtherApps: true)
+                tuner?.focusPanel()
+            }
+        }
         app.run()
     }
 
@@ -190,12 +213,41 @@ struct Knob {
 struct KnobSection {
     let title: String
     let knobs: [Knob]
+    /// One-click states: each sets several knobs at once (key → value).
+    var presets: [(String, [String: Double])] = []
 }
 
 enum Knobs {
     /// Origin and arm length aren't view properties — the previewer owns them
     /// and feeds them to previewReset — so they live in the transport row.
     static let sections: [KnobSection] = [
+        KnobSection(title: "Battery widget (gauge) — presets, then dial", knobs: [
+            Knob(label: "override (0 = live IOKit)", key: "batteryDebugEnabled", min: 0, max: 1, integer: true,
+                 get: { $0.batteryDebugEnabled ? 1 : 0 }, set: { $0.batteryDebugEnabled = $1 >= 0.5 }),
+            Knob(label: "present (0 = desktop)", key: "batteryDebugPresent", min: 0, max: 1, integer: true,
+                 get: { $0.batteryDebugPresent }, set: { $0.batteryDebugPresent = $1.rounded() }),
+            Knob(label: "percent", key: "batteryDebugPct", min: 0, max: 100, integer: true,
+                 get: { $0.batteryDebugPct }, set: { $0.batteryDebugPct = $1.rounded() }),
+            Knob(label: "on AC", key: "batteryDebugAC", min: 0, max: 1, integer: true,
+                 get: { $0.batteryDebugAC }, set: { $0.batteryDebugAC = $1.rounded() }),
+            Knob(label: "charging", key: "batteryDebugCharging", min: 0, max: 1, integer: true,
+                 get: { $0.batteryDebugCharging }, set: { $0.batteryDebugCharging = $1.rounded() }),
+            Knob(label: "minutes (0 = unknown)", key: "batteryDebugMins", min: 0, max: 600, integer: true,
+                 get: { $0.batteryDebugMins }, set: { $0.batteryDebugMins = $1.rounded() }),
+        ], presets: [
+            ("live IOKit", ["batteryDebugEnabled": 0]),
+            ("on battery", ["batteryDebugEnabled": 1, "batteryDebugPresent": 1, "batteryDebugPct": 54,
+                            "batteryDebugAC": 0, "batteryDebugCharging": 0, "batteryDebugMins": 252]),
+            ("charging",   ["batteryDebugEnabled": 1, "batteryDebugPresent": 1, "batteryDebugPct": 78,
+                            "batteryDebugAC": 1, "batteryDebugCharging": 1, "batteryDebugMins": 41]),
+            ("low",        ["batteryDebugEnabled": 1, "batteryDebugPresent": 1, "batteryDebugPct": 9,
+                            "batteryDebugAC": 0, "batteryDebugCharging": 0, "batteryDebugMins": 17]),
+            ("full on AC", ["batteryDebugEnabled": 1, "batteryDebugPresent": 1, "batteryDebugPct": 100,
+                            "batteryDebugAC": 1, "batteryDebugCharging": 0, "batteryDebugMins": 0]),
+            ("unknown",    ["batteryDebugEnabled": 1, "batteryDebugPresent": 1, "batteryDebugPct": 54,
+                            "batteryDebugAC": 0, "batteryDebugCharging": 0, "batteryDebugMins": 0]),
+            ("desktop",    ["batteryDebugEnabled": 1, "batteryDebugPresent": 0]),
+        ]),
         KnobSection(title: "Boom — choreography (replays)", knobs: [
             Knob(label: "front 1 sweep (s)", key: "boomWave1", min: 0.4, max: 4.0, cost: .sim,
                  get: { $0.boomWave1 }, set: { $0.boomWave1 = $1 }),
@@ -404,7 +456,7 @@ final class Tuner: NSObject {
         let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: Self.panelW, height: h),
                         styleMask: [.titled, .closable, .utilityWindow, .resizable],
                         backing: .buffered, defer: false)
-        p.title = "CodeSaver — scrub & tune"
+        p.title = "CodeSaver — scrub & tune   (esc or ⌘Q quits · h hides)"
         p.isFloatingPanel = true
         p.hidesOnDeactivate = false
         p.becomesKeyOnlyIfNeeded = false
@@ -546,7 +598,10 @@ final class Tuner: NSObject {
 
         let rowH: CGFloat = 30, headH: CGFloat = 28
         var docH: CGFloat = 12
-        for s in Knobs.sections { docH += headH + CGFloat(s.knobs.count) * rowH + 8 }
+        func presetRows(_ s: KnobSection) -> Int { (s.presets.count + 3) / 4 }
+        for s in Knobs.sections {
+            docH += headH + CGFloat(s.knobs.count + presetRows(s)) * rowH + 8
+        }
         let doc = NSView(frame: NSRect(x: 0, y: 0, width: width - 16, height: docH))
 
         var y = docH - 12
@@ -555,6 +610,20 @@ final class Tuner: NSObject {
             let h = mono(section.title, x: 12, y: y + 6, w: width - 40, size: 10, bold: true)
             h.textColor = NSColor(calibratedRed: 0.72, green: 0.66, blue: 1.0, alpha: 1)
             doc.addSubview(h)
+            // Preset buttons, four to a row, above the section's sliders.
+            for (row, chunk) in stride(from: 0, to: section.presets.count, by: 4)
+                .map({ Array(section.presets[$0..<min($0 + 4, section.presets.count)]) }).enumerated() {
+                y -= rowH
+                let bw = (width - 40 - 3 * 4) / 4
+                for (i, (title, preset)) in chunk.enumerated() {
+                    let b = button(title, x: 12 + CGFloat(i) * (bw + 4), y: y + 3, w: bw) {
+                        [weak self] in self?.applyPreset(preset)
+                    }
+                    b.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+                    doc.addSubview(b)
+                }
+                _ = row
+            }
             for knob in section.knobs {
                 y -= rowH
                 doc.addSubview(mono(knob.label, x: 12, y: y + 4, w: 168, size: 10))
@@ -814,6 +883,13 @@ final class Tuner: NSObject {
         rebuild()
     }
 
+    /// Pull focus to the panel so esc / h / space land here.
+    func focusPanel() {
+        panel?.makeKeyAndOrderFront(nil)
+    }
+
+    @objc func hideScreensMenu(_ sender: Any?) { toggleScreens() }
+
     private func toggleScreens() {
         screensVisible.toggle()
         screensButton.title = screensVisible ? "Hide" : "Show"
@@ -830,6 +906,18 @@ final class Tuner: NSObject {
             values[knob.key]?.stringValue = fmt(knob, d)
         }
         rebuild()
+        dump()
+    }
+
+    /// A preset sets several knobs at once and repaints; the sliders follow.
+    private func applyPreset(_ preset: [String: Double]) {
+        for (key, value) in preset {
+            guard let knob = Knobs.all.first(where: { $0.key == key }) else { continue }
+            for v in views { knob.set(v, value) }
+            sliders[key]?.doubleValue = value
+            values[key]?.stringValue = fmt(knob, value)
+        }
+        for v in views { v.previewRepaint() }
         dump()
     }
 
@@ -1027,6 +1115,9 @@ private final class ScreenHost: NSView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func mouseDown(with event: NSEvent) {
+        // Any click on the saver pulls focus here, so esc works right after.
+        NSApp.activate(ignoringOtherApps: true)
+        PreviewMain.tuner?.focusPanel()
         // Into the saver's own space first: it's flipped, so this is already
         // x-from-left / y-from-top, which is what CG global coords want.
         let p = saver.convert(event.locationInWindow, from: nil)
