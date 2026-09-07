@@ -36,6 +36,17 @@
 //  that subscribes to now-playing and publishes a file (albumart.json)
 //  rather than a snapshot.
 //
+//  Every loop here is a thread that never returns, and on such a thread
+//  the autorelease pool Foundation opens at entry drains at exit — never.
+//  So each poll and each publish runs inside a pool of its own. A
+//  contentsOfDirectory, an attributesOfItem, a Data(contentsOf:), the NSURL
+//  behind every appendingPathComponent — each hands back an autoreleased
+//  object, and without a pool per iteration every one of them stayed
+//  pending for the life of the daemon: 130 spool files stat'd once a second
+//  is ~460 objects a second, and after two days the six threads held 94
+//  million of them — 20 GB, nearly all of it in the compressor. A loop
+//  that runs forever drains its own pool. Law, like the pipe fds below.
+//
 //  The merge rule is recency: the freshest signal wins, except a
 //  PermissionRequest holds until any newer event for that session.
 //  Host app target only.
@@ -121,13 +132,18 @@ enum FeedsService {
         init(_ name: String, every interval: TimeInterval, _ poll: @escaping () -> Value) {
             let thread = Thread { [self] in
                 while true {
-                    let started = Date()
-                    let value = poll()
-                    lock.lock()
-                    snapshot = Snapshot(value: value, polledAt: started)
-                    lock.unlock()
-                    Thread.sleep(forTimeInterval:
-                        max(0.05, interval - Date().timeIntervalSince(started)))
+                    // One pool per poll: everything the poll autoreleased
+                    // goes when the pool does, not when the thread does —
+                    // which is never (see the header).
+                    autoreleasepool {
+                        let started = Date()
+                        let value = poll()
+                        lock.lock()
+                        snapshot = Snapshot(value: value, polledAt: started)
+                        lock.unlock()
+                        Thread.sleep(forTimeInterval:
+                            max(0.05, interval - Date().timeIntervalSince(started)))
+                    }
                 }
             }
             thread.name = "feeds.\(name)"
@@ -289,28 +305,32 @@ enum FeedsService {
         while (sessions.latest == nil || spools.latest == nil), Date() < ready {
             Thread.sleep(forTimeInterval: 0.05)
         }
+        // The main thread has no run loop to drain a pool for it either:
+        // one pool per tick, same as the publishers.
         while true {
-            let started = Date()
-            let feed = buildFeed(hooks: sessions.latest?.value ?? [],
-                                 spool: spools.latest?.value ?? [:],
-                                 pins: pins.latest?.value ?? PinsSnapshot(),
-                                 nowPlaying: nowPlaying.latest,
-                                 stateSince: &stateSince)
-            if feed != lastFeed, let dir = widgetsDir {
-                let tmp = dir.appendingPathComponent(".feed.json.tmp")
-                let dst = dir.appendingPathComponent("feed.json")
-                // rename(2) over the old file. A remove-then-move left a
-                // window in which feed.json did not exist, and the saver's
-                // 1Hz poll landing there installed an empty feed — every
-                // panel blank for a second. `updated` bumps each tick, so
-                // this republishes every second and the window was hit a
-                // few times a night.
-                if let data = feed.data(using: .utf8), (try? data.write(to: tmp)) != nil,
-                   (try? CorpusStore.replaceFile(at: dst, with: tmp)) != nil {
-                    lastFeed = feed
+            autoreleasepool {
+                let started = Date()
+                let feed = buildFeed(hooks: sessions.latest?.value ?? [],
+                                     spool: spools.latest?.value ?? [:],
+                                     pins: pins.latest?.value ?? PinsSnapshot(),
+                                     nowPlaying: nowPlaying.latest,
+                                     stateSince: &stateSince)
+                if feed != lastFeed, let dir = widgetsDir {
+                    let tmp = dir.appendingPathComponent(".feed.json.tmp")
+                    let dst = dir.appendingPathComponent("feed.json")
+                    // rename(2) over the old file. A remove-then-move left a
+                    // window in which feed.json did not exist, and the
+                    // saver's 1Hz poll landing there installed an empty feed
+                    // — every panel blank for a second. `updated` bumps each
+                    // tick, so this republishes every second and the window
+                    // was hit a few times a night.
+                    if let data = feed.data(using: .utf8), (try? data.write(to: tmp)) != nil,
+                       (try? CorpusStore.replaceFile(at: dst, with: tmp)) != nil {
+                        lastFeed = feed
+                    }
                 }
+                Thread.sleep(forTimeInterval: max(0.2, 1.0 - Date().timeIntervalSince(started)))
             }
-            Thread.sleep(forTimeInterval: max(0.2, 1.0 - Date().timeIntervalSince(started)))
         }
     }
 
