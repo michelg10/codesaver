@@ -29,6 +29,7 @@ CodeSaver fills the screen with code sampled from your own GitHub repos, typed o
 - macOS 14 (Sonoma) or later — the screensaver is a modern ExtensionKit `.appex`
 - Xcode 15+
 - A GitHub token for fetching your repos: one click imports it from an authenticated [`gh`](https://cli.github.com) CLI, or paste a PAT with repo read access
+- For the live session widgets only: [Claude Code](https://claude.com/claude-code) and a `python3` (the stock `/usr/bin/python3` is enough — the hook is stdlib-only)
 
 ## Build & install
 
@@ -36,9 +37,10 @@ CodeSaver fills the screen with code sampled from your own GitHub repos, typed o
 ./appex/install.sh                # build, sign, install to /Applications
 open /Applications/CodeSaver.app  # the app walks you through the rest
 ./build.sh && ./helper/install.sh # optional: the ignition LaunchAgent
+python3 feeds/wire-settings.py    # optional: live Claude Code session widgets
 ```
 
-`install.sh` auto-detects your Apple Development team from the keychain (`TEAM_ID=…` overrides; a free Apple ID via Xcode → Accounts works) — no other configuration exists outside the app. Everything after the build is the app's job: the window is a three-step checklist — enable the screensaver, connect GitHub, switch on auto-refresh. A prebuilt `CodeSaver.app` needs no repo at all: drag it into /Applications, open it, same three steps.
+`install.sh` auto-detects your Apple Development team from the keychain (`TEAM_ID=…` overrides; a free Apple ID via Xcode → Accounts works) — no other configuration exists outside the app. Everything after the build is the app's job: the window is a three-step checklist — enable the screensaver, connect GitHub, switch on auto-refresh (that toggle registers both LaunchAgents: the corpus refresher and the widget feed daemon described below). A prebuilt `CodeSaver.app` needs no repo at all: drag it into /Applications, open it, same three steps. The saver works without a corpus (it types a small built-in sample until the first refresh lands) and without any of the optional pieces — a missing igniter, an unwired Claude Code, or no music player simply leaves that act out.
 
 With the igniter installed, use **macOS's own trigger**: set System Settings → Lock Screen → "Start Screen Saver when inactive" to taste, and/or bind a hot corner to Start Screen Saver. The agent only scouts: after ~20 s of inactivity (tunable: `defaults write com.michelg10.CodeSaver.Igniter captureAfterIdle -float 20`) it captures each display once and records the mouse — the screen is static precisely because you're idle, so one capture suffices and costs nothing. It also watches the cursor approach saver-bound hot corners and captures pre-emptively, so corner launches detonate instantly. Captures are deleted the moment you return. Grant the igniter **Screen Recording** permission for the pixelated-desktop act — without it (or without a fresh capture, e.g. a surprise activation) the saver simply starts normally. Same at the lock screen: ScreenCaptureKit lists no displays there, so a corner hit on the lock screen starts the plain saver — it is not treated as a permission failure (only a real denial triggers the ten-minute capture backoff). Launch decisions and capture failures are logged to `~/Library/Logs/CodeSaver/igniter.log`; `codesaver-igniter --corners` prints corner config plus the lock/permission state the agent sees. `build/codesaver-igniter --capture` writes a one-off manifest for testing.
 
@@ -48,23 +50,44 @@ The app owns its data — nothing is baked in at build time. It lists your non-f
 
 At runtime the saver memory-maps the corpus from the container and draws a fresh ~400-file subset each launch — repos weighted by √(file count) with a per-repo share cap, so big projects dominate only within reason — decoding files lazily and refreshing half the subset every time a spinner "request" completes. Corpus swaps are atomic renames and the reader validates the index against the bin, so a refresh can never torn-read a running saver.
 
-**Staying fresh**: the "Refresh automatically" toggle registers a LaunchAgent via `SMAppService` (it appears under CodeSaver in System Settings → Login Items; `install.sh` registers it too). It ticks hourly at the lowest QoS launchd offers — `ProcessType Background`, `Nice 20`, low-priority I/O — and the process gates itself: work happens at most once per ~day and **only on AC power**, except that a missing corpus is fetched immediately. Dissenters can flip the one-line predicate `RefreshService.powerGateSatisfied()`. Headless CLI, mostly for scripts: `CodeSaver --refresh [--force]`, `--import-gh-token`, `--register-agent`; `CODESAVER_GITHUB_TOKEN` overrides the Keychain.
+**Staying fresh**: the "Refresh automatically" toggle registers a LaunchAgent via `SMAppService` (it appears under CodeSaver in System Settings → Login Items; `install.sh` registers it too). It ticks hourly at the lowest QoS launchd offers — `ProcessType Background`, `Nice 20`, low-priority I/O — and the process gates itself: work happens at most once per ~day and **only on AC power**, except that a missing corpus is fetched immediately. Dissenters can flip the one-line predicate `RefreshService.powerGateSatisfied()`. Headless CLI, mostly for scripts: `CodeSaver --refresh [--force]`, `--import-gh-token`, `--register-agent` (both agents), `--reregister-feeds` (cycle the feed daemon after its plist changed or a `launchctl bootout`), `--feeds` (the daemon itself, what the LaunchAgent runs), `--activate`; `CODESAVER_GITHUB_TOKEN` overrides the Keychain.
+
+## Live widgets: Claude Code sessions and now playing
+
+Optional, and off until wired. With them, the saver shows what the machine is actually doing while it idles: one rounded TUI box per live Claude Code session bottom-left — the project directory, `✽ Thinking (12s)`, `Bash: exec`, `Permissions required`, a resting `✻ Done (2m 7s · 4.1k tokens)` — glyphs in Claude's orange (orange is real Claude Code; violet stays the saver's own theater), active sessions floating above resting ones. Bottom-right, the track playing in Music or Spotify, with a progress bar and the cover rendered as a text-ramp mosaic. Every panel is a character grid like the rest of the saver.
+
+Three parts, each independent:
+
+1. **The feed daemon** — `CodeSaver --feeds`, a KeepAlive LaunchAgent (`com.michelg10.CodeSaver.feeds`) that the app's **Auto-refresh** toggle and `install.sh` register alongside the corpus refresher. Once a second it merges its sources into `widgets/feed.json` in the app-group container — the only place the sandboxed saver can read — and the saver polls that file. A feed older than 20 s (daemon gone) removes every panel: frozen state is never shown as live. No sources at all means an empty feed and no panels; nothing to configure, nothing to see.
+2. **Claude Code hooks** — `python3 feeds/wire-settings.py` edits `~/.claude/settings.json` (backup kept beside it): the state writer `feeds/cc-state-hook.py` goes on ten session events (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PermissionRequest`, `MessageDisplay`, `Stop`, `StopFailure`, `SessionEnd`, all `async`), and the statusline is wrapped by `feeds/cc-statusline-wrapper.sh`, which passes your existing statusline through untouched and tees its JSON into the same writer every 5 s for the model name and token counts. Both scripts are copied to `~/.claude/codesaver/bin` so the repo can go away afterwards (`--dev` points at the checkout instead); state lands in `~/.claude/codesaver/sessions/`, one small JSON per session, pruned after a day. `--dry-run` shows the diff, `--uninstall` puts the old statusline back. Restart Claude Code once; panels appear on the next prompt.
+3. **Now playing** — polled from Music / Spotify by AppleScript, only while the player is running. macOS asks for Automation consent the first time the app window opens (the daemon can't prompt; the app does it on the bundle's behalf, one approval covers both). Paused music stays on the panel for half an hour. The cover mosaic is on/off under **Advanced → album art**, with a tuning window.
+
+bifrocate — a local Claude proxy that spools each session's model-side event stream to `~/.bifrocate/cot/` and runs a pin daemon that keeps chosen sessions' prompt caches warm — is **optional** and simply not read when absent: the hooks alone carry every state above. What it adds is sub-second resolution between *thinking*, *responding* and *writing the tool call*, an instant *Done* on Escape (there is no hook for an interrupt), and pinned sessions, which rest on the rack as `✻ Pinned (next ping in 35m ∙ 2h 32m ago)` and outlive the one-hour idle cutoff. With bifrocate stopped, its spools just go quiet and the panels fall back to hook state within two minutes; pins vanish when its pin daemon's state file is older than 90 s.
 
 ## Repo layout
 
 ```
 appex/                         the screensaver (ExtensionKit appex + host app)
-├── CodeSaverExtension/        the .appex — CodeSaverView.swift is the whole show
+├── CodeSaverExtension/        the .appex — CodeSaverView.swift is the whole show,
+│                              BoomCore/BoomMetal.swift the intro + Metal renderer
 ├── CodeSaver/                 SwiftUI host app: install / preview UI, GitHub
 │                              fetch + corpus build (GitHubCorpusFetcher.swift),
-│                              refresh gates + LaunchAgent (RefreshService.swift)
+│                              refresh gates + LaunchAgent (RefreshService.swift),
+│                              widget feed daemon (FeedsService.swift), album-art
+│                              ramp renderer + tuning window (AlbumArt*.swift)
 ├── install.sh                 build + install to /Applications + pluginkit
 └── BACKGROUND.md              appex screensaver architecture notes (upstream)
+feeds/                         the Claude Code side of the widgets
+├── wire-settings.py           installs/removes the hook + statusline wiring
+├── cc-state-hook.py           hook + statusline state writer (stdlib python)
+├── cc-statusline-wrapper.sh   tees the statusline JSON into the writer
+└── albumart/ramp.py           reference renderer the Swift port was verified against
 helper/                        ignition scout: idle/corner watcher → desktop capture
 ├── Igniter.swift              the codesaver-igniter agent (single file)
 └── install.sh                 install/uninstall the LaunchAgent
 build.sh                       builds the windowed preview / snapshot harness
 Sources/PreviewMain.swift      windowed preview / PNG snapshot renderer
+Sources/MarqueeTuner.swift     standalone window for tuning the music panel's marquee
 ```
 
 The snapshot harness is how the aesthetics were tuned: `./build.sh && ./build/preview --snapshot <dir> <t1> <t2>…` renders deterministic frames offscreen (`CODESAVER_WORKDUR` pins the cycle length, `CODESAVER_CLOCK_EPOCH` the clock, `CODESAVER_SEED` the scene; `CODESAVER_WIDGETS=0` leaves the live session panels out).

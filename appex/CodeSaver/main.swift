@@ -51,7 +51,9 @@ if args.contains("--refresh") {
 // Called by install.sh when the feeds agent's plist has changed: registering
 // an already-enabled agent is a no-op and launchd keeps the job definition it
 // first loaded, so the only way a new ProcessType (or anything else in the
-// plist) takes effect is to unregister and register again.
+// plist) takes effect is to unregister and register again. Also the recovery
+// for a booted-out feeds agent (SMAppService keeps reporting .enabled after
+// `launchctl bootout`; cycling it starts the job again).
 if args.contains("--reregister-feeds") {
     FeedsAgent.unregister()
     let s = FeedsAgent.register(interactive: false)
@@ -68,15 +70,6 @@ if args.contains("--register-agent") {
     let ok1 = s1 == .enabled || s1 == .requiresApproval
     let ok2 = s2 == .enabled || s2 == .requiresApproval
     exit(ok1 && ok2 ? 0 : 1)
-}
-
-// Recovery for a booted-out feeds agent (SMAppService keeps reporting
-// .enabled after `launchctl bootout`; cycle it).
-if args.contains("--reregister-feeds") {
-    FeedsAgent.unregister()
-    let status = FeedsAgent.register(interactive: false)
-    print("feeds agent: \(RefreshAgent.describe(status))")
-    exit(status == .enabled || status == .requiresApproval ? 0 : 1)
 }
 
 // Scripted one-shot of the UI's "Import from gh CLI" button.
