@@ -61,9 +61,19 @@ struct PreviewMain {
                 steps += 1
             }
             // Metal is THE renderer: the snapshot is an offscreen GPU frame.
+            // CODESAVER_PERF=1 also times the whole frame — quad build, UI
+            // rasters, encode, GPU, readback — per snapshot: the live
+            // renderer's 60-frame averages never fire offscreen (no completed
+            // handler), and its cpu figure never covered the view's build
+            // step anyway, so this is the harness's only per-frame number.
+            let frameStart = CACurrentMediaTime()
             guard let cg = view.metalDebugSnapshot() else {
                 print(String(format: "t=%.2f — no Metal frame", target))
                 continue
+            }
+            if perfEnabled {
+                print(String(format: "perf t=%.2f frame %.2f ms (build+encode+gpu+readback)",
+                             target, (CACurrentMediaTime() - frameStart) * 1000))
             }
             let url = URL(fileURLWithPath: outDir)
                 .appendingPathComponent(String(format: "frame-%07.2fs.png", target))
@@ -71,10 +81,12 @@ struct PreviewMain {
             try! rep.representation(using: .png, properties: [:])!.write(to: url)
             print("wrote \(url.path)")
         }
-        // The renderer's perf counters arrive as async blocks on the main
-        // queue; pump it briefly so 60-frame averages reach the diag log.
+        // Let anything queued on the main runloop (diag writes, deferred
+        // teardown) drain before exit.
         RunLoop.main.run(until: Date().addingTimeInterval(0.3))
     }
+
+    static let perfEnabled = ProcessInfo.processInfo.environment["CODESAVER_PERF"] == "1"
 
     static var tuner: Tuner?
 
@@ -611,8 +623,8 @@ final class Tuner: NSObject {
             h.textColor = NSColor(calibratedRed: 0.72, green: 0.66, blue: 1.0, alpha: 1)
             doc.addSubview(h)
             // Preset buttons, four to a row, above the section's sliders.
-            for (row, chunk) in stride(from: 0, to: section.presets.count, by: 4)
-                .map({ Array(section.presets[$0..<min($0 + 4, section.presets.count)]) }).enumerated() {
+            for chunk in stride(from: 0, to: section.presets.count, by: 4)
+                .map({ Array(section.presets[$0..<min($0 + 4, section.presets.count)]) }) {
                 y -= rowH
                 let bw = (width - 40 - 3 * 4) / 4
                 for (i, (title, preset)) in chunk.enumerated() {
@@ -622,7 +634,6 @@ final class Tuner: NSObject {
                     b.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
                     doc.addSubview(b)
                 }
-                _ = row
             }
             for knob in section.knobs {
                 y -= rowH

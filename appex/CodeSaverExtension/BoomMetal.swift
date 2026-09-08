@@ -486,6 +486,7 @@ final class BoomMetalRenderer {
     private var instanceStaging: [CellInstance] = []
     private let glyphBuffer: MTLBuffer
     private static let glyphCap = 32768
+    private var glyphCapReported = false
     private let fillBuffer: MTLBuffer
     private let lateFillBuffer: MTLBuffer
     private static let fillCap = 1024
@@ -851,6 +852,7 @@ final class BoomMetalRenderer {
         d.storageMode = .private
         // Synchronous frame: fence in, and release on EVERY exit — the
         // success path has already waited for its own completion by then.
+        let tStart = CACurrentMediaTime()
         acquireFrame()
         defer { releaseFrame() }
         guard let target = ctx.device.makeTexture(descriptor: d),
@@ -868,14 +870,24 @@ final class BoomMetalRenderer {
                   destinationBytesPerRow: bpr, destinationBytesPerImage: bpr * ph)
         blit.endEncoding()
         cb.commit()
+        let tEncoded = CACurrentMediaTime()
         cb.waitUntilCompleted()
-        if Self.perfEnabled {
-            BoomDiag.log(String(format: "snapshot gpu %.2f ms (%d×%d)",
-                                (cb.gpuEndTime - cb.gpuStartTime) * 1000, pw, ph))
-        }
+        let tDone = CACurrentMediaTime()
         guard let provider = CGDataProvider(data: Data(bytes: buf.contents(),
                                                        count: bpr * ph) as CFData)
         else { return nil }
+        if Self.perfEnabled {
+            // Split so the harness can subtract the offscreen-only costs
+            // (the wait and the readback copy) from its whole-frame time and
+            // read the view's own build cost off the remainder.
+            let line = String(format: "snapshot encode %.2f ms  wait %.2f ms  gpu %.2f ms  readback %.2f ms (%d×%d)",
+                              (tEncoded - tStart) * 1000, (tDone - tEncoded) * 1000,
+                              (cb.gpuEndTime - cb.gpuStartTime) * 1000,
+                              (CACurrentMediaTime() - tDone) * 1000, pw, ph)
+            BoomDiag.log(line)
+            print("boom-metal: " + line)
+            fflush(stdout)
+        }
         return CGImage(
             width: pw, height: ph, bitsPerComponent: 8, bitsPerPixel: 32,
             bytesPerRow: bpr, space: CGColorSpaceCreateDeviceRGB(),
@@ -963,6 +975,10 @@ final class BoomMetalRenderer {
 
         // 2. Typed rows (and fading debris glyphs): instanced text.
         let glyphCount = min(frame.glyphs.count, Self.glyphCap)
+        if frame.glyphs.count > Self.glyphCap, !glyphCapReported {
+            glyphCapReported = true
+            BoomDiag.log(diagTag + " glyph instances \(frame.glyphs.count) exceed the \(Self.glyphCap) cap — tail dropped")
+        }
         if glyphCount > 0, let a = atlas, let an = a.texture, let ah = a.haloTexture {
             glyphBuffer.contents().bindMemory(to: GlyphInstance.self, capacity: glyphCount)
                 .update(from: frame.glyphs, count: glyphCount)
@@ -1511,6 +1527,10 @@ final class TerminalGlyphAtlas {
         guard ensureTextures() else { return nil }
         let w = max(1, Int(ceil(cellW * CGFloat(cells) * scale)))
         let h = max(1, Int(ceil(lineH * scale)))
+        // A glyph bigger than the whole atlas (a tiny CODESAVER_ATLAS_SIZE
+        // start) grows it before any shelf math; past the cap it draws
+        // nothing rather than a replace() outside the texture.
+        while max(w, h) > size { guard grow() else { return nil } }
         if shelfX + w > size {
             shelfY += shelfH
             shelfX = 0
