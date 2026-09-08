@@ -31,7 +31,6 @@ fi
 # Signing identity: same detection as appex/install.sh. A real certificate
 # gives TCC a stable designated requirement; ad-hoc falls back to per-build
 # identity (the permission will re-prompt after rebuilds).
-[[ -f setup.conf ]] && source setup.conf
 SIGN_ID="${SIGN_ID:-Apple Development}"
 if ! security find-certificate -c "$SIGN_ID" >/dev/null 2>&1; then
   echo "── warning: no '$SIGN_ID' certificate — ad-hoc signing (TCC grant won't survive rebuilds)"

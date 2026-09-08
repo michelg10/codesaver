@@ -1,5 +1,4 @@
 .DS_Store
 build/
 appex/build/
-setup.conf
 __pycache__/

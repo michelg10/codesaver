@@ -455,12 +455,21 @@ private func rectCaptureLeaks(on display: CGDirectDisplayID) -> Bool {
     let before = bigIOSurfaceRegionCount()
     let sem = DispatchSemaphore(value: 0)
     var got = false
+    var answered = true
     autoreleasepool {
         SCScreenshotManager.captureImage(in: CGDisplayBounds(display)) { image, _ in
             got = image != nil
             sem.signal()
         }
-        sem.wait()
+        // Bounded: a healthy probe answers in ~0.13 s and a blocked delivery
+        // queue in ~5 s. A replayd that never answers must not park this
+        // thread forever with `capturing` latched — that would silence every
+        // capture and queue every corner hit for good.
+        answered = sem.wait(timeout: .now() + 15) == .success
+    }
+    guard answered else {
+        igniterLog("captureImage(in:) leak probe: no answer in 15 s — inconclusive, will retry")
+        return false
     }
     guard got else { return false }
     let leaks = bigIOSurfaceRegionCount() > before
@@ -803,6 +812,7 @@ final class Igniter {
         capturing = true
         let mouse = mouseCG()
         captureDisplays { [weak self] images, why in
+            var userReturned = false
             // No images: write nothing (the saver then starts normally) —
             // but only ONE of the possible reasons deserves the long backoff.
             //  • Screen Recording denied: asked directly, without prompting
@@ -844,7 +854,13 @@ final class Igniter {
                 // The user returned during the shot's latency. The return-
                 // cleanup already ran (nothing to delete then) and reset
                 // idleCaptured — writing now would orphan a screenshot on
-                // disk with nothing left to delete it. Drop the capture.
+                // disk with nothing left to delete it. Drop the capture —
+                // and the launch that was waiting on it: an idle-timeout
+                // launch decided 300 ms ago would otherwise start the saver
+                // over a user who is back at the keyboard. (A corner hit
+                // that landed mid-capture still rides below: that one was
+                // the user's own hand.)
+                userReturned = true
             } else {
                 writeManifest(kind: kind, mouse: mouse, captures: images)
                 // Mark what's on disk so the return-cleanup knows to sweep
@@ -860,7 +876,13 @@ final class Igniter {
                 self?.pendingLaunch = false
                 self?.launchSaver("\(kind): hit landed mid-capture, riding it")
             }
-            then?()
+            if userReturned {
+                if then != nil {
+                    igniterLog("\(kind) launch dropped — the user returned during the capture")
+                }
+            } else {
+                then?()
+            }
         }
     }
 }
