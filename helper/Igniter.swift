@@ -264,7 +264,58 @@ struct CornerGesture {
 /// photograph the saver itself (a refresh capturing boom frames would feed
 /// the NEXT boom garbage if the saver process were ever restarted in
 /// place). Checks the appex, the engine, and the legacy host by name.
+///
+/// Asked five times a second, so the cost is the whole idle budget of this
+/// agent: the old form walked every pid with proc_name — ~700 syscalls a
+/// tick, most of the 1% it drew. One sysctl(KERN_PROC_ALL) hands back every
+/// process's kinfo_proc in a single copy, and p_comm — the same name
+/// proc_name reports, truncated to MAXCOMLEN (16) — is compared in place,
+/// no String per process. The pid walk stays as the fallback for a sysctl
+/// that fails outright.
 func saverIsRunning() -> Bool {
+    saverIsRunningSysctl() ?? saverIsRunningProcWalk()
+}
+
+/// The three saver processes as p_comm sees them: "CodeSaverExtensi",
+/// "ScreenSaverEngin", "legacyScreenSave" — first MAXCOMLEN bytes, NUL.
+private let saverCommNames: [[CChar]] =
+    ["CodeSaverExtension", "ScreenSaverEngine", "legacyScreenSaver"].map { name in
+        Array(name.utf8.prefix(Int(MAXCOMLEN))).map { CChar(bitPattern: $0) } + [0]
+    }
+
+/// nil = sysctl itself failed (caller falls back), else the answer.
+private func saverIsRunningSysctl() -> Bool? {
+    var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL]
+    let stride = MemoryLayout<kinfo_proc>.stride
+    // Two rounds: the size query and the read are not atomic, so processes
+    // spawned in between need slack — a few dozen first, a few hundred if
+    // the kernel still answered ENOMEM.
+    for slack in [64, 512] {
+        var size = 0
+        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 0 else { return nil }
+        var buf = [kinfo_proc](repeating: kinfo_proc(), count: size / stride + slack)
+        var len = buf.count * stride
+        let rc = buf.withUnsafeMutableBytes { raw in
+            sysctl(&mib, 3, raw.baseAddress, &len, nil, 0)
+        }
+        if rc != 0 {
+            if errno == ENOMEM { continue }
+            return nil
+        }
+        for i in 0..<(len / stride) {
+            let hit = withUnsafeBytes(of: buf[i].kp_proc.p_comm) { comm -> Bool in
+                let base = comm.baseAddress!.assumingMemoryBound(to: CChar.self)
+                return saverCommNames.contains { strncmp(base, $0, Int(MAXCOMLEN) + 1) == 0 }
+            }
+            if hit { return true }
+        }
+        return false
+    }
+    return nil
+}
+
+/// The original walk: every pid, one proc_name syscall each.
+private func saverIsRunningProcWalk() -> Bool {
     var pids = [pid_t](repeating: 0, count: 4096)
     let ret = proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.size))
     let count = min(Int(ret), pids.count)
@@ -625,6 +676,19 @@ final class Igniter {
     private var lastIdleCapture = Date.distantPast
     private var cornerCaptured = false
     private var capturing = false
+    /// The capture in flight: when it started, what kind, whether a launch
+    /// waits on it — and its generation, so a completion that finally
+    /// arrives after the watchdog gave up on it can be told from the next
+    /// capture's own.
+    private var captureStarted = Date.distantPast
+    private var captureKind = ""
+    private var captureLaunches = false
+    private var captureGeneration = 0
+    /// How long a capture may stay unanswered. A healthy shot takes ~0.3 s
+    /// and the leak probe's own bound is 15 s; past 30 s ScreenCaptureKit
+    /// has lost the callback, and `capturing` latched forever would mean
+    /// no capture ever again and every corner hit queued for good.
+    private static let captureWatchdog: TimeInterval = 30
     private var lastCornerCapture = Date.distantPast
     private var corners: [CGPoint] = []
     private var custom: [CustomCorner] = []
@@ -653,6 +717,9 @@ final class Igniter {
     }
 
     private func tick() {
+        if capturing, Date().timeIntervalSince(captureStarted) > Self.captureWatchdog {
+            captureWatchdogFired()
+        }
         // After a permission-denied capture, captures back off — but corner
         // HITS keep working (the saver just starts without a boom).
         let captureOK = Date() >= captureBackoffUntil
@@ -808,10 +875,53 @@ final class Igniter {
         }
     }
 
+    /// `capturing` has been latched past the watchdog: ScreenCaptureKit never
+    /// called back. Reset as the empty-result path does — flags and
+    /// timestamps forgotten so the next tick's retry is a real one, a short
+    /// backoff so a replayd that is wedged is not hammered — then honour
+    /// what was waiting on the shot. A corner hit is the user's own hand:
+    /// launch plainly, as a hit during backoff would. An idle-timeout launch
+    /// only if the user is still away; thirty seconds is long enough to
+    /// have come back, and a saver popping over them was the bug before
+    /// last. The completion, should it ever arrive, checks the generation
+    /// and does nothing.
+    private func captureWatchdogFired() {
+        igniterLog("capture watchdog: no completion after \(Int(Self.captureWatchdog)) s (\(captureKind)) — resetting")
+        capturing = false
+        deleteManifest()
+        idleCaptured = false
+        cornerCaptured = false
+        if captureKind == "corner" { lastCornerCapture = .distantPast }
+        else { lastIdleCapture = .distantPast }
+        captureBackoffUntil = Date().addingTimeInterval(2)
+        let wantsLaunch = pendingLaunch || captureLaunches
+        pendingLaunch = false
+        captureLaunches = false
+        guard wantsLaunch else { return }
+        if captureKind == "idle", idleSeconds() < 1.0 {
+            igniterLog("capture watchdog: idle launch dropped — the user is back")
+        } else {
+            launchSaver("capture watchdog: the shot never came back, plain saver")
+        }
+    }
+
     private func capture(kind: String, then: (() -> Void)? = nil) {
         capturing = true
+        captureStarted = Date()
+        captureKind = kind
+        captureLaunches = then != nil
+        captureGeneration &+= 1
+        let generation = captureGeneration
         let mouse = mouseCG()
         captureDisplays { [weak self] images, why in
+            // The watchdog gave up on this shot and may have started another:
+            // a late answer owns nothing any more — not the flags, not the
+            // manifest (it would overwrite the newer capture's), not the
+            // launch (already fired plainly, or dropped). Let the images go.
+            guard let self, generation == self.captureGeneration, self.capturing else {
+                igniterLog("\(kind) capture answered late (after the watchdog) — ignored")
+                return
+            }
             var userReturned = false
             // No images: write nothing (the saver then starts normally) —
             // but only ONE of the possible reasons deserves the long backoff.
@@ -836,19 +946,19 @@ final class Igniter {
                 // backoff passes instead of waiting out idleRefreshEvery
                 // on a latch that was set before the shot came back.
                 deleteManifest()
-                self?.idleCaptured = false
-                self?.cornerCaptured = false
-                if kind == "corner" { self?.lastCornerCapture = .distantPast }
-                else { self?.lastIdleCapture = .distantPast }
+                self.idleCaptured = false
+                self.cornerCaptured = false
+                if kind == "corner" { self.lastCornerCapture = .distantPast }
+                else { self.lastIdleCapture = .distantPast }
                 let detail = why ?? "no detail"
                 if !CGPreflightScreenCaptureAccess() {
                     igniterLog("\(kind) capture denied — no Screen Recording permission (\(detail)); backing off 10 min")
-                    self?.captureBackoffUntil = Date().addingTimeInterval(600)
+                    self.captureBackoffUntil = Date().addingTimeInterval(600)
                 } else if screenIsLocked() {
                     igniterLog("\(kind) capture skipped — screen is locked, no desktop to capture (\(detail))")
                 } else {
                     igniterLog("\(kind) capture empty — \(detail); retrying in 2 s")
-                    self?.captureBackoffUntil = Date().addingTimeInterval(2)
+                    self.captureBackoffUntil = Date().addingTimeInterval(2)
                 }
             } else if kind == "idle", idleSeconds() < 1.0 {
                 // The user returned during the shot's latency. The return-
@@ -866,15 +976,15 @@ final class Igniter {
                 // Mark what's on disk so the return-cleanup knows to sweep
                 // it — including custom-timeout launches, whose capture
                 // doesn't come through the proactive path.
-                if kind == "corner" { self?.cornerCaptured = true }
-                else { self?.idleCaptured = true }
+                if kind == "corner" { self.cornerCaptured = true }
+                else { self.idleCaptured = true }
             }
-            self?.capturing = false
+            self.capturing = false
             // A hit that landed while this capture was in flight rides it:
             // the capture (fresh either way) is on disk before the launch.
-            if self?.pendingLaunch == true {
-                self?.pendingLaunch = false
-                self?.launchSaver("\(kind): hit landed mid-capture, riding it")
+            if self.pendingLaunch == true {
+                self.pendingLaunch = false
+                self.launchSaver("\(kind): hit landed mid-capture, riding it")
             }
             if userReturned {
                 if then != nil {
