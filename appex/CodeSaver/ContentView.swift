@@ -412,7 +412,7 @@ struct ContentView: View {
         let idle = idleTimeout > 0
             ? "the igniter starts the saver itself at this idle, capturing the desktop at that exact moment — set macOS's saver timeout to Never so the two don't race"
             : "macOS's own timeout starts the saver; the igniter keeps a fresh desktop capture ready for the boom"
-        return idle + "\ncorners are detected by the igniter itself — leave macOS's hot corners unbound so they don't race it"
+        return idle + "\ncorners are detected by the igniter itself — leave macOS's hot corners unbound so they don't race it\na modifier corner works like macOS's: hold the key first, then drive the cursor in — pressing it with the cursor already there is ignored"
     }
 
     private var firstError: String? {
