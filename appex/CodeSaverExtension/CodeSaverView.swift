@@ -1595,6 +1595,12 @@ public final class CodeSaverView: ScreenSaverView {
             batteryCache = buildBatteryCache(key: key, b, label: label, lit: lit, scale: scale)
         }
         guard let cache = batteryCache else { return }
+        // The gauge sits on the clock's rail to the RIGHT of the box. On a
+        // narrow screen (portrait, or a 9:16 story render) the clock spans
+        // most of the width and the two would overprint; a rail that can't
+        // be shared is not shown at all.
+        if clockVisible, let clock = clockCache?.blitRect,
+           cache.blitRect.insetBy(dx: -charW * 2, dy: 0).intersects(clock) { return }
         metal.setUITexture("battery", image: cache.image)   // ≤1 Hz re-upload
         frame.quads.append(.init(key: "battery", rect: cache.blitRect,
                                  maskToWipedCells: intro == .boom))
@@ -1835,9 +1841,11 @@ public final class CodeSaverView: ScreenSaverView {
         feed.updated = obj["updated"] as? Double ?? 0
         for raw in obj["sessions"] as? [[String: Any]] ?? [] {
             var w = WidgetSession()
-            w.cwd = raw["cwd"] as? String ?? "?"
+            // Composed: the panel measures cells per Character, and a
+            // decomposed syllable is several of those.
+            w.cwd = (raw["cwd"] as? String ?? "?").precomposedStringWithCanonicalMapping
             w.state = raw["state"] as? String ?? "done"
-            w.tool = raw["tool"] as? String
+            w.tool = (raw["tool"] as? String)?.precomposedStringWithCanonicalMapping
             w.turnStarted = raw["turn_started"] as? Double
             w.turnEnded = raw["turn_ended"] as? Double
             w.turnTokens = raw["turn_tokens"] as? Int
@@ -1858,8 +1866,8 @@ public final class CodeSaverView: ScreenSaverView {
         }
         if let np = obj["nowplaying"] as? [String: Any] {
             feed.npApp = np["app"] as? String
-            feed.npTitle = np["title"] as? String ?? ""
-            feed.npArtist = np["artist"] as? String ?? ""
+            feed.npTitle = (np["title"] as? String ?? "").precomposedStringWithCanonicalMapping
+            feed.npArtist = (np["artist"] as? String ?? "").precomposedStringWithCanonicalMapping
             feed.npPos = np["position"] as? Double ?? 0
             feed.npDur = np["duration"] as? Double ?? 0
             feed.npTS = np["ts"] as? Double ?? 0
@@ -2551,7 +2559,12 @@ public final class CodeSaverView: ScreenSaverView {
         }
         if let g = widgetGlyphCache[ch] { return g }
         let w = NSAttributedString(string: String(ch), attributes: [.font: font!]).size().width
-        let n = max(1, Int((w / charW).rounded()))
+        // Ceil, never round: a Hangul syllable falls back at 1.40 cells, and
+        // rounding handed it ONE — a negative kern that squeezed every
+        // syllable over its neighbour. Same rule as the main grid's
+        // cellWidth: a glyph gets at least the cells its advance covers,
+        // capped at two (an emoji at 2.1 cells takes a terminal's two).
+        let n = min(2, max(1, Int(ceil(w / charW - 0.05))))
         var kern = CGFloat(n) * charW - w
         if abs(kern) < 0.05 { kern = 0 }
         let g = (cells: n, kern: kern)
@@ -3082,7 +3095,7 @@ public final class CodeSaverView: ScreenSaverView {
         let progRow = WidgetRow(runs: progRuns)
 
         let bl = app + ".app"
-        let botFill = max(0, inner - bl.count - 4)
+        let botFill = max(0, inner - widgetCells(bl) - 4)
         let bottom = WidgetRow(runs: [
             ("\u{2570}" + String(repeating: "\u{2500}", count: botFill) + " ", run(railC)),
             (bl, run(labelC)), (" \u{2500}\u{256F}", run(railC)),
