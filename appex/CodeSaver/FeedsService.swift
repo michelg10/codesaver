@@ -105,11 +105,29 @@ enum FeedsService {
         init(from decoder: Decoder) throws {
             let c = try decoder.singleValueContainer()
             if let i = try? c.decode(Int.self) { value = i }
-            else if let d = try? c.decode(Double.self) { value = Int(d) }
+            // Int(exactly:) — a plain Int(d) traps on a non-finite or
+            // out-of-range double, and this decode runs on every file
+            // every second: one bad value would crash-loop the daemon.
+            else if let d = try? c.decode(Double.self) { value = Int(exactly: d.rounded()) }
             else if let s = try? c.decode(String.self) {
                 value = Int(s.trimmingCharacters(in: .whitespaces))
             } else { value = nil }
         }
+    }
+
+    // MARK: File metadata
+
+    /// mtime + size straight from stat(2). FileManager.attributesOfItem
+    /// builds (and autoreleases) a dictionary of every attribute per call —
+    /// measured at 4.4 ms for the ~180 spool + session files the publishers
+    /// stat each second, against 0.2 ms here. Follows symlinks, so a linked
+    /// spool reports the data's own mtime.
+    private static func fileStat(_ path: String) -> (mtime: Date, size: UInt64)? {
+        var st = stat()
+        guard stat(path, &st) == 0 else { return nil }
+        let m = st.st_mtimespec
+        return (Date(timeIntervalSince1970: Double(m.tv_sec) + Double(m.tv_nsec) / 1e9),
+                UInt64(max(0, st.st_size)))
     }
 
     // MARK: Publisher
@@ -277,8 +295,7 @@ enum FeedsService {
                 // Compare the OPTIONAL: a deleted tuning file means "back to
                 // defaults" and must re-render too, which a plain `if let`
                 // silently skipped.
-                let m = (try? FileManager.default.attributesOfItem(atPath: tu.path))?[
-                    .modificationDate] as? Date
+                let m = fileStat(tu.path)?.mtime
                 if m != lastTuningMTime {
                     lastTuningMTime = m
                     lastArtKey = ""
@@ -348,8 +365,7 @@ enum FeedsService {
         var out: [HookRecord] = []
         for name in names where name.hasSuffix(".json") && !name.hasPrefix(".") {
             let url = hookDir.appendingPathComponent(name)
-            if let m = (try? fm.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date,
-               m < untouched { continue }
+            if let m = fileStat(url.path)?.mtime, m < untouched { continue }
             guard let data = try? Data(contentsOf: url),
                   let h = try? JSONDecoder().decode(HookState.self, from: data),
                   let sid = h.session_id else { continue }
@@ -367,9 +383,7 @@ enum FeedsService {
         let cutoff = Date().addingTimeInterval(-2 * 3600)
         for name in names where name.hasSuffix(".jsonl") {
             let url = spoolDir.appendingPathComponent(name)
-            guard let attrs = try? fm.attributesOfItem(atPath: url.path),
-                  let mtime = attrs[.modificationDate] as? Date,
-                  let size = attrs[.size] as? UInt64 else { continue }
+            guard let (mtime, size) = fileStat(url.path) else { continue }
             let sid = String(name.dropLast(6))
             if mtime < cutoff && offsets[url.path] != nil { continue }
             if mtime < cutoff { offsets[url.path] = size; continue }  // old history: skip, don't parse
@@ -441,8 +455,7 @@ enum FeedsService {
         guard let names = try? fm.contentsOfDirectory(atPath: hookDir.path) else { return }
         let cutoff = Date().addingTimeInterval(-24 * 3600)
         func old(_ url: URL) -> Bool {
-            guard let m = (try? fm.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
-            else { return false }
+            guard let m = fileStat(url.path)?.mtime else { return false }
             return m < cutoff
         }
         for name in names {
@@ -470,8 +483,7 @@ enum FeedsService {
     private struct JSONCache { var mtime: Date?; var obj: [String: Any] = [:] }
 
     private static func cachedJSON(_ url: URL, _ cache: inout JSONCache) -> [String: Any] {
-        let m = (try? FileManager.default.attributesOfItem(atPath: url.path))?[
-            .modificationDate] as? Date
+        let m = fileStat(url.path)?.mtime
         if m == cache.mtime { return cache.obj }
         cache.mtime = m
         guard m != nil, let data = try? Data(contentsOf: url),
@@ -502,8 +514,8 @@ enum FeedsService {
             // exempt from decay) would advertise "Permissions required"
             // for an hour. ESRCH only — EPERM means the pid exists, and a
             // recycled pid merely keeps today's behaviour.
-            if let pid = h.pid?.value, pid > 1,
-               kill(pid_t(pid), 0) != 0, errno == ESRCH { continue }
+            if let pid = h.pid?.value, pid > 1, let p = pid_t(exactly: pid),
+               kill(p, 0) != 0, errno == ESRCH { continue }
             let s = spool[sid]
             let hookTS = max(h.hook_ts ?? 0, 0)
             let activity = max(hookTS, s?.ts ?? 0)     // real events only

@@ -119,9 +119,20 @@ def main():
         st["pid"] = int(pid)
 
     if ev == "SessionStart":
-        st.setdefault("hook_state", "done")
+        # A resumed session (--resume / --continue keep the id) arrives
+        # still marked "gone" by its own SessionEnd; left alone it stayed
+        # invisible until the first prompt of the new run.
+        if st.get("hook_state") in (None, "gone"):
+            st["hook_state"] = "done"
         if data.get("model"):
             st["model"] = data["model"]
+    elif st.get("hook_state") == "gone" and ev != "UserPromptSubmit":
+        # SessionEnd's async siblings can land after it (a Stop or
+        # MessageDisplay from the final turn): a straggler must not
+        # resurrect a closed session as "done" for the next hour. Only
+        # SessionStart above or a new turn's prompt reopens it.
+        lk.close()
+        return
     elif ev == "UserPromptSubmit":
         st["hook_state"] = "working"
         st["turn_started"] = now
