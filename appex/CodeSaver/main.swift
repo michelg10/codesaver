@@ -14,6 +14,7 @@
 
 import Foundation
 import PaperSaverKit
+import ServiceManagement
 
 let args = CommandLine.arguments
 
@@ -48,28 +49,46 @@ if args.contains("--refresh") {
     RunLoop.main.run()
 }
 
+// The widget feed daemon is opt-in: only the app's "Live widgets" toggle
+// ever turns it on. Both install-time entry points below therefore act on it
+// only when it is already on (enabled, or registered and waiting in Login
+// Items) — a reinstall keeps a chosen daemon running on the new build and
+// never starts one for a user who never chose it.
+func feedsIsOn(_ s: SMAppService.Status) -> Bool { s == .enabled || s == .requiresApproval }
+
 // Called by install.sh when the feeds agent's plist has changed: registering
 // an already-enabled agent is a no-op and launchd keeps the job definition it
 // first loaded, so the only way a new ProcessType (or anything else in the
 // plist) takes effect is to unregister and register again. Also the recovery
 // for a booted-out feeds agent (SMAppService keeps reporting .enabled after
-// `launchctl bootout`; cycling it starts the job again).
+// `launchctl bootout`, and after the bundle swap — the record is keyed by the
+// /Applications path; cycling it starts the job again).
 if args.contains("--reregister-feeds") {
+    guard feedsIsOn(FeedsAgent.status) else {
+        print("feeds agent: off — not registered (turn on Live widgets in the app)")
+        exit(0)
+    }
     FeedsAgent.unregister()
     let s = FeedsAgent.register(interactive: false)
     print("feeds agent: \(RefreshAgent.describe(s))")
-    exit(s == .enabled || s == .requiresApproval ? 0 : 1)
+    exit(feedsIsOn(s) ? 0 : 1)
 }
 
-// Called by install.sh once the app is at its stable /Applications path.
+// Called by install.sh once the app is at its stable /Applications path:
+// the corpus refresher always (a no-op that self-heals a stale BTM record),
+// the feeds agent only if it was already on.
 if args.contains("--register-agent") {
     let s1 = RefreshAgent.register(interactive: false)
     print("refresh agent: \(RefreshAgent.describe(s1))")
-    let s2 = FeedsAgent.register(interactive: false)
-    print("feeds agent: \(RefreshAgent.describe(s2))")
-    let ok1 = s1 == .enabled || s1 == .requiresApproval
-    let ok2 = s2 == .enabled || s2 == .requiresApproval
-    exit(ok1 && ok2 ? 0 : 1)
+    var ok = s1 == .enabled || s1 == .requiresApproval
+    if feedsIsOn(FeedsAgent.status) {
+        let s2 = FeedsAgent.register(interactive: false)
+        print("feeds agent: \(RefreshAgent.describe(s2)) (kept)")
+        ok = ok && feedsIsOn(s2)
+    } else {
+        print("feeds agent: off (opt in with Live widgets in the app)")
+    }
+    exit(ok ? 0 : 1)
 }
 
 // Scripted one-shot of the UI's "Import from gh CLI" button.

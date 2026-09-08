@@ -2,8 +2,9 @@
 //  ContentView.swift
 //  CodeSaver
 //
-//  The host app window: a live render of the saver on top, a three-step
-//  setup checklist below, corpus status at the bottom. The palette and the
+//  The host app window: a live render of the saver on top, a four-step
+//  setup checklist below (the fourth, live widgets, is optional), corpus
+//  status at the bottom. The palette and the
 //  ✽/✻ glyph vocabulary are the saver's own (CodeSaverView's constants): the
 //  current setup step glows like a working spinner, finished steps rest grey.
 //
@@ -59,6 +60,7 @@ struct ContentView: View {
     @State private var showVerbsImporter = false
     @State private var albumArtStyle: String = ContentView.loadAlbumArtStyle()
     @State private var igniterState = IgniterState.missing
+    @State private var igniterDenied = false
     @State private var cornerTL = igniterDefaults?.integer(forKey: "cornerTL") ?? 0
     @State private var cornerTR = igniterDefaults?.integer(forKey: "cornerTR") ?? 0
     @State private var cornerBL = igniterDefaults?.integer(forKey: "cornerBL") ?? 0
@@ -98,6 +100,7 @@ struct ContentView: View {
             pluginManager.checkScreensaverStatus()
             refreshManager.reload()
             igniterState = Self.probeIgniter()
+            igniterDenied = Self.igniterScreenRecordingDenied()
             albumArtStyle = Self.loadAlbumArtStyle()
         }
         // The tuning window writes the same key (picking a style there
@@ -106,7 +109,10 @@ struct ContentView: View {
             for: .albumArtStyleDidChange)) { _ in
             albumArtStyle = Self.loadAlbumArtStyle()
         }
-        .onAppear { igniterState = Self.probeIgniter() }
+        .onAppear {
+            igniterState = Self.probeIgniter()
+            igniterDenied = Self.igniterScreenRecordingDenied()
+        }
         .fileImporter(isPresented: $showVerbsImporter,
                       allowedContentTypes: [.text, .tabSeparatedText]) { result in
             if case .success(let url) = result {
@@ -159,11 +165,15 @@ struct ContentView: View {
     private var saverDone: Bool { pluginManager.isActiveScreensaver }
     private var tokenDone: Bool { refreshManager.hasToken }
     private var agentDone: Bool { refreshManager.agentEnabled }
+    private var feedsDone: Bool { refreshManager.feedsEnabled }
 
+    /// The glowing step is the next one to do — the optional fourth included,
+    /// once the three that make the saver work are done.
     private var currentStep: Int? {
         if !saverDone { return 0 }
         if !tokenDone { return 1 }
         if !agentDone { return 2 }
+        if !feedsDone { return 3 }
         return nil
     }
 
@@ -255,16 +265,52 @@ struct ContentView: View {
                     .disabled(!tokenDone)
             }
             if refreshManager.agentNeedsApproval {
-                HStack(spacing: 8) {
-                    Text("waiting for approval in Login Items")
-                        .font(Theme.mono(11)).foregroundStyle(Theme.alert)
-                    Button("Open Login Items") { refreshManager.openLoginItems() }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                }
-                .padding(.leading, 24)
+                approvalRow
             }
+
+            // 4 — the widget feed daemon: its own LaunchAgent, its own
+            // switch. Optional — the saver is whole without it — so nothing
+            // gates it and nothing else turns it on.
+            let feedsState = state(of: 3, done: feedsDone)
+            HStack(spacing: 10) {
+                glyph(feedsState)
+                stepTitle("Live widgets", feedsState)
+                Text("optional · Claude Code sessions · now playing")
+                    .font(Theme.mono(10)).foregroundStyle(Theme.dim)
+                Spacer()
+                Toggle("", isOn: Binding(get: { refreshManager.feedsEnabled },
+                                         set: { refreshManager.setLiveWidgets($0) }))
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                    .labelsHidden()
+            }
+            if refreshManager.feedsNeedsApproval {
+                approvalRow
+            }
+            Text(liveWidgetsCaption)
+                .font(Theme.mono(10))
+                .foregroundStyle(Theme.dim)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.leading, 24)
         }
+    }
+
+    /// Both agents wait on the same Login Items approval when macOS asks.
+    private var approvalRow: some View {
+        HStack(spacing: 8) {
+            Text("waiting for approval in Login Items")
+                .font(Theme.mono(11)).foregroundStyle(Theme.alert)
+            Button("Open Login Items") { refreshManager.openLoginItems() }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+        }
+        .padding(.leading, 24)
+    }
+
+    private var liveWidgetsCaption: String {
+        "sessions need Claude Code's hooks: python3 feeds/wire-settings.py — state lands in ~/.claude/codesaver/sessions"
+        + "\nnow playing reads Music or Spotify; macOS asks for consent when this window opens"
+        + "\nbifrocate is optional — without it the panels follow hook state alone"
     }
 
     // MARK: Corpus
@@ -322,6 +368,40 @@ struct ContentView: View {
         return text.contains("state = running") ? .running : .stopped
     }
 
+    /// The igniter can't tell the app it was refused Screen Recording — TCC
+    /// prompts once, at the first idle capture, while the user is away — but
+    /// it logs every refusal. The last capture outcome in the log's tail
+    /// decides: a denial that no capture-backed launch has followed, and
+    /// less than a day old (a standing denial re-logs every ten idle
+    /// minutes, so a grant fixed since goes quiet even before the next
+    /// launch proves it). Runs on the probe's cadence: window activation.
+    private static func igniterScreenRecordingDenied() -> Bool {
+        let path = NSHomeDirectory() + "/Library/Logs/CodeSaver/igniter.log"
+        guard let h = FileHandle(forReadingAtPath: path) else { return false }
+        defer { try? h.close() }
+        let size = (try? h.seekToEnd()) ?? 0
+        let span: UInt64 = 16_384
+        try? h.seek(toOffset: size > span ? size - span : 0)
+        guard let data = try? h.readToEnd() else { return false }
+        // Lossy on purpose: the cut can land inside a multi-byte glyph.
+        let text = String(decoding: data, as: UTF8.self)
+        var lastDenial: Substring?
+        for line in text.split(whereSeparator: \.isNewline) {
+            if line.contains("capture denied — no Screen Recording permission") {
+                lastDenial = line.prefix(20)      // the ISO-8601 stamp
+            } else if line.contains("launching saver"), !line.contains("plain saver") {
+                // Any capture-backed launch — "fresh capture", "riding the
+                // approach capture", "riding it" — proves the grant; only
+                // the plain-saver launches (lock screen, backoff, watchdog)
+                // say nothing about it.
+                lastDenial = nil
+            }
+        }
+        guard let stamp = lastDenial,
+              let when = ISO8601DateFormatter().date(from: String(stamp)) else { return false }
+        return Date().timeIntervalSince(when) < 86_400
+    }
+
     private var ignitionRows: some View {
         VStack(alignment: .leading, spacing: 12) {
             if igniterState != .running {
@@ -346,6 +426,18 @@ struct ContentView: View {
                         NSPasteboard.general.setString(command, forType: .string)
                     }
                     .buttonStyle(.bordered).controlSize(.small)
+                }
+            }
+            if igniterState == .running, igniterDenied {
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    Text("✽").font(Theme.mono(13)).foregroundStyle(Theme.alert)
+                        .shadow(color: Theme.alert.opacity(0.9), radius: 5)
+                    Text("no Screen Recording grant — the saver starts plain, no boom · System Settings › Privacy & Security › Screen Recording › CodeSaverIgniter")
+                        .font(Theme.mono(11)).foregroundStyle(Theme.alert)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                    Button("Open") { openScreenRecordingSettings() }
+                        .buttonStyle(.bordered).controlSize(.small)
                 }
             }
             HStack(spacing: 8) {
@@ -542,6 +634,12 @@ struct ContentView: View {
 
     private func openScreenSaverSettings() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.ScreenSaver-Settings.extension") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    private func openScreenRecordingSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
             NSWorkspace.shared.open(url)
         }
     }

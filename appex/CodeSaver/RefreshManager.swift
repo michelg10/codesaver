@@ -18,6 +18,8 @@ final class RefreshManager: ObservableObject {
     @Published var progressText: String?
     @Published var agentEnabled = false
     @Published var agentNeedsApproval = false
+    @Published var feedsEnabled = false
+    @Published var feedsNeedsApproval = false
     @Published var customVerbCount: Int?   // nil = bundled list in use
     @Published var lastActionError: String?
 
@@ -29,7 +31,8 @@ final class RefreshManager: ObservableObject {
         hasToken = TokenStore.current != nil
         state = CorpusStore.loadState()
         owner = RefreshService.configuredOwner ?? ""
-        adoptAgentStatus(RefreshAgent.status, FeedsAgent.status)
+        adoptAgentStatus(RefreshAgent.status)
+        adoptFeedsStatus(FeedsAgent.status)
         customVerbCount = CorpusStore.verbsURL
             .flatMap(Self.readVerbFile)
             .map(Self.verbCount)
@@ -179,29 +182,46 @@ final class RefreshManager: ObservableObject {
 
     // MARK: Auto-refresh agent
 
-    /// The toggle owns BOTH LaunchAgents — corpus refresh and the widget
-    /// feeds daemon — as the pair `--register-agent` registers, since this
-    /// toggle is the only registration path a drag-installed app ever runs.
+    /// The corpus refresher only. The widget feed daemon used to ride this
+    /// toggle (one switch, two agents) — which meant a KeepAlive daemon for
+    /// anyone who merely wanted their corpus fresh. It has its own step now.
     func setAutoRefresh(_ enabled: Bool) {
         if enabled {
             if !RefreshAgent.isAtStablePath {
                 lastActionError = "auto-refresh needs the app to live in /Applications"
             }
-            adoptAgentStatus(RefreshAgent.register(interactive: true),
-                             FeedsAgent.register(interactive: true))
+            adoptAgentStatus(RefreshAgent.register(interactive: true))
         } else {
             RefreshAgent.unregister()
+            reload()
+        }
+    }
+
+    private func adoptAgentStatus(_ refresh: SMAppService.Status) {
+        agentEnabled = refresh == .enabled
+        agentNeedsApproval = refresh == .requiresApproval
+    }
+
+    // MARK: Live widgets agent
+
+    /// The widget feed daemon (`CodeSaver --feeds`): opt-in, and this toggle
+    /// is the only path that ever turns it on — install.sh's
+    /// `--register-agent` re-registers it only when it is already enabled.
+    func setLiveWidgets(_ enabled: Bool) {
+        if enabled {
+            if !FeedsAgent.isAtStablePath {
+                lastActionError = "live widgets need the app to live in /Applications"
+            }
+            adoptFeedsStatus(FeedsAgent.register(interactive: true))
+        } else {
             FeedsAgent.unregister()
             reload()
         }
     }
 
-    /// One toggle, two agents: on only when both run; "needs approval" when
-    /// either is waiting on Login Items.
-    private func adoptAgentStatus(_ refresh: SMAppService.Status,
-                                  _ feeds: SMAppService.Status) {
-        agentEnabled = refresh == .enabled && feeds == .enabled
-        agentNeedsApproval = refresh == .requiresApproval || feeds == .requiresApproval
+    private func adoptFeedsStatus(_ feeds: SMAppService.Status) {
+        feedsEnabled = feeds == .enabled
+        feedsNeedsApproval = feeds == .requiresApproval
     }
 
     func openLoginItems() {

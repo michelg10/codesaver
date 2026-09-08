@@ -92,18 +92,22 @@ if [[ ${NO_ACTIVATE:-0} != 1 ]]; then
   fi
 fi
 
-# (Re-)register the LaunchAgents (corpus refresh + widget feeds) now that the
-# app sits at its stable /Applications path; a no-op when already enabled.
-# RunAtLoad gives a first corpus fetch right away once a token is present.
+# (Re-)register the corpus refresh LaunchAgent now that the app sits at its
+# stable /Applications path; a no-op when already enabled. RunAtLoad gives a
+# first corpus fetch right away once a token is present. The widget feeds
+# agent is opt-in (the app's "Live widgets" switch): this re-registers it
+# only if it was already on, and never turns it on for a fresh install.
 /Applications/CodeSaver.app/Contents/MacOS/CodeSaver --register-agent 2>/dev/null \
-  || echo "── agent registration failed — toggle “Refresh automatically” in the app"
+  || echo "── agent registration failed — toggle “Auto-refresh” in the app"
 
 # The feeds daemon is KeepAlive: it survived the bundle swap above on the
 # unlinked inode, and re-registering an already-enabled agent never re-execs
 # it — nor does it reload the plist, so a changed ProcessType would never
 # take effect. Unregister + register loads the bundle's current plist and
 # starts the daemon on the new build; the kickstart is the fallback for a
-# job that was left loaded but not running.
+# job that was left loaded but not running. Both only when the agent is on:
+# --reregister-feeds exits 0 without registering for a user who never
+# switched Live widgets on, and the launchctl checks then find no job.
 # (The refresh agent needs none: StartInterval re-execs it every hour.)
 FEEDS_LABEL="$(/usr/libexec/PlistBuddy -c 'Print :Label' \
   CodeSaver/com.michelg10.CodeSaver.feeds.plist 2>/dev/null || echo com.michelg10.CodeSaver.feeds)"
@@ -116,7 +120,7 @@ if launchctl print "gui/$(id -u)/$FEEDS_LABEL" 2>/dev/null | grep -q "state = ru
 elif launchctl kickstart -k "gui/$(id -u)/$FEEDS_LABEL" 2>/dev/null; then
   echo "── restarted the feeds daemon on the new build"
 else
-  echo "── feeds daemon not loaded yet (it starts with “Refresh automatically” / next login)"
+  echo "── feeds daemon off (opt in with “Live widgets” in the app)"
 fi
 
 echo "── installed /Applications/CodeSaver.app"
