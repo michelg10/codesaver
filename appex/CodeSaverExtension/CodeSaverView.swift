@@ -2709,6 +2709,78 @@ public final class CodeSaverView: ScreenSaverView {
 
     private struct WidgetRow { var runs: [(String, [NSAttributedString.Key: Any])] }
 
+    // MARK: Panel raster cache
+
+    /// One rounded panel's last raster, with everything that went into it.
+    /// A panel's content moves at ≤ ~10 Hz — the spinner glyph, a marquee
+    /// step, a 1 Hz timer, the glow ripple on an active label — yet every
+    /// frame laid out and drew EVERY panel through CoreText and re-uploaded
+    /// it: ≈0.65 ms per panel per frame at scale 1, four times that at @2x,
+    /// the largest CPU item in a frame with a full rack. Rows and art are
+    /// compared by VALUE, run by run — text, font, colour, shadow, kern — so
+    /// a change in any of them re-rasters, and the renderer's identity check
+    /// then skips the upload while the image object is the one it already
+    /// holds. A fresh raster is allocated while the old one is still cached,
+    /// so their identities can never coincide; its upload is forced anyway.
+    private struct WidgetPanelRaster {
+        var rows: [WidgetRow]
+        var art: (rows: [NSAttributedString], step: CGFloat, cols: Int, afterRow: Int)?
+        var scale: CGFloat
+        var charW: CGFloat
+        var lineH: CGFloat
+        var width: CGFloat       // widest row: the art's column origin needs it
+        var size: NSSize
+        var image: CGImage
+        var used: Int            // widgetPanelSerial at the last emit
+    }
+    private var widgetPanelRasters: [String: WidgetPanelRaster] = [:]
+    /// Bumped once per widget build; a panel not emitted under the current
+    /// serial (a session that ended, a track that stopped) is evicted.
+    private var widgetPanelSerial = 0
+
+    private static func widgetAttrsEqual(_ a: [NSAttributedString.Key: Any],
+                                         _ b: [NSAttributedString.Key: Any]) -> Bool {
+        guard a.count == b.count else { return false }
+        for (k, va) in a {
+            guard let vb = b[k] else { return false }
+            switch (va, vb) {
+            case let (x as NSFont, y as NSFont): if x != y { return false }
+            case let (x as NSColor, y as NSColor): if x != y { return false }
+            case let (x as NSShadow, y as NSShadow):
+                // NSShadow is compared field by field: its own isEqual is
+                // not documented to be by value.
+                if x.shadowBlurRadius != y.shadowBlurRadius || x.shadowOffset != y.shadowOffset
+                    || x.shadowColor != y.shadowColor { return false }
+            case let (x as NSNumber, y as NSNumber): if x != y { return false }
+            default: return false     // an attribute this can't compare: re-raster
+            }
+        }
+        return true
+    }
+
+    private static func widgetRowsEqual(_ a: [WidgetRow], _ b: [WidgetRow]) -> Bool {
+        guard a.count == b.count else { return false }
+        for (ra, rb) in zip(a, b) {
+            guard ra.runs.count == rb.runs.count else { return false }
+            for (x, y) in zip(ra.runs, rb.runs)
+            where x.0 != y.0 || !widgetAttrsEqual(x.1, y.1) { return false }
+        }
+        return true
+    }
+
+    private static func widgetArtEqual(
+        _ a: (rows: [NSAttributedString], step: CGFloat, cols: Int, afterRow: Int)?,
+        _ b: (rows: [NSAttributedString], step: CGFloat, cols: Int, afterRow: Int)?) -> Bool {
+        switch (a, b) {
+        case (nil, nil): return true
+        case let (x?, y?):
+            return x.step == y.step && x.cols == y.cols && x.afterRow == y.afterRow
+                && x.rows.count == y.rows.count
+                && zip(x.rows, y.rows).allSatisfy { $0.isEqual(to: $1) }
+        default: return false
+        }
+    }
+
     /// Rasterizes one rounded TUI panel and appends its quad. `rows` are
     /// full-width strings of exactly `cols` characters (rails included).
     private func emitWidgetPanel(_ frame: inout BoomMetalRenderer.FrameInput,
@@ -2720,71 +2792,107 @@ public final class CodeSaverView: ScreenSaverView {
                                        card: (x: Int, y: Int, w: Int, h: Int,
                                               flash: CGFloat, blip: Bool)?)? = nil) {
         let step = lineH
-        var width: CGFloat = 0
-        let built: [NSAttributedString] = rows.map { row in
-            let line = NSMutableAttributedString()
-            for (text, attrs) in row.runs {
-                line.append(widgetRun(text, attrs))
-            }
-            width = max(width, line.size().width)
-            return line
-        }
         let pad: CGFloat = 6
-        let size = NSSize(width: width + pad * 2,
+        let artSig = art.map { (rows: $0.rows, step: $0.step, cols: $0.cols, afterRow: $0.afterRow) }
+        let image: CGImage, size: NSSize, width: CGFloat
+        if var c = widgetPanelRasters[key], c.scale == scale, c.charW == charW, c.lineH == lineH,
+           Self.widgetArtEqual(c.art, artSig), Self.widgetRowsEqual(c.rows, rows) {
+            c.used = widgetPanelSerial
+            widgetPanelRasters[key] = c
+            image = c.image; size = c.size; width = c.width
+            metal.setUITexture(key, image: image)     // the object it holds: no upload
+        } else {
+            var widest: CGFloat = 0
+            let built: [NSAttributedString] = rows.map { row in
+                let line = NSMutableAttributedString()
+                for (text, attrs) in row.runs {
+                    line.append(widgetRun(text, attrs))
+                }
+                widest = max(widest, line.size().width)
+                return line
+            }
+            width = widest
+            size = NSSize(width: width + pad * 2,
                           height: step * CGFloat(built.count) + pad * 2)
-        guard let img = rasterUI(size: size, scale: scale, {
-            NSColor.black.withAlphaComponent(0.87).setFill()
-            NSBezierPath(roundedRect: NSRect(origin: .zero, size: size),
-                         xRadius: 3, yRadius: 3).fill()
-            var y = pad
-            for (i, line) in built.enumerated() {
-                line.draw(at: NSPoint(x: pad, y: y))
-                y += step
-                if let art, art.afterRow == i {
-                    // Straight into this context, starting on a CELL BOUNDARY
-                    // of the panel's own grid — the art shares the chrome's
-                    // font, so its columns coincide with the rails and the
-                    // text below. Pixel-centering here is what kept knocking
-                    // the art off the grid.
-                    let totalCells = Int((width / charW).rounded())
-                    let lead = CGFloat(max(1, (totalCells - art.cols) / 2))
-                    let ox = pad + lead * charW
-                    AlbumArtGrid.draw(rows: art.rows, at: NSPoint(x: ox, y: y), step: art.step)
-                    if let card = art.card, card.flash > 0 || card.blip {
-                        // The spinner's own flash and blip, over the card's
-                        // cells, in screen space (the panel's top-left plus
-                        // this raster's offsets), drawn late — over the quad.
-                        let px = origin.x + ox + CGFloat(card.x) * charW
-                        let py = origin.y - size.height + y + CGFloat(card.y) * art.step
-                        let rect = NSRect(x: px, y: py, width: CGFloat(card.w) * charW,
-                                          height: CGFloat(card.h) * art.step)
-                        if card.flash > 0 {
-                            appendTeleportFlash(&frame.lateFills, rect: rect.insetBy(dx: -2, dy: -1),
-                                                alpha: card.flash, scale: scale)
-                        }
-                        if card.blip {
-                            appendBlip(&frame.lateFills,
-                                       cell: NSRect(x: px + CGFloat(card.w / 2) * charW,
-                                                    y: py + art.step, width: charW, height: art.step),
-                                       scale: scale)
-                        }
+            guard let img = rasterUI(size: size, scale: scale, {
+                NSColor.black.withAlphaComponent(0.87).setFill()
+                NSBezierPath(roundedRect: NSRect(origin: .zero, size: size),
+                             xRadius: 3, yRadius: 3).fill()
+                var y = pad
+                for (i, line) in built.enumerated() {
+                    line.draw(at: NSPoint(x: pad, y: y))
+                    y += step
+                    if let art, art.afterRow == i {
+                        // Straight into this context, starting on a CELL BOUNDARY
+                        // of the panel's own grid — the art shares the chrome's
+                        // font, so its columns coincide with the rails and the
+                        // text below. Pixel-centering here is what kept knocking
+                        // the art off the grid.
+                        let totalCells = Int((width / charW).rounded())
+                        let lead = CGFloat(max(1, (totalCells - art.cols) / 2))
+                        let ox = pad + lead * charW
+                        AlbumArtGrid.draw(rows: art.rows, at: NSPoint(x: ox, y: y), step: art.step)
                     }
                 }
-            }
-        }) else { return }
-        metal.setUITexture(key, image: img, always: true)
+            }) else { return }
+            image = img
+            widgetPanelRasters[key] = WidgetPanelRaster(
+                rows: rows, art: artSig, scale: scale, charW: charW, lineH: lineH,
+                width: width, size: size, image: img, used: widgetPanelSerial)
+            metal.setUITexture(key, image: img, always: true)
+        }
         frame.quads.append(.init(key: key, rect: CGRect(
             x: origin.x, y: origin.y - size.height,
             width: size.width, height: size.height),
             maskToWipedCells: mask))
+        if let art, let card = art.card, card.flash > 0 || card.blip {
+            // The spinner's own flash and blip, over the card's cells, in
+            // screen space (the panel's top-left plus the raster's offsets),
+            // drawn late — over the quad. Placed where the raster put the
+            // art, and appended every frame: the raster may be cached, the
+            // choreography never is.
+            let totalCells = Int((width / charW).rounded())
+            let lead = CGFloat(max(1, (totalCells - art.cols) / 2))
+            let ox = pad + lead * charW
+            let y = pad + step * CGFloat(art.afterRow + 1)
+            let px = origin.x + ox + CGFloat(card.x) * charW
+            let py = origin.y - size.height + y + CGFloat(card.y) * art.step
+            let rect = NSRect(x: px, y: py, width: CGFloat(card.w) * charW,
+                              height: CGFloat(card.h) * art.step)
+            if card.flash > 0 {
+                appendTeleportFlash(&frame.lateFills, rect: rect.insetBy(dx: -2, dy: -1),
+                                    alpha: card.flash, scale: scale)
+            }
+            if card.blip {
+                appendBlip(&frame.lateFills,
+                           cell: NSRect(x: px + CGFloat(card.w / 2) * charW,
+                                        y: py + art.step, width: charW, height: art.step),
+                           scale: scale)
+            }
+        }
     }
 
     private func buildWidgetQuads(_ frame: inout BoomMetalRenderer.FrameInput,
                                   metal: BoomMetalRenderer, scale: CGFloat) {
         pollWidgetFeed()
         guard font != nil else { return }
+        // Every panel emitted below stamps its raster with this serial; what
+        // is left unstamped on the way out — including the way out through
+        // the stale-feed guard — is a panel that is gone, and so is its image.
+        widgetPanelSerial &+= 1
+        defer {
+            if widgetPanelRasters.contains(where: { $0.value.used != widgetPanelSerial }) {
+                widgetPanelRasters = widgetPanelRasters.filter { $0.value.used == widgetPanelSerial }
+            }
+        }
         let mask = intro == .boom
-        let wall = Date().timeIntervalSince1970
+        // The feed's timestamps are wall-clock; so is the panels' idea of
+        // "now" — except under a pinned clock (CODESAVER_CLOCK_EPOCH), where
+        // it follows the same epoch + sim time the clock does, so a fixture
+        // whose stamps are written against that epoch renders byte-identical
+        // frames. Unset (the appex), it is Date() as before.
+        let wall = Self.clockEpoch.map { $0.timeIntervalSince1970 + now }
+            ?? Date().timeIntervalSince1970
         guard wall - widgetFeed.updated < 20 else { return }   // daemon stale → nothing
 
         let base = font!
@@ -3236,19 +3344,34 @@ public final class CodeSaverView: ScreenSaverView {
         let full = NSSize(width: panel.width + shadowPad * 2,
                           height: panel.height + shadowPad * 2)
         let bAlpha = backdropAlpha
-        guard let img = rasterUI(size: full, scale: scale, {
-            if bAlpha > 0.02, let pimg = panelCacheImage,
-               let cg = NSGraphicsContext.current?.cgContext {
-                cg.saveGState()
-                if bAlpha < 1 { cg.setAlpha(bAlpha) }
-                cg.translateBy(x: 0, y: full.height)
-                cg.scaleBy(x: 1, y: -1)
-                cg.draw(pimg, in: CGRect(origin: .zero, size: full))
-                cg.restoreGState()
-            }
-            text.draw(at: NSPoint(x: shadowPad + padH, y: shadowPad + padV))
-        }) else { return }
-        metal.setUITexture("panel", image: img, always: true)
+        // Same cache as the widget panels, one entry: while the statusline
+        // works, its glyph and glow sweep change the text every frame and
+        // this is a miss; at rest ("✻ Verbed for 2m 7s") the raster and its
+        // upload are skipped for the whole pause.
+        let img: CGImage
+        if let c = heroPanelRaster, c.scale == scale, c.full == full, c.alpha == bAlpha,
+           c.backdrop == panelCacheKey, c.text.isEqual(to: text) {
+            img = c.image
+            metal.setUITexture("panel", image: img)
+        } else {
+            guard let fresh = rasterUI(size: full, scale: scale, {
+                if bAlpha > 0.02, let pimg = panelCacheImage,
+                   let cg = NSGraphicsContext.current?.cgContext {
+                    cg.saveGState()
+                    if bAlpha < 1 { cg.setAlpha(bAlpha) }
+                    cg.translateBy(x: 0, y: full.height)
+                    cg.scaleBy(x: 1, y: -1)
+                    cg.draw(pimg, in: CGRect(origin: .zero, size: full))
+                    cg.restoreGState()
+                }
+                text.draw(at: NSPoint(x: shadowPad + padH, y: shadowPad + padV))
+            }) else { return }
+            img = fresh
+            heroPanelRaster = HeroPanelRaster(
+                text: NSAttributedString(attributedString: text), full: full, alpha: bAlpha,
+                scale: scale, backdrop: panelCacheKey, image: fresh)
+            metal.setUITexture("panel", image: fresh, always: true)
+        }
         frame.quads.append(.init(key: "panel",
                                  rect: NSRect(x: panel.minX - shadowPad,
                                               y: panel.minY - shadowPad,
@@ -3260,6 +3383,16 @@ public final class CodeSaverView: ScreenSaverView {
                                 alpha: arrivalFlash, scale: scale)
         }
     }
+
+    private struct HeroPanelRaster {
+        var text: NSAttributedString
+        var full: NSSize
+        var alpha: CGFloat
+        var scale: CGFloat
+        var backdrop: String     // panelCacheKey the backdrop was drawn from
+        var image: CGImage
+    }
+    private var heroPanelRaster: HeroPanelRaster?
 
     private var boomFreshCells: [Int] = []
     private var introNeedsFullRedraw = true
