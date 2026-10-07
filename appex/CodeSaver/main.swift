@@ -18,8 +18,9 @@ import ServiceManagement
 
 let args = CommandLine.arguments
 
-// The widget feed daemon — merges Claude Code hook state + bifrocate CoT
-// spools + now-playing into widgets/feed.json in the app-group container.
+// The widget feed daemon — merges Claude Code hook state + the mods' live
+// state and pin files + now-playing into widgets/feed.json in the app-group
+// container.
 if args.contains("--feeds") {
     FeedsService.runDaemon()
 }

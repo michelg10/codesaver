@@ -4,8 +4,11 @@
 Registered (async) on ~10 hook events in ~/.claude/settings.json, and invoked
 with --statusline from the statusline wrapper. Each call folds one event into
 ~/.claude/codesaver/sessions/<session_id>.json (atomic replace). The CodeSaver
-feeds daemon (`CodeSaver --feeds`) merges these files with bifrocate's CoT
-spools and mirrors the result into the app-group container for the saver.
+feeds daemon (`CodeSaver --feeds`) merges these files with the pause and pin
+mods' live state files (~/.claude/live) and mirrors the result into the
+app-group container for the saver. The live file decides a session's state
+when it has one; this file stays the base -- it alone sees permission
+dialogs, and it covers sessions that don't load the mods.
 
 Contract: NEVER write to stdout (UserPromptSubmit/SessionStart stdout is
 injected into Claude's context), never exit non-zero, stay fast. Subagent

@@ -1707,15 +1707,19 @@ public final class CodeSaverView: ScreenSaverView {
     //
     // Reads widgets/feed.json — written into the app-group container by
     // `CodeSaver --feeds` (FeedsService.swift), which merges Claude Code
-    // hook state, bifrocate CoT spools, and the local music player. Panels
-    // follow the approved design: rounded TUI boxes bottom-left, one per
-    // live session, glyph in Claude orange (orange = actual Claude Code;
-    // violet stays the saver's own theater), music bottom-right. A stale
-    // feed (daemon gone) removes every panel — never show frozen state as
-    // if it were live. A session pinned in bifrocate (its pin daemon keeps
-    // the prompt cache warm with keep-alive pings) rests as
-    // `✻ Pinned (next ping in 35m ∙ 2h 32m ago)` and sits above the other
-    // resting panels.
+    // hook state, the claude-mods live state and pin files, and the local
+    // music player. Panels follow the approved design: rounded TUI boxes
+    // bottom-left, one per live session, glyph in Claude orange (orange =
+    // actual Claude Code; violet stays the saver's own theater), music
+    // bottom-right. A stale feed (daemon gone) removes every panel — never
+    // show frozen state as if it were live. A pinned session (the pin mod
+    // keeps its prompt cache warm with keep-alive pings) rests as
+    // `✻ Pinned (next ping in 35m ∙ 2h 32m ago)` above the other resting
+    // panels. A paused one (the pause mod: /pause, or Presence's Suspend)
+    // still works while what was under way finishes —
+    // `✽ Pausing… waiting for Bash (42s ∙ elapsed 3m 12s)`, the time
+    // counted from the pause — then rests as `✻ Paused (12m ∙ elapsed 15m)`
+    // above the pinned ones.
     //
     // The music panel's art box is there from a track's first frame, sized
     // from the saved tuning. While the cover is on its way it is a CRT seen
@@ -1738,10 +1742,13 @@ public final class CodeSaverView: ScreenSaverView {
         var stateSince: Double?
         var bg: [String: Int] = [:]
         var pin: WidgetPin?
+        /// "pausing" only: what the pause still waits on — tool names, or
+        /// "model" for a request in flight (feed `waiting_for`).
+        var waitingFor: [String] = []
     }
 
-    /// bifrocate's pin daemon has this session (feed `pin`). `fresh` is
-    /// false when the daemon hasn't written its state lately.
+    /// The pin mod has this session pinned (feed `pin`). `fresh` is false
+    /// when its pin file hasn't been rewritten for a minute.
     private struct WidgetPin {
         var pinnedAt: Double = 0
         var status: String?
@@ -1853,6 +1860,8 @@ public final class CodeSaverView: ScreenSaverView {
             w.lastActive = raw["last_active"] as? Double
             w.stateSince = raw["state_since"] as? Double
             w.bg = raw["bg"] as? [String: Int] ?? [:]
+            w.waitingFor = (raw["waiting_for"] as? [String] ?? [])
+                .map { $0.precomposedStringWithCanonicalMapping }
             if let p = raw["pin"] as? [String: Any] {
                 var pin = WidgetPin()
                 pin.pinnedAt = p["pinned_at"] as? Double ?? 0
@@ -2619,20 +2628,33 @@ public final class CodeSaverView: ScreenSaverView {
         return out
     }
 
+    /// Whether a panel is working — everything but a resting Done or
+    /// Paused. "pausing" works: the pause still waits on a tool or a reply.
+    private func widgetActive(_ w: WidgetSession) -> Bool {
+        w.state != "done" && w.state != "paused"
+    }
+
     private func widgetStateLabel(_ w: WidgetSession) -> String {
         switch w.state {
         case "thinking":     return "Thinking"
         case "responding":   return "Responding"
-        case "toolcall":     return "\(w.tool ?? "?"): emit"
+        // A live file from before the contract named the streaming tool
+        // call has none to give.
+        case "toolcall":     return w.tool.map { "\($0): emit" } ?? "Writing tool call"
         case "waiting_tool": return "\(w.tool ?? "?"): exec"
         case "permission":   return "Permissions required"
+        case "pausing":
+            let on = w.waitingFor.map { $0 == "model" ? "the model" : $0 }
+            return on.isEmpty ? "Pausing\u{2026}"
+                : "Pausing\u{2026} waiting for " + on.joined(separator: ", ")
+        case "paused":       return "Paused"
         default:             return w.pin != nil ? "Pinned" : "Done"
         }
     }
 
-    /// "next ping in 35m", or the pin daemon's reason there isn't one.
+    /// "next ping in 35m", or the pin's reason there isn't one.
     private func widgetPinNext(_ pin: WidgetPin, wall: Double) -> String {
-        guard pin.fresh else { return "pin daemon silent" }
+        guard pin.fresh else { return "pin silent" }
         switch pin.status {
         case "waiting":
             guard let n = pin.nextPingAt else { return "pinned" }
@@ -2640,11 +2662,9 @@ public final class CodeSaverView: ScreenSaverView {
         case "sent":     return "pinging\u{2026}"
         case "busy":     return "next ping after this turn"
         case "cold":     return "cache cold"
-        case "held":     return "ping held"
         case "stalled":  return "pings stalled"
         case "error":    return "ping failed"
-        case "gone":     return "session gone"
-        case "no_spool", "not_claude", "no_registry": return "not pingable"
+        case "limited":  return "pings off: usage limit"
         default:         return "pinned"
         }
     }
@@ -2674,7 +2694,21 @@ public final class CodeSaverView: ScreenSaverView {
     /// The "(4m 12s ∙ 8.2k tokens ∙ …)" tail; nil during the latency window.
     private func widgetParen(_ w: WidgetSession, wall: Double) -> String? {
         var parts: [String] = []
-        if w.state != "done" {
+        if w.state == "paused" {
+            // Paused and settled: since when — spans, not a ticking clock: a
+            // pause can last the night — then the turn it caught, if it
+            // caught one, and what carries on through it: the pin's pings,
+            // background work.
+            if let ss = w.stateSince, wall > ss { parts.append(spanString(wall - ss)) }
+            if w.turnEnded == nil, let t0 = w.turnStarted, wall > t0 + 1 {
+                parts.append("elapsed " + spanString(wall - t0))
+            }
+            if let pin = w.pin { parts.append(widgetPinNext(pin, wall: wall)) }
+            if let bgl = widgetBGLabel(w.bg) { parts.append(bgl) }
+            guard !parts.isEmpty else { return nil }
+            return "(" + parts.joined(separator: " \u{2219} ") + ")"
+        }
+        if widgetActive(w) {
             // Active: time in THIS state, then the turn's totals.
             if let ss = w.stateSince, wall > ss { parts.append(timeString(wall - ss)) }
             if let tok = w.turnTokens, tok > 0 { parts.append("\(countString(Double(tok))) tokens") }
@@ -2685,7 +2719,7 @@ public final class CodeSaverView: ScreenSaverView {
             return "(" + parts.joined(separator: " \u{2219} ") + ")"
         }
         if let pin = w.pin {
-            // Pinned and resting: what the pin daemon does next, then how
+            // Pinned and resting: what the pin mod does next, then how
             // long the pin has been held. The tokens/background tail gives
             // way — the pin is the story of a resting pinned panel.
             parts.append(widgetPinNext(pin, wall: wall))
@@ -2920,8 +2954,10 @@ public final class CodeSaverView: ScreenSaverView {
         // turn-start order, which would have kept four resting panels over
         // a long-running tool call or a parked permission prompt).
         let sessions = Array(widgetFeed.sessions.sorted { l, r in
-            let la = l.state != "done", ra = r.state != "done"
+            let la = widgetActive(l), ra = widgetActive(r)
             if la != ra { return la }
+            let lz = l.state == "paused", rz = r.state == "paused"   // paused rests above pinned
+            if lz != rz { return lz }
             let lp = l.pin != nil, rp = r.pin != nil      // pinned rests above resting
             if lp != rp { return lp }
             return (l.turnStarted ?? 0) > (r.turnStarted ?? 0)
@@ -2983,7 +3019,7 @@ public final class CodeSaverView: ScreenSaverView {
             y - CGFloat($0) * pitch - panelH >= heroBottom
         }.count
         for (i, c) in contents.prefix(fitCount).enumerated().reversed() {
-            let active = c.w.state != "done"
+            let active = widgetActive(c.w)
             let rC = active ? railC : railDimC
             // Frames 1...5 only: at panel scale the hero's "·" rest frame
             // reads as a dropout, not a beat.
@@ -3037,8 +3073,9 @@ public final class CodeSaverView: ScreenSaverView {
                     }
                     runs.append((String(ch), attrs))
                 }
-            } else if c.w.pin != nil {
-                // Kept warm: the glyph in quiet clay, the words resting grey.
+            } else if c.w.pin != nil || c.w.state == "paused" {
+                // Kept warm, or held where the pause caught it: the glyph in
+                // quiet clay, the words resting grey.
                 runs.append((glyphFrame + " ",
                              run(ccOrange.blended(withFraction: 0.45, of: doneC) ?? doneC)))
                 runs.append((c.label, run(doneC)))

@@ -2,8 +2,8 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- LaunchAgent registered by SMAppService (see FeedsService.swift).
      Keeps `CodeSaver --feeds` alive: the widget feed daemon that merges
-     Claude Code hook state + bifrocate CoT spools + now-playing into
-     widgets/feed.json in the app-group container. Cheap by construction
+     Claude Code hook state + the mods' live state and pin files +
+     now-playing into widgets/feed.json in the app-group container. Cheap by construction
      (a 1s merge over tiny files, ~4% of a core) — and run at STANDARD
      priority on purpose: as a Background/nice/low-I/O job it was starved
      outright whenever normal-priority work saturated the machine (one

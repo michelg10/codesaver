@@ -3,24 +3,42 @@
 //  CodeSaver
 //
 //  The widget feed daemon: `CodeSaver --feeds`, kept alive by the
-//  com.michelg10.CodeSaver.feeds LaunchAgent. Merges four sources into
+//  com.michelg10.CodeSaver.feeds LaunchAgent. Merges five sources into
 //  one widgets/feed.json in the app-group container (the only place the
 //  sandboxed saver can read):
 //
 //    1. ~/.claude/codesaver/sessions/*.json — per-session state written by
 //       the Claude Code hook script (feeds/cc-state-hook.py) and statusline
 //       wrapper: coarse state machine, permission waits, background tasks,
-//       token counts.
-//    2. ~/.bifrocate/cot/*.jsonl — bifrocate's main-agent CoT spools:
-//       fine-grained thinking / toolcall-writing states and interrupt
-//       (`superseded`) markers, ~1s off the wire.
-//    3. Now playing — Music.app / Spotify via AppleScript, polled only
+//       token counts. The base record: the only source that sees a
+//       permission dialog, and the only one for a session that doesn't
+//       load the mods below.
+//    2. $CLAUDE_LIVE_DIR/<sid>.json (default ~/.claude/live) — the live
+//       state file claude-mods' pause mod keeps for its session (the
+//       contract is ~/bin/claude-mods/PAUSE.md): every model request and
+//       tool call in flight, main agent and subagents (thinking,
+//       responding, writing a tool call, which tool is running, held at
+//       the pause gate), how the last turn ended (`aborted` = Esc — no
+//       more guessing an interrupt from silence), context size,
+//       background tasks, and whether the session is paused and since
+//       when. A session with a fresh one takes its state from it.
+//    3. $CLAUDE_LIVE_DIR/pins/<sid>.json — the pin mod, one file per
+//       pinned session (kept warm with keep-alive pings): what it will do
+//       next. A pinned session stays on the rack while its pin lives,
+//       even past the hour.
+//    4. Now playing — Music.app / Spotify via AppleScript, polled only
 //       while the player is actually running; a paused track is held for
 //       half an hour.
-//    4. ~/.bifrocate/pins.json + pins.state.json — bifrocate's pin daemon:
-//       which sessions are pinned (kept warm with keep-alive pings) and,
-//       per pin, what the daemon will do next. A pinned session stays on
-//       the rack while its pin lives, even past the hour.
+//    5. LEGACY — ~/.bifrocate/cot/*.jsonl, bifrocate's main-agent CoT
+//       spools. Read only for a session without a fresh live file. Since
+//       Claude Code moved to server-side threads the spool misses most
+//       requests; remove it (tailSpools, SpoolState, the spools
+//       publisher) once the mods are loaded in every session.
+//
+//  Every directory honours an environment override — CLAUDE_LIVE_DIR as
+//  the mods themselves do, CODESAVER_SESSIONS_DIR and CODESAVER_SPOOL_DIR
+//  for the other two — so Sources/FeedsCheck.swift can run the merge on
+//  fabricated files, never on a live session's.
 //
 //  Publish/subscribe. Each source is polled by its own PUBLISHER thread at
 //  its own cadence, and the result — an immutable snapshot, stamped with
@@ -47,8 +65,11 @@
 //  million of them — 20 GB, nearly all of it in the compressor. A loop
 //  that runs forever drains its own pool. Law, like the pipe fds below.
 //
-//  The merge rule is recency: the freshest signal wins, except a
-//  PermissionRequest holds until any newer event for that session.
+//  The merge: a fresh live file (its pid alive, written within the last
+//  60 s) decides a session's state; without one, recency between the hook
+//  file and the spool — the freshest signal wins. Either way a
+//  PermissionRequest holds until any newer event for that session: the
+//  live file doesn't report permission dialogs (v1).
 //  Host app target only.
 //
 
@@ -61,15 +82,32 @@ enum FeedsService {
 
     // MARK: Paths
 
-    private static var home: URL { FileManager.default.homeDirectoryForCurrentUser }
-    private static var hookDir: URL { home.appendingPathComponent(".claude/codesaver/sessions") }
-    private static var spoolDir: URL { home.appendingPathComponent(".bifrocate/cot") }
-    private static var pinsURL: URL { home.appendingPathComponent(".bifrocate/pins.json") }
-    private static var pinStateURL: URL { home.appendingPathComponent(".bifrocate/pins.state.json") }
+    /// `$name` when set, else `fallback` under home. Resolved ONCE (static
+    /// lets): the publishers touch these per file per second, and
+    /// ProcessInfo.environment copies the whole environment on every call.
+    /// A test sets its overrides before the first read.
+    private static func envDir(_ name: String, _ fallback: String) -> URL {
+        if let v = ProcessInfo.processInfo.environment[name], !v.isEmpty {
+            return URL(fileURLWithPath: (v as NSString).expandingTildeInPath, isDirectory: true)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(fallback)
+    }
+    private static let hookDir = envDir("CODESAVER_SESSIONS_DIR", ".claude/codesaver/sessions")
+    private static let liveDir = envDir("CLAUDE_LIVE_DIR", ".claude/live")
+    private static let pinsDir = liveDir.appendingPathComponent("pins", isDirectory: true)
+    /// LEGACY: bifrocate's CoT spools — goes with tailSpools.
+    private static let spoolDir = envDir("CODESAVER_SPOOL_DIR", ".bifrocate/cot")
     static var widgetsDir: URL? { CorpusStore.widgetsDirectory }
+
+    /// PAUSE.md's staleness rule for live and pin files: a file not
+    /// rewritten for a minute (the writers heartbeat every 15 s and 30 s)
+    /// has no writer left, or one that is wedged.
+    private static let liveStaleAfter: TimeInterval = 60
 
     // MARK: Per-session model
 
+    /// LEGACY: one session's view off bifrocate's spool — goes with
+    /// tailSpools once every session loads the mods.
     private struct SpoolState {
         var state = ""          // thinking | responding | toolcall | waiting_tool | done
         var tool: String?
@@ -115,6 +153,155 @@ enum FeedsService {
         }
     }
 
+    /// A live state file as the pause mod writes it (PAUSE.md, "Live state
+    /// files"). Every field optional — the contract makes pid, model,
+    /// context.tokens and the turn's times nullable, and a decode that
+    /// demanded a field the writer left out would drop the whole session.
+    /// Times are epoch MILLISECONDS here; LiveRecord carries seconds.
+    private struct LiveFile: Decodable {
+        struct Turn: Decodable {
+            var state: String?           // working | done | idle
+            var started: Double?
+            var ended: Double?
+            var end: String?             // answer | aborted | error | refusal
+            var tokens: Double?          // context growth this turn
+        }
+        struct Activity: Decodable {
+            var agent: String?           // "main", or a subagent's id
+            var state: String?
+            var tool: String?
+            var since: Double?
+        }
+        struct Context: Decodable { var tokens: Double? }
+        struct BackgroundTask: Decodable { var type: String? }
+        var pid: LenientInt?
+        var cwd: String?
+        var updated: Double?
+        var mainChanged: Double?         // the main conversation's last change
+        var pausedSince: Double?         // the oldest hold's since
+        var turn: Turn?
+        var paused: Bool?
+        var settled: Bool?
+        var activities: [Activity]?
+        var background: [BackgroundTask]?
+        var context: Context?
+    }
+
+    /// One thing in flight off a live file — a model request or a tool
+    /// call, the main agent's or a subagent's.
+    private struct LiveActivity {
+        var main: Bool
+        var state: String    // held | requesting | thinking | responding | writing-tool-call | tool
+        var tool: String?
+        var since: Double
+    }
+
+    /// A live file, decoded, in seconds: what the live publisher hands the
+    /// merge.
+    private struct LiveRecord {
+        var pid: Int?
+        var updated: Double
+        var cwd: String?
+        var turnState: String        // working | done | idle
+        var mainChanged: Double?     // nil from a writer older than the field
+        var turnStarted: Double?
+        var turnEnded: Double?
+        var turnTokens: Int?         // context growth this turn, when the file knows
+        var paused: Bool
+        var settled: Bool
+        var pausedSince: Double?     // when the current pause began
+        var activities: [LiveActivity]
+        var background: [String: Int]   // type -> count, the hook's `bg` shape
+        var contextTokens: Int?
+
+        init?(_ data: Data) {
+            guard let f = try? JSONDecoder().decode(LiveFile.self, from: data),
+                  let updated = f.updated else { return nil }
+            func s(_ ms: Double?) -> Double? { ms.map { $0 / 1000 } }
+            pid = f.pid?.value
+            self.updated = updated / 1000
+            cwd = f.cwd
+            mainChanged = s(f.mainChanged)
+            turnState = f.turn?.state ?? "idle"
+            turnStarted = s(f.turn?.started)
+            turnEnded = s(f.turn?.ended)
+            turnTokens = f.turn?.tokens.flatMap { Int(exactly: $0.rounded()) }
+            paused = f.paused ?? false
+            settled = f.settled ?? false
+            pausedSince = s(f.pausedSince)
+            activities = (f.activities ?? []).compactMap { a in
+                guard let st = a.state, let since = a.since else { return nil }
+                return LiveActivity(main: (a.agent ?? "main") == "main", state: st,
+                                    tool: a.tool, since: since / 1000)
+            }
+            // Counted by type, as the hook folds Stop's background_tasks:
+            // the panel says "2 shells, 1 agent still running".
+            var bg: [String: Int] = [:]
+            for t in f.background ?? [] { bg[t.type ?? "task", default: 0] += 1 }
+            background = bg
+            contextTokens = f.context?.tokens.flatMap { Int(exactly: $0.rounded()) }
+        }
+
+        /// The main conversation's last change: what a hook timestamp — a
+        /// permission prompt, which the hook only ever sees for the main
+        /// agent — is ranked against. Never `updated` (the 15 s heartbeat),
+        /// nor `changed`, which also moves with a subagent's step and any
+        /// hold coming or going: a background subagent would end a prompt
+        /// the main agent still has open. A writer older than `mainChanged`
+        /// gets the same answer, nearly, from the main agent's own stamps.
+        var mainChangedAt: Double {
+            mainChanged ?? stamps(mainOnly: true)
+        }
+
+        /// The last real use, for the hour rule: any agent's step, the
+        /// turn's start and end. Not `changed` either: a Suspend lands a
+        /// hold on every session, and must not make one idle for hours
+        /// look used again.
+        var usedAt: Double {
+            max(stamps(mainOnly: false), mainChanged ?? 0)
+        }
+
+        private func stamps(mainOnly: Bool) -> Double {
+            var t = max(turnStarted ?? 0, turnEnded ?? 0)
+            for a in activities where a.main || !mainOnly { t = max(t, a.since) }
+            return t
+        }
+    }
+
+    /// A pin file (PAUSE.md, "Pin files"), epoch milliseconds.
+    private struct PinFile: Decodable {
+        var pid: LenientInt?
+        var updated: Double?
+        var pinnedAt: Double?
+        var status: String?          // waiting | busy | sent | cold | stalled | error
+        var nextPingAt: Double?
+        var pingedAt: Double?
+        var pings: Double?
+    }
+
+    /// A pin file, decoded, in seconds.
+    private struct PinRecord {
+        var pid: Int?
+        var updated: Double
+        var pinnedAt: Double
+        var status: String?
+        var nextPingAt: Double?
+        var pingedAt: Double?
+        var pings: Int?
+
+        init?(_ data: Data) {
+            guard let f = try? JSONDecoder().decode(PinFile.self, from: data),
+                  let updated = f.updated else { return nil }
+            pid = f.pid?.value
+            self.updated = updated / 1000
+            pinnedAt = (f.pinnedAt ?? 0) / 1000
+            status = f.status
+            nextPingAt = f.nextPingAt.map { $0 / 1000 }
+            pingedAt = f.pingedAt.map { $0 / 1000 }
+            pings = f.pings.flatMap { Int(exactly: $0.rounded()) }
+        }
+    }
+
     // MARK: File metadata
 
     /// mtime + size straight from stat(2). FileManager.attributesOfItem
@@ -128,6 +315,15 @@ enum FeedsService {
         let m = st.st_mtimespec
         return (Date(timeIntervalSince1970: Double(m.tv_sec) + Double(m.tv_nsec) / 1e9),
                 UInt64(max(0, st.st_size)))
+    }
+
+    /// Whether `pid` still names a process. ESRCH only — EPERM means it
+    /// exists, and a recycled pid merely keeps today's behaviour. No pid
+    /// (a writer that had none to give) can't be checked and counts as
+    /// alive, leaving the timestamps to decide.
+    private static func pidAlive(_ pid: Int?) -> Bool {
+        guard let pid, pid > 1, let p = pid_t(exactly: pid) else { return true }
+        return !(kill(p, 0) != 0 && errno == ESRCH)
     }
 
     // MARK: Publisher
@@ -184,16 +380,6 @@ enum FeedsService {
         let h: HookState
     }
 
-    /// bifrocate's pins: which sessions are pinned, what its daemon last
-    /// reported per pin, and whether that report is fresh (written at least
-    /// every 30 s while the daemon runs; older than 90 s means nobody is
-    /// pinging).
-    private struct PinsSnapshot {
-        var pins: [String: Any] = [:]
-        var entries: [String: Any] = [:]
-        var fresh = false
-    }
-
     /// The player as last polled. `polledAt` is when the answer came back,
     /// so the subscriber can carry a playing position forward to the second
     /// it publishes.
@@ -226,6 +412,16 @@ enum FeedsService {
             return readSessionFiles()
         }
 
+        // The mods' live files, one per session, rewritten on every change
+        // and at least every 15 s.
+        var liveCache: [String: Cached<LiveRecord>] = [:]
+        let live = Publisher("live", every: 1.0) { () -> [String: LiveRecord] in
+            readLiveFiles(&liveCache)
+        }
+
+        // LEGACY: bifrocate's spools, the fallback for a session without a
+        // fresh live file. Remove with tailSpools once the mods are loaded
+        // everywhere.
         var offsets: [String: UInt64] = [:]          // spool path -> bytes consumed
         var spool: [String: SpoolState] = [:]        // session id -> spool view
         let spools = Publisher("spools", every: 1.0) { () -> [String: SpoolState] in
@@ -233,14 +429,11 @@ enum FeedsService {
             return spool
         }
 
-        var pinsCache = JSONCache()
-        var pinStateCache = JSONCache()
-        let pins = Publisher("pins", every: 1.0) { () -> PinsSnapshot in
-            let state = cachedJSON(pinStateURL, &pinStateCache)
-            return PinsSnapshot(
-                pins: (cachedJSON(pinsURL, &pinsCache)["pins"] as? [String: Any]) ?? [:],
-                entries: (state["sessions"] as? [String: Any]) ?? [:],
-                fresh: Date().timeIntervalSince1970 - ((state["updated_at"] as? Double) ?? 0) < 90)
+        // The pin mod's files, one per pinned session, rewritten on every
+        // change and at least every 30 s.
+        var pinCache: [String: Cached<PinRecord>] = [:]
+        let pins = Publisher("pins", every: 1.0) { () -> [String: PinRecord] in
+            readJSONDir(pinsDir, &pinCache) { PinRecord($0) }
         }
 
         // The one publisher that spawns processes (pgrep, osascript) — the
@@ -315,11 +508,13 @@ enum FeedsService {
         // a source.
         var stateSince: [String: (String, Double)] = [:]   // session id -> (state, since)
         var lastFeed = ""
-        // Let the two local-file publishers land their first snapshot before
+        // Let the local-file publishers land their first snapshot before
         // the first publish, so a daemon bounce doesn't flash an empty rack
-        // for a second. Bounded: a stuck source must not hold the feed.
+        // (or a pinned panel) for a second. Bounded: a stuck source must not
+        // hold the feed.
         let ready = Date().addingTimeInterval(3)
-        while (sessions.latest == nil || spools.latest == nil), Date() < ready {
+        while (sessions.latest == nil || live.latest == nil || spools.latest == nil
+               || pins.latest == nil), Date() < ready {
             Thread.sleep(forTimeInterval: 0.05)
         }
         // The main thread has no run loop to drain a pool for it either:
@@ -328,8 +523,9 @@ enum FeedsService {
             autoreleasepool {
                 let started = Date()
                 let feed = buildFeed(hooks: sessions.latest?.value ?? [],
+                                     live: live.latest?.value ?? [:],
                                      spool: spools.latest?.value ?? [:],
-                                     pins: pins.latest?.value ?? PinsSnapshot(),
+                                     pins: pins.latest?.value ?? [:],
                                      nowPlaying: nowPlaying.latest,
                                      stateSince: &stateSince)
                 if feed != lastFeed, let dir = widgetsDir {
@@ -374,8 +570,12 @@ enum FeedsService {
         return out
     }
 
-    // MARK: Spool tailing
+    // MARK: Spool tailing (LEGACY)
 
+    /// bifrocate's CoT spools. Since Claude Code moved to server-side
+    /// threads they miss most requests; the merge reads them only for a
+    /// session without a fresh live file. Remove this, SpoolState, spoolDir
+    /// and the spools publisher once the mods are loaded in every session.
     private static func tailSpools(offsets: inout [String: UInt64],
                                    spool: inout [String: SpoolState]) {
         let fm = FileManager.default
@@ -475,150 +675,317 @@ enum FeedsService {
         }
     }
 
-    // MARK: Pins (bifrocate's pin daemon)
+    // MARK: Live and pin files (claude-mods)
 
-    /// A decoded JSON object cached by mtime. Both pin files are tiny and
-    /// rewritten rarely — pins.json on a toggle, pins.state.json on change or
-    /// every ~30s — so a stat per poll is all they cost.
-    private struct JSONCache { var mtime: Date?; var obj: [String: Any] = [:] }
+    /// A decoded file and the stat it was decoded at.
+    private struct Cached<T> { var mtime: Date; var size: UInt64; var value: T }
 
-    private static func cachedJSON(_ url: URL, _ cache: inout JSONCache) -> [String: Any] {
-        let m = fileStat(url.path)?.mtime
-        if m == cache.mtime { return cache.obj }
-        cache.mtime = m
-        guard m != nil, let data = try? Data(contentsOf: url),
-              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        else { cache.obj = [:]; return [:] }
-        cache.obj = obj
-        return obj
+    /// Every `<sid>.json` in `dir`, decoded and keyed by session id. A file whose
+    /// stat hasn't moved since the last poll comes out of `cache`, so a quiet
+    /// session costs one stat a second. A decode that fails — the writer
+    /// caught mid-write, which PAUSE.md allows ("a reader that hits a
+    /// half-written file just tries again next poll") — keeps the last good
+    /// value and is retried next poll. Files untouched for `maxAge` are
+    /// skipped unread, and dot-files are a writer's temp.
+    private static func readJSONDir<T>(_ dir: URL, maxAge: TimeInterval? = nil,
+                                       _ cache: inout [String: Cached<T>],
+                                       _ decode: (Data) -> T?) -> [String: T] {
+        let base = dir.path
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: base)) ?? []
+        let cutoff = maxAge.map { Date().addingTimeInterval(-$0) }
+        var out: [String: T] = [:]
+        for name in names where name.hasSuffix(".json") && !name.hasPrefix(".") {
+            let path = base + "/" + name
+            guard let (mtime, size) = fileStat(path) else { continue }
+            if let cutoff, mtime < cutoff { continue }
+            let key = String(name.dropLast(5))
+            if let c = cache[key], c.mtime == mtime, c.size == size {
+                out[key] = c.value
+            } else if let data = FileManager.default.contents(atPath: path),
+                      let v = decode(data) {
+                cache[key] = Cached(mtime: mtime, size: size, value: v)
+                out[key] = v
+            } else if let c = cache[key] {
+                out[key] = c.value
+            }
+        }
+        if cache.count > out.count { cache = cache.filter { out[$0.key] != nil } }
+        return out
+    }
+
+    /// The live files that could still be fresh: one not rewritten for a
+    /// minute is stale whatever it says, so it isn't even read.
+    private static func readLiveFiles(_ cache: inout [String: Cached<LiveRecord>]) -> [String: LiveRecord] {
+        readJSONDir(liveDir, maxAge: liveStaleAfter, &cache) { LiveRecord($0) }
+    }
+
+    /// One merge over the file sources, each read right here — what
+    /// Sources/FeedsCheck.swift runs against fabricated files. No
+    /// now-playing (its poll spawns processes), no prune, no write;
+    /// `stateSince` carries across calls as the daemon's does across ticks.
+    static func feedOnce(stateSince: inout [String: (String, Double)]) -> String {
+        var offsets: [String: UInt64] = [:]
+        var spool: [String: SpoolState] = [:]
+        tailSpools(offsets: &offsets, spool: &spool)
+        var liveCache: [String: Cached<LiveRecord>] = [:]
+        var pinCache: [String: Cached<PinRecord>] = [:]
+        return buildFeed(hooks: readSessionFiles(),
+                         live: readLiveFiles(&liveCache),
+                         spool: spool,
+                         pins: readJSONDir(pinsDir, &pinCache) { PinRecord($0) },
+                         nowPlaying: nil, stateSince: &stateSince)
     }
 
     // MARK: Merge + feed
 
+    /// What a fresh live file says its session is doing, in the feed's
+    /// words: the state, its tool, when the file says it began, and — while
+    /// a pause still waits on work under way — what it waits for. nil when
+    /// the file has nothing to say: no turn in this process yet (a session
+    /// just started, or resumed), where the hook's record stands.
+    private static func liveState(_ L: LiveRecord)
+        -> (state: String, tool: String?, since: Double?, waitingFor: [String])? {
+        if L.paused {
+            // The gate stops every new step; what was under way finishes.
+            // `settled` (PAUSE.md: paused, and every activity held or none
+            // left) is "Paused". Until then the session is still working,
+            // and the panel says on what — any agent's, oldest first: the
+            // main turn can sit held while a subagent's Bash runs on. Model
+            // requests all read alike ("model"), a tool by its name.
+            if L.settled { return ("paused", nil, L.pausedSince, []) }
+            var names: [String] = []
+            for a in L.activities.filter({ $0.state != "held" }).sorted(by: { $0.since < $1.since }) {
+                let n = a.state == "tool" ? (a.tool ?? "tool") : "model"
+                if !names.contains(n) { names.append(n) }
+            }
+            return ("pausing", nil, L.pausedSince, names)
+        }
+        switch L.turnState {
+        case "done":
+            // However it ended — an answer, Esc (`aborted`), an error — the
+            // turn is over the moment the file says so: an interrupt no
+            // longer sits out 120 s of silence before it reads as Done.
+            return ("done", nil, L.turnEnded, [])
+        case "working":
+            // The main agent's newest activity: parallel tool calls are
+            // separate entries, and the newest is the freshest signal. None
+            // at all is the beat between a reply's `stop` and its tools, or
+            // between the tools and the next request — the model's turn, as
+            // the hook's "working" always read.
+            guard let a = L.activities.filter({ $0.main }).max(by: { $0.since < $1.since })
+            else { return ("thinking", nil, nil, []) }
+            switch a.state {
+            case "responding":        return ("responding", nil, a.since, [])
+            // Named since the contract added `tool` here; an older writer's
+            // nameless one reads "Writing tool call".
+            case "writing-tool-call": return ("toolcall", a.tool, a.since, [])
+            case "tool":              return ("waiting_tool", a.tool, a.since, [])
+            case "held":
+                // At the gate in an unpaused session: the last hold just
+                // went, and the step is released within half a second.
+                return a.tool != nil ? ("waiting_tool", a.tool, a.since, [])
+                                     : ("thinking", nil, a.since, [])
+            default:                  return ("thinking", nil, a.since, [])  // requesting, thinking
+            }
+        default:
+            return nil
+        }
+    }
+
     /// The subscriber's merge: the latest snapshot from every publisher into
     /// the feed document. Nothing here touches a source.
-    private static func buildFeed(hooks: [HookRecord], spool: [String: SpoolState],
-                                  pins pinsSnap: PinsSnapshot,
+    private static func buildFeed(hooks: [HookRecord], live: [String: LiveRecord],
+                                  spool: [String: SpoolState], pins: [String: PinRecord],
                                   nowPlaying: Publisher<NowPlaying?>.Snapshot?,
                                   stateSince: inout [String: (String, Double)]) -> String {
         let now = Date().timeIntervalSince1970
         var sessions: [[String: Any]] = []
-        let pins = pinsSnap.pins, pinEntries = pinsSnap.entries, pinStateFresh = pinsSnap.fresh
 
-        for rec in hooks {
-            let h = rec.h, sid = rec.sid
-            if h.hook_state == "gone" { continue }
-            // A dead CLI is a gone session whether or not SessionEnd ran:
-            // a killed process or force-closed terminal never fires it,
-            // and the sticky states below (waiting_tool / permission are
-            // exempt from decay) would advertise "Permissions required"
-            // for an hour. ESRCH only — EPERM means the pid exists, and a
-            // recycled pid merely keeps today's behaviour.
-            if let pid = h.pid?.value, pid > 1, let p = pid_t(exactly: pid),
-               kill(p, 0) != 0, errno == ESRCH { continue }
-            let s = spool[sid]
-            let hookTS = max(h.hook_ts ?? 0, 0)
-            let activity = max(hookTS, s?.ts ?? 0)     // real events only
+        // A live file speaks for its session only while it is fresh
+        // (PAUSE.md): its pid alive and its heartbeat under a minute old. A
+        // stale one is a session that died without cleaning up, or a mod
+        // unloaded mid-run — either way the hook file decides again.
+        let fresh = live.filter { now - $0.value.updated < liveStaleAfter && pidAlive($0.value.pid) }
+        var hooksBySid: [String: HookState] = [:]
+        for rec in hooks { hooksBySid[rec.sid] = rec.h }
+
+        // The hook files are the base, but a session they never saw (hooks
+        // wired after it started, or not at all) still gets a panel from a
+        // fresh live file. Sorted, so equal turn starts keep one order.
+        for sid in Set(hooksBySid.keys).union(fresh.keys).sorted() {
+            let h = hooksBySid[sid]
+            let L = fresh[sid]
+            // A fresh live file is a live session by definition — its pid
+            // was just checked — even under a hook record a --resume hasn't
+            // reopened yet. Without one, the hook record must vouch for it.
+            if L == nil {
+                guard let h, h.hook_state != "gone" else { continue }
+                // A dead CLI is a gone session whether or not SessionEnd ran:
+                // a killed process or force-closed terminal never fires it,
+                // and the sticky states below (waiting_tool / permission are
+                // exempt from decay) would advertise "Permissions required"
+                // for an hour.
+                guard pidAlive(h.pid?.value) else { continue }
+            }
+            // LEGACY: the spool only for a session without a fresh live file.
+            let s = L == nil ? spool[sid] : nil
+            let hookTS = max(h?.hook_ts ?? 0, 0)
+            let liveMainTS = L?.mainChangedAt ?? 0
+            let activity = max(hookTS, s?.ts ?? 0, L?.usedAt ?? 0)   // real events only
             // Unused for an hour -> panel disappears. An hour because that
             // is Claude Code's prompt-cache TTL: the panel dies exactly when
             // the session's cache does. The statusline heartbeat keeps
-            // ticking while the CLI merely sits open, so it must not count.
+            // ticking while the CLI merely sits open, so it must not count —
+            // nor must the live file's 15 s `updated`.
             // No real event ever (or the fields were lost): don't show the
             // session at all. Falling back to the statusline heartbeat here
             // made ghost sessions immortal — the heartbeat ticks every 5s
             // in any open CLI, so "last used" always looked seconds old.
             guard activity > 0 else { continue }
-            let lastUsed = activity
+            // A turn the live file says is running is in use right now,
+            // however old its last change: a 70-minute tool call changes
+            // nothing in the file. A settled pause is not in use.
+            let running = L.map { $0.turnState == "working" && !$0.settled } ?? false
+            let lastUsed = running ? now : activity
             // …unless the session is pinned: the pin is an explicit wish to
             // keep it warm, so its panel stays (showing the pin's state, cold
-            // included) until the pin daemon drops the pin — which it does
-            // within a minute of the CLI going away.
-            let pin = pins[sid] as? [String: Any]
+            // included) until the pin mod deletes the file — on /unpin, at
+            // maxHours, or when the session ends. One whose session died
+            // without cleaning up has a dead pid; one whose writer went
+            // quiet ("pin silent") holds the panel only through the hour
+            // after it was last heard from, so a recycled pid can't keep a
+            // ghost on the rack forever.
+            var pin = pins[sid]
+            if let p = pin, !pidAlive(p.pid) || now - p.updated > 3600 { pin = nil }
             if now - lastUsed > 3600, pin == nil { continue }
 
-            // Recency merge; permission holds until something newer arrives.
+            // The live file decides — except that permission holds until
+            // something newer arrives, the live file's `mainChanged`
+            // included: the file doesn't see the dialog. Without a live file, the
+            // recency merge of hook and spool.
             var state: String
-            var tool = h.tool
-            if h.hook_state == "permission" && hookTS >= (s?.ts ?? 0) {
+            var tool = h?.tool
+            var exactSince: Double?        // when the state began, if the source knows
+            var waitingFor: [String] = []
+            var fromLive = false
+            if h?.hook_state == "permission" && hookTS >= max(s?.ts ?? 0, liveMainTS) {
                 state = "permission"
+            } else if let L, let ls = liveState(L) {
+                fromLive = true
+                state = ls.state
+                tool = ls.tool             // nil too: the hook's tool is the previous call's
+                exactSince = ls.since
+                waitingFor = ls.waitingFor
             } else if let s, s.ts > hookTS {
                 state = s.state
                 if s.state == "toolcall" || s.state == "waiting_tool" {
                     tool = s.tool ?? tool
                 }
             } else {
-                state = h.hook_state ?? "done"
+                state = h?.hook_state ?? "done"
                 if state == "working" { state = "thinking" }
             }
             // A STREAMING state whose signals went quiet is an interrupt or
             // a pre-hooks session: decay to done. waiting_tool and permission
             // are exempt — a 40-minute tool execution or a parked approval
             // dialog is legitimately silent (the statusline heartbeat never
-            // counts as activity either way).
-            if ["thinking", "responding", "toolcall"].contains(state),
+            // counts as activity either way). A live state is exempt too:
+            // the file says when a turn ends, so a long think is just long.
+            if !fromLive, ["thinking", "responding", "toolcall"].contains(state),
                now - activity > 120 { state = "done" }
 
             // Stamp when this state began, so panels can show "(5s ∙ …)".
-            // First sight of a session (daemon restart) seeds from the last
-            // real event rather than `now` — a 40-minute tool wait must not
-            // read as seconds old because the daemon bounced.
+            // Keyed with the tool — "Bash: exec" after "Read: exec" is a new
+            // state, not the old one's timer — but a state that hasn't
+            // changed keeps its stamp (requesting → thinking is one
+            // "Thinking"). A change takes the source's own start when it has
+            // one. Otherwise first sight of a session (daemon restart) seeds
+            // from the last real event rather than `now` — a 40-minute tool
+            // wait must not read as seconds old because the daemon bounced.
+            let toolState = state == "toolcall" || state == "waiting_tool" || state == "permission"
+            let key = toolState ? "\(state):\(tool ?? "?")" : state
             let since: Double
-            if let prev = stateSince[sid], prev.0 == state {
+            if let prev = stateSince[sid], prev.0 == key {
                 since = prev.1
+            } else if let exactSince, exactSince <= now {
+                since = exactSince
             } else if stateSince[sid] == nil {
-                since = state == "done" ? (h.turn_ended ?? lastUsed)
+                since = state == "done" ? (h?.turn_ended ?? lastUsed)
                                         : (activity > 0 ? activity : now)
             } else {
                 since = now
             }
-            stateSince[sid] = (state, since)
+            stateSince[sid] = (key, since)
 
             var entry: [String: Any] = ["id": sid, "state": state,
                                         "state_since": since]
             // Composed: a project directory named in Hangul or kana reaches
             // the hook decomposed whenever it came off an HFS+ volume or a
             // path the shell normalised, and the panel measures its cells per
-            // Character — a decomposed syllable is several of those.
-            entry["cwd"] = (h.cwd ?? s?.cwd ?? "?").precomposedStringWithCanonicalMapping
-            if let tool, state == "toolcall" || state == "waiting_tool"
-                        || state == "permission" { entry["tool"] = tool }
-            if let ts = h.turn_started { entry["turn_started"] = ts }
+            // Character — a decomposed syllable is several of those. Both
+            // follow the session; the hook's first, rewritten at every event
+            // where the live file's is re-read after each main turn.
+            entry["cwd"] = (h?.cwd ?? L?.cwd ?? s?.cwd ?? "?").precomposedStringWithCanonicalMapping
+            if let tool, toolState { entry["tool"] = tool }
+            if !waitingFor.isEmpty { entry["waiting_for"] = waitingFor }
+            // The live turn's start (its first step), else the hook's (the
+            // prompt), else the spool's guess from a 20 s gap.
+            if let ts = L?.turnStarted ?? h?.turn_started { entry["turn_started"] = ts }
             else if let s, s.turnStart > 0 { entry["turn_started"] = s.turnStart }
+            let liveEnded = (fromLive && L?.turnState == "done") ? L?.turnEnded : nil
             if state == "done" {
-                // Freeze Done elapsed: Stop's timestamp when hooks saw the
-                // turn end, else the spool's last activity.
-                entry["turn_ended"] = h.turn_ended ?? s?.ts ?? now
+                // Freeze Done elapsed: the live file's end when it has the
+                // turn, else Stop's timestamp when hooks saw it end, else the
+                // spool's last activity.
+                entry["turn_ended"] = liveEnded ?? h?.turn_ended ?? s?.ts ?? now
                 entry["last_active"] = lastUsed
+            } else if fromLive, let L, L.turnState != "working" {
+                // Paused between turns — or before this process's first, a
+                // resumed session whose turn_started is the hook's old one:
+                // no turn clock left to run.
+                entry["turn_ended"] = liveEnded ?? L.turnEnded ?? h?.turn_ended ?? activity
             }
-            if let total = h.session_tokens {
+            // Context: the live file's own measure, else the statusline's.
+            if let total = L?.contextTokens ?? h?.session_tokens {
                 entry["session_tokens"] = total
-                // "Tokens this turn" = context growth since the prompt: the
-                // reply, tool results, and injected reminders alike — every
-                // token the turn added. The statusline's counts are per
-                // request (the live context), so growth is a plain
-                // difference against the anchor the hook took at prompt
-                // time. Only trust an anchor stamped for THIS turn.
-                if let a = h.anchor_tokens, let at = h.anchor_turn,
-                   at == h.turn_started, total > a {
-                    entry["turn_tokens"] = total - a
-                }
             }
-            if state == "done", let bg = h.bg, !bg.isEmpty { entry["bg"] = bg }
+            // "Tokens this turn" = context growth since the prompt: the
+            // reply, tool results, and injected reminders alike — every
+            // token the turn added. The live file counts it itself
+            // (`turn.tokens`), and when it does, that is the number.
+            // Otherwise the hook's: the statusline's counts are per request
+            // (the live context), so growth is a plain difference against
+            // the anchor the hook took at prompt time. Only trust an anchor
+            // stamped for THIS turn, and keep both ends of the difference
+            // the hook's own: across two sources' ideas of "context" it
+            // would be noise.
+            if let t = L?.turnTokens {
+                if t > 0 { entry["turn_tokens"] = t }
+            } else if let h, let total = h.session_tokens, let a = h.anchor_tokens,
+                      let at = h.anchor_turn, at == h.turn_started, total > a {
+                entry["turn_tokens"] = total - a
+            }
+            // Background work the last turn left running, on a resting
+            // panel: the live file's list when it has the session, else
+            // Stop's counts off the hook.
+            if state == "done" || state == "paused",
+               let bg = fromLive ? L?.background : h?.bg, !bg.isEmpty { entry["bg"] = bg }
             if let pin {
-                var p: [String: Any] = ["pinned_at": pin["pinned_at"] as? Double ?? 0,
-                                        "fresh": pinStateFresh]
-                if let e = pinEntries[sid] as? [String: Any] {
-                    if let st = e["status"] as? String { p["status"] = st }
-                    if let n = e["next_ping_at"] as? Double { p["next_ping_at"] = n }
-                    if let t = e["pinged_at"] as? Double { p["pinged_at"] = t }
-                    if let c = e["pings"] as? Int { p["pings"] = c }
-                }
+                // Fresh per pin: each session's pin mod writes its own file,
+                // where bifrocate's one daemon had one flag for every pin.
+                var p: [String: Any] = ["pinned_at": pin.pinnedAt,
+                                        "fresh": now - pin.updated < liveStaleAfter]
+                if let st = pin.status { p["status"] = st }
+                if let n = pin.nextPingAt { p["next_ping_at"] = n }
+                if let t = pin.pingedAt { p["pinged_at"] = t }
+                if let c = pin.pings { p["pings"] = c }
                 entry["pin"] = p
             }
             sessions.append(entry)
         }
         sessions.sort {
-            (($0["turn_started"] as? Double) ?? 0) > (($1["turn_started"] as? Double) ?? 0)
+            let l = ($0["turn_started"] as? Double) ?? 0, r = ($1["turn_started"] as? Double) ?? 0
+            return l != r ? l > r : (($0["id"] as? String) ?? "") < (($1["id"] as? String) ?? "")
         }
 
         var root: [String: Any] = ["updated": now, "sessions": sessions]

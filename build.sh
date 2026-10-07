@@ -32,6 +32,19 @@ swiftc -O -parse-as-library helper/Igniter.swift \
   -o build/codesaver-igniter
 echo "── built build/codesaver-igniter  (helper/install.sh installs the LaunchAgent)"
 
+# --- Feed merge check (the daemon's merge on fabricated files, in a temp dir) -
+echo "── compiling feed check…"
+swiftc -O -parse-as-library -module-name FeedsCheck \
+  appex/CodeSaver/FeedsService.swift \
+  appex/CodeSaver/CorpusStore.swift \
+  appex/CodeSaver/AlbumArtShared.swift \
+  appex/CodeSaver/AlbumArtRamp.swift \
+  appex/CodeSaver/Helpers/Logger.swift \
+  Sources/FeedsCheck.swift \
+  -framework AppKit -framework ServiceManagement -framework ImageIO \
+  -o build/feeds-check
+echo "── built build/feeds-check  (run it: never touches ~/.claude or the real feed)"
+
 # --- Marquee tuner (standalone window for the now-playing title roll) --------
 echo "── compiling marquee tuner…"
 swiftc -O -parse-as-library Sources/MarqueeTuner.swift -framework AppKit -o build/marquee-tuner

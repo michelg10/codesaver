@@ -310,7 +310,7 @@ struct ContentView: View {
     private var liveWidgetsCaption: String {
         "sessions need Claude Code's hooks: python3 feeds/wire-settings.py — state lands in ~/.claude/codesaver/sessions"
         + "\nnow playing reads Music or Spotify; macOS asks for consent when this window opens"
-        + "\nbifrocate is optional — without it the panels follow hook state alone"
+        + "\nthe pause + pin mods are optional — without them the panels follow hook state alone"
     }
 
     // MARK: Corpus
