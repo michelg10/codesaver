@@ -392,6 +392,20 @@ struct FeedsCheck {
         var tampered = vector
         tampered["c"] = "g" + (vector["c"] as! String).dropFirst()
         check("…and not once tampered with", Bus.open(tampered, key: Bus.key(secret, "cmd"), purpose: "cmd") == nil)
+        let heartbeat: [String: Any] = ["v": 2, "id": "codesaver-0123456789abcdef", "ts": 1_791_604_313_091,
+                                        "ctr": 1_791_604_313_091, "device": "bridge", "action": "watching",
+                                        "value": NSNull()]
+        if let env = Bus.seal(heartbeat, key: Bus.key(secret, "cmd"), purpose: "cmd"),
+           let c = (env["c"] as? String).flatMap({ Data(base64Encoded: $0) }),
+           let back = Bus.open(env, key: Bus.key(secret, "cmd"), purpose: "cmd") {
+            check("the heartbeat seals, padded to 256, and opens as it was",
+                  (c.count - 16) % 256 == 0 && back["pad"] == nil && back.count == heartbeat.count
+                    && back["action"] as? String == "watching" && back["value"] is NSNull
+                    && back["ctr"] as? Int == 1_791_604_313_091)
+            check("…and not as state", Bus.open(env, key: Bus.key(secret, "state"), purpose: "state") == nil)
+        } else {
+            check("the heartbeat seals", false)
+        }
         check("the Keychain's hex is the secret", Bus.parseKey(String(repeating: "0", count: 64)) != nil
               && Bus.parseKey(String(repeating: "0", count: 62)) == nil
               && Bus.parseKey("+f" + String(repeating: "0", count: 62)) == nil)

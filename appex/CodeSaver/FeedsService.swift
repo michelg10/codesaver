@@ -30,7 +30,9 @@
 //       while the player is actually running; a paused track is held for
 //       half an hour. While neither plays, the Office HomePods stand in:
 //       their state off home-control's bus (HomeBus, below), decrypted
-//       here with keys derived from the home key in the login Keychain.
+//       here with keys derived from the home key in the login Keychain —
+//       and while the saver is on screen showing them, Room's "watching"
+//       heartbeat, so the bridge stores their covers.
 //    5. LEGACY — ~/.bifrocate/cot/*.jsonl, bifrocate's main-agent CoT
 //       spools. Read only for a session without a fresh live file. Since
 //       Claude Code moved to server-side threads the spool misses most
@@ -494,16 +496,32 @@ enum FeedsService {
         // The HomePods, off home-control's bus: the stand-in while this
         // Mac's players have nothing playing. It subscribes to the Mac's
         // poll and doesn't fetch while that one plays — the HomePods can't
-        // win then. Otherwise every 5 s while they play, so a track change
-        // shows within a few seconds, and every 15 s while they don't. A
-        // network round trip, so a publisher of its own like the rest: a
-        // slow or absent network ages only this value.
+        // win then. Otherwise every 5 s while they play or are on screen, so
+        // a track change (or a cover the bridge just stored) shows within a
+        // few seconds, and every 15 s while neither. A network round trip,
+        // so a publisher of its own like the rest: a slow or absent network
+        // ages only this value.
+        //
+        // While CodeSaver is on screen with the pair's music on its panel,
+        // it is a viewer, as Room in the foreground is: a heartbeat on
+        // the first poll that finds it so and every 25 s after. When the
+        // saver goes, the heartbeats stop and the bridge's 75 s runs out.
         var homePausedSince: Double?
         var homeLast: NowPlaying?
         var homeFetched = Date.distantPast
+        var homeWatched = Date.distantPast           // the last heartbeat that reached the bus
         let homePods = Publisher("homepods", every: 5.0) { () -> NowPlaying? in
             if nowPlaying.latest?.value?.state == "playing" { return homeLast }
-            if homeLast?.state != "playing", Date().timeIntervalSince(homeFetched) < 15 { return homeLast }
+            let shown = chooseNowPlaying(mac: nowPlaying.latest?.value, homePods: homeLast,
+                                         at: Date().timeIntervalSince1970)?.app == HomeBus.app
+            let viewing = shown && saverOnScreen()
+            if !viewing {
+                homeWatched = .distantPast
+            } else if Date().timeIntervalSince(homeWatched) >= 25, homeBus.sayWatching() {
+                homeWatched = Date()
+            }
+            if homeLast?.state != "playing", !viewing,
+               Date().timeIntervalSince(homeFetched) < 15 { return homeLast }
             homeFetched = Date()
             switch homeBus.nowPlaying() {
             case .unknown:
@@ -543,10 +561,10 @@ enum FeedsService {
             }
             guard let np = current() else { return lastArtKey }
             let key = "\(np.app)|\(np.title)|\(np.artist)"
-            // A HomePod cover reaches the bus only while Room has the room
-            // on screen, so it can turn up after its track did: the blob
-            // name decides when to run again, but the saver matches on the
-            // key alone.
+            // A HomePod cover reaches the bus only while someone watches —
+            // Room, or this saver once its first heartbeat lands — so it
+            // turns up seconds after its track did: the blob name decides
+            // when to run again, but the saver matches on the key alone.
             let runKey = key + "|" + (np.art ?? "")
             if runKey != lastArtKey {
                 lastArtKey = runKey
@@ -1182,6 +1200,37 @@ enum FeedsService {
 
     private static let homeBus = HomeBus()
 
+    /// CodeSaver on screen: ScreenSaverEngine running with our extension in
+    /// it (the extension alone is also System Settings' preview), and the
+    /// main display awake — a saver behind a sleeping display is watched by
+    /// nobody, and its heartbeat would keep the room polled briskly all
+    /// night. One sysctl(KERN_PROC_ALL) with p_comm compared in place, as
+    /// the igniter's saverIsRunning does; the names are matched as p_comm
+    /// holds them, cut to MAXCOMLEN. CGDisplayIsAsleep doesn't check this
+    /// process in with LaunchServices (verified with lsappinfo on a bundled
+    /// probe), so it keeps the rule the player poll keeps. A sysctl that
+    /// fails is "not on screen": a heartbeat is only ever sent on a yes.
+    private static func saverOnScreen() -> Bool {
+        guard CGDisplayIsAsleep(CGMainDisplayID()) == 0 else { return false }
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL]
+        var size = 0
+        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 0 else { return false }
+        let stride = MemoryLayout<kinfo_proc>.stride
+        var procs = [kinfo_proc](repeating: kinfo_proc(), count: size / stride + 64)
+        var len = procs.count * stride
+        guard procs.withUnsafeMutableBytes({ sysctl(&mib, 3, $0.baseAddress, &len, nil, 0) }) == 0 else { return false }
+        var engine = false, ours = false
+        for i in 0..<(len / stride) {
+            withUnsafeBytes(of: procs[i].kp_proc.p_comm) { comm in
+                let name = comm.baseAddress!.assumingMemoryBound(to: CChar.self)
+                if strncmp(name, "ScreenSaverEngine", Int(MAXCOMLEN)) == 0 { engine = true }
+                if strncmp(name, "CodeSaverExtension", Int(MAXCOMLEN)) == 0 { ours = true }
+            }
+            if engine && ours { return true }
+        }
+        return false
+    }
+
     /// The Office HomePods as home-control (~/bin/michelg10-apps/home-control)
     /// sees them. Its bridge on the Pi holds one connection to the pair and
     /// publishes the room's state on a bus it assumes compromisable
@@ -1194,33 +1243,58 @@ enum FeedsService {
     /// HKDF-SHA256(home key, salt "home-control", info = label), the label
     /// "home-control/v2/<purpose>" again as associated data.
     ///
+    /// And it is a viewer, as Room is in the foreground: while CodeSaver is
+    /// on screen with the pair's music on its panel it sends Room's
+    /// authenticated "watching" heartbeat (sayWatching), which is what makes
+    /// the bridge upload covers — the current one at once — and poll the
+    /// room briskly. Nothing the bus says counts as watching; only a command
+    /// sealed with the home key does.
+    ///
     /// The secrets are homectl's — login Keychain, service "home-control",
     /// put there by setup-secrets.sh — read through /usr/bin/security as
     /// homectl reads them (the items trust that tool: no prompt), at most
-    /// once every ten minutes, never written anywhere. Only the `kv` and
-    /// `art` keys are derived and kept: this process can open the room's
-    /// snapshot and its covers, and cannot seal a command. Nor does it ever
-    /// say it is watching — that heartbeat is Room's, and it turns on brisk
-    /// polling and cover uploads at home — so a cover is on the bus only
-    /// while Room has had the room on screen during the track. A Mac
-    /// without home-control has no items, and the HomePods are never asked.
+    /// once every ten minutes, never written anywhere. Three purpose keys
+    /// are derived and the secret itself dropped: `kv` and `art` to read the
+    /// room's snapshot and its covers, `cmd` for the heartbeat. That last
+    /// key could seal any command the bridge allows — it is the key homectl
+    /// already holds in this login session — and the only one this code
+    /// ever seals is `bridge.watching`, which takes no value and changes
+    /// nothing in the room. A Mac without home-control has no items, and
+    /// the HomePods are never asked.
     final class HomeBus {
         static let app = "HomePod"
         private static let base = "https://api.michelg10.com/v1/home"
 
+        /// This Mac's installation at the bridge, made once and kept in
+        /// CodeSaver's defaults. The bridge keeps the last counter of 32
+        /// installations and forgets the one unused longest, so an id per
+        /// daemon start would in time push the phone's out.
+        private static let installation: String = {
+            let d = UserDefaults.standard, key = "HomeBusInstallationID"
+            if let s = d.string(forKey: key), s.utf8.count >= 8, s.utf8.count <= 64,
+               s.utf8.allSatisfy({ (48...57).contains($0) || (97...122).contains($0) || $0 == 45 }) {
+                return s
+            }
+            let s = "codesaver-" + (0..<8).map { _ in String(format: "%02x", UInt8.random(in: 0...255)) }.joined()
+            d.set(s, forKey: key)
+            return s
+        }()
+
         private struct Keys {
             let kv: SymmetricKey
             let art: SymmetricKey
+            let cmd: SymmetricKey
             let token: String
         }
         private let lock = NSLock()               // the poll and album art run on two threads
         private var keys: Keys?
         private var keysReadAt = Date.distantPast
+        private var ctr = 0                       // the heartbeat's last counter; the poll's thread only
 
         /// The pair's now-playing, off kv `state`. One GET, on this thread.
         func nowPlaying() -> NowPlayingPoll {
             guard let k = currentKeys() else { return .idle }
-            guard let r = Self.get("/kv/state", token: k.token, cap: 1 << 20) else { return .unknown }
+            guard let r = Self.request("GET", "/kv/state", token: k.token, cap: 1 << 20) else { return .unknown }
             switch r.status {
             case 200: break
             case 404: return .idle                // the bridge has never stored a state
@@ -1239,9 +1313,29 @@ enum FeedsService {
         /// longer has it (the bridge keeps four) or it doesn't open.
         func cover(_ name: String) -> Data? {
             guard Self.isArtName(name), let k = currentKeys(),
-                  let r = Self.get("/blob/art/" + name, token: k.token, cap: 4 << 20),
+                  let r = Self.request("GET", "/blob/art/" + name, token: k.token, cap: 4 << 20),
                   r.status == 200 else { return nil }
             return Self.openArt(r.body, name: name, key: k.art)
+        }
+
+        /// Room's "I am looking": `bridge.watching`, sealed under `cmd` and
+        /// published on `cmd` like any command — fresh timestamp, a counter
+        /// above every one before it — so the bridge's guard admits it. One
+        /// is good for 75 s; Room sends one every 20–30 s while it is in the
+        /// foreground, and the caller here every 25 s while CodeSaver is on
+        /// screen. Never acked. False when it didn't reach the bus.
+        func sayWatching() -> Bool {
+            guard let k = currentKeys() else { return false }
+            let ts = Int((Date().timeIntervalSince1970 * 1000).rounded())
+            ctr = max(ctr + 1, ts)
+            let command: [String: Any] = ["v": 2, "id": Self.installation, "ts": ts, "ctr": ctr,
+                                          "device": "bridge", "action": "watching", "value": NSNull()]
+            guard let env = Self.seal(command, key: k.cmd, purpose: "cmd"),
+                  let body = try? JSONSerialization.data(withJSONObject: env),
+                  let r = Self.request("POST", "/ch/cmd", token: k.token, body: body, cap: 1 << 16)
+            else { return false }
+            if r.status == 401 || r.status == 403 { forget() }
+            return (200..<300).contains(r.status)
         }
 
         private func currentKeys() -> Keys? {
@@ -1259,7 +1353,8 @@ enum FeedsService {
             }
             guard let hex = item("command-key"), let secret = Self.parseKey(hex),
                   let token = item("bus-token-app") else { return nil }
-            keys = Keys(kv: Self.key(secret, "kv"), art: Self.key(secret, "art"), token: token)
+            keys = Keys(kv: Self.key(secret, "kv"), art: Self.key(secret, "art"), cmd: Self.key(secret, "cmd"),
+                        token: token)
             return keys
         }
 
@@ -1340,6 +1435,22 @@ enum FeedsService {
             return obj
         }
 
+        /// An envelope for `payload`, padded first (a `pad` of dots) to a
+        /// multiple of 256 bytes as protocol.seal pads, so its length says
+        /// nothing about what is inside; a fresh random nonce.
+        static func seal(_ payload: [String: Any], key: SymmetricKey, purpose: String) -> [String: Any]? {
+            var obj = payload
+            obj["pad"] = ""
+            guard let bare = try? JSONSerialization.data(withJSONObject: obj) else { return nil }
+            obj["pad"] = String(repeating: ".", count: (256 - bare.count % 256) % 256)
+            guard let plain = try? JSONSerialization.data(withJSONObject: obj),
+                  let box = try? ChaChaPoly.seal(plain, using: key, authenticating: label(purpose))
+            else { return nil }
+            let sealed = box.combined                 // nonce (12) || ciphertext || tag
+            return ["v": 2, "n": sealed.prefix(12).base64EncodedString(),
+                    "c": sealed.dropFirst(12).base64EncodedString()]
+        }
+
         /// Blob art/<name> = nonce (12) || sealed("ART1" || uint32 length ||
         /// image || zero padding), its associated data the art label + "|" +
         /// name, so the bus can't serve one cover in place of another.
@@ -1358,16 +1469,22 @@ enum FeedsService {
 
         // ── the wire ──
 
-        /// GET on the bus, on this thread, under homectl's rules: at most
-        /// `cap` bytes (cancelled past it), no proxy — a VPN's must never
-        /// see the token — and no redirects, which would carry the
-        /// Authorization header wherever they pointed. nil for anything
-        /// that didn't finish.
-        private static func get(_ path: String, token: String, cap: Int) -> (status: Int, body: Data)? {
+        /// A request to the bus, on this thread, under homectl's rules: an
+        /// answer of at most `cap` bytes (cancelled past it), no proxy — a
+        /// VPN's must never see the token — and no redirects, which would
+        /// carry the Authorization header wherever they pointed. nil for
+        /// anything that didn't finish.
+        private static func request(_ method: String, _ path: String, token: String,
+                                    body: Data? = nil, cap: Int) -> (status: Int, body: Data)? {
             guard let url = URL(string: base + path) else { return nil }
             var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
+            req.httpMethod = method
             req.setValue("Bearer " + token, forHTTPHeaderField: "Authorization")
             req.setValue("codesaver/1", forHTTPHeaderField: "User-Agent")
+            if let body {
+                req.httpBody = body
+                req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            }
             let cfg = URLSessionConfiguration.ephemeral
             cfg.connectionProxyDictionary = [:]
             cfg.timeoutIntervalForResource = 20
@@ -1486,8 +1603,8 @@ enum FeedsService {
         let app = np.app
         var ok = false
         if app == HomeBus.app {
-            // The bridge's own copy, decrypted here. None until Room has
-            // had the room on screen during this track (see HomeBus).
+            // The bridge's own copy, decrypted here. None until someone
+            // has watched during this track (see HomeBus).
             if let name = np.art, let img = homeBus.cover(name), (try? img.write(to: src)) != nil { ok = true }
         } else if app == "Music" {
             let script = """
