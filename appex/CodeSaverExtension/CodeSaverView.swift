@@ -3239,7 +3239,9 @@ public final class CodeSaverView: ScreenSaverView {
         progRuns.append((" \u{2502}", run(railC)))
         let progRow = WidgetRow(runs: progRuns)
 
-        let bl = app + ".app"
+        // A player on this Mac goes by its app; the HomePods (the feed's
+        // stand-in when nothing plays here) by their own name.
+        let bl = app == "HomePod" ? app : app + ".app"
         let botFill = max(0, inner - widgetCells(bl) - 4)
         let bottom = WidgetRow(runs: [
             ("\u{2570}" + String(repeating: "\u{2500}", count: botFill) + " ", run(railC)),

@@ -28,7 +28,9 @@
 //       even past the hour.
 //    4. Now playing — Music.app / Spotify via AppleScript, polled only
 //       while the player is actually running; a paused track is held for
-//       half an hour.
+//       half an hour. While neither plays, the Office HomePods stand in:
+//       their state off home-control's bus (HomeBus, below), decrypted
+//       here with keys derived from the home key in the login Keychain.
 //    5. LEGACY — ~/.bifrocate/cot/*.jsonl, bifrocate's main-agent CoT
 //       spools. Read only for a session without a fresh live file. Since
 //       Claude Code moved to server-side threads the spool misses most
@@ -74,6 +76,7 @@
 //
 
 import CoreGraphics
+import CryptoKit
 import Foundation
 import ImageIO
 import ServiceManagement
@@ -383,8 +386,8 @@ enum FeedsService {
     /// The player as last polled. `polledAt` is when the answer came back,
     /// so the subscriber can carry a playing position forward to the second
     /// it publishes.
-    private struct NowPlaying {
-        var app: String
+    struct NowPlaying {
+        var app: String              // Music | Spotify | HomePod
         var state: String            // playing | paused
         var title: String
         var artist: String
@@ -392,6 +395,32 @@ enum FeedsService {
         var duration: Double
         var pausedSince: Double?
         var polledAt: Double
+        var art: String? = nil       // HomePod only: the cover's blob name on the bus, once there is one
+    }
+
+    /// Paused music stays on the panel for half an hour — long enough to
+    /// come back to, short enough that a player left paused overnight
+    /// doesn't hold the corner all night. The clock starts at the first
+    /// paused poll; only a resume or a stop resets it, so once it runs out
+    /// the entry stays gone. One clock per source.
+    private static func holdPaused(_ np: NowPlaying, _ pausedSince: inout Double?) -> NowPlaying? {
+        guard np.state == "paused" else { pausedSince = nil; return np }
+        let since = pausedSince ?? np.polledAt
+        pausedSince = since
+        if np.polledAt - since > 1800 { return nil }
+        var held = np
+        held.pausedSince = since
+        return held
+    }
+
+    /// Whose music the panel shows: this Mac's player while it plays; the
+    /// HomePods while they play and it doesn't; otherwise whichever is
+    /// paused, this Mac's first. An entry without a completed poll for a
+    /// minute and a half is nobody's — by then nobody knows what that
+    /// player is doing — so a stale one never outranks a live one.
+    static func chooseNowPlaying(mac: NowPlaying?, homePods: NowPlaying?, at now: Double) -> NowPlaying? {
+        let fresh = [mac, homePods].compactMap { $0 }.filter { now - $0.polledAt < 90 }
+        return fresh.first { $0.state == "playing" } ?? fresh.first
     }
 
     // MARK: Daemon
@@ -456,23 +485,41 @@ enum FeedsService {
                 pausedSince = nil
                 lastKnown = nil
                 return nil
-            case .player(var np):
-                // Paused music stays on the panel for half an hour — long
-                // enough to come back to, short enough that a player left
-                // paused overnight doesn't hold the corner all night. The
-                // clock starts at the first paused poll; only a resume or a
-                // stop resets it, so once it runs out the entry stays gone.
-                if np.state == "paused" {
-                    let since = pausedSince ?? np.polledAt
-                    pausedSince = since
-                    if np.polledAt - since > 1800 { lastKnown = nil; return nil }
-                    np.pausedSince = since
-                } else {
-                    pausedSince = nil
-                }
-                lastKnown = np
-                return np
+            case .player(let np):
+                lastKnown = holdPaused(np, &pausedSince)
+                return lastKnown
             }
+        }
+
+        // The HomePods, off home-control's bus: the stand-in while this
+        // Mac's players have nothing playing. It subscribes to the Mac's
+        // poll and doesn't fetch while that one plays — the HomePods can't
+        // win then. Otherwise every 5 s while they play, so a track change
+        // shows within a few seconds, and every 15 s while they don't. A
+        // network round trip, so a publisher of its own like the rest: a
+        // slow or absent network ages only this value.
+        var homePausedSince: Double?
+        var homeLast: NowPlaying?
+        var homeFetched = Date.distantPast
+        let homePods = Publisher("homepods", every: 5.0) { () -> NowPlaying? in
+            if nowPlaying.latest?.value?.state == "playing" { return homeLast }
+            if homeLast?.state != "playing", Date().timeIntervalSince(homeFetched) < 15 { return homeLast }
+            homeFetched = Date()
+            switch homeBus.nowPlaying() {
+            case .unknown:
+                return homeLast                      // carried, and aged out by the 90 s rule, as above
+            case .idle:
+                homePausedSince = nil
+                homeLast = nil
+                return nil
+            case .player(let np):
+                homeLast = holdPaused(np, &homePausedSince)
+                return homeLast
+            }
+        }
+        func current() -> NowPlaying? {
+            chooseNowPlaying(mac: nowPlaying.latest?.value, homePods: homePods.latest?.value,
+                             at: Date().timeIntervalSince1970)
         }
 
         // Album art subscribes to now-playing and publishes a FILE. On a
@@ -481,7 +528,7 @@ enum FeedsService {
         // re-renders the playing track: the tuning window saves, this
         // notices within a second, and the saver shows the new art — the
         // whole point of keeping the knobs out of the binary.
-        var lastArtKey = ""                          // "app|title|artist" of last art run
+        var lastArtKey = ""                          // "app|title|artist|art" of last art run
         var lastTuningMTime: Date?                   // widgets/albumart-tuning.json
         _ = Publisher("albumart", every: 1.0) { () -> String in
             if let tu = AlbumArtTuning.url {
@@ -494,11 +541,16 @@ enum FeedsService {
                     lastArtKey = ""
                 }
             }
-            guard let np = nowPlaying.latest?.value else { return lastArtKey }
+            guard let np = current() else { return lastArtKey }
             let key = "\(np.app)|\(np.title)|\(np.artist)"
-            if key != lastArtKey {
-                lastArtKey = key
-                refreshAlbumArt(app: np.app, key: key)
+            // A HomePod cover reaches the bus only while Room has the room
+            // on screen, so it can turn up after its track did: the blob
+            // name decides when to run again, but the saver matches on the
+            // key alone.
+            let runKey = key + "|" + (np.art ?? "")
+            if runKey != lastArtKey {
+                lastArtKey = runKey
+                refreshAlbumArt(np, key: key)
             }
             return lastArtKey
         }
@@ -526,7 +578,7 @@ enum FeedsService {
                                      live: live.latest?.value ?? [:],
                                      spool: spools.latest?.value ?? [:],
                                      pins: pins.latest?.value ?? [:],
-                                     nowPlaying: nowPlaying.latest,
+                                     nowPlaying: current(),
                                      stateSince: &stateSince)
                 if feed != lastFeed, let dir = widgetsDir {
                     let tmp = dir.appendingPathComponent(".feed.json.tmp")
@@ -796,7 +848,7 @@ enum FeedsService {
     /// the feed document. Nothing here touches a source.
     private static func buildFeed(hooks: [HookRecord], live: [String: LiveRecord],
                                   spool: [String: SpoolState], pins: [String: PinRecord],
-                                  nowPlaying: Publisher<NowPlaying?>.Snapshot?,
+                                  nowPlaying: NowPlaying?,
                                   stateSince: inout [String: (String, Double)]) -> String {
         let now = Date().timeIntervalSince1970
         var sessions: [[String: Any]] = []
@@ -989,13 +1041,14 @@ enum FeedsService {
         }
 
         var root: [String: Any] = ["updated": now, "sessions": sessions]
-        if let snap = nowPlaying, let np = snap.value, now - np.polledAt < 90 {
+        if let np = nowPlaying {
             // Carried to THIS second: the position runs forward while
             // playing (and holds while paused), and `ts` is now — so the
             // saver's freshness gate sees a live entry for as long as the
             // poll is recent. A slow poll ages the value; it doesn't blank
             // the panel. Ninety seconds without a completed poll and the
-            // entry goes: by then nobody knows what the player is doing.
+            // entry goes (chooseNowPlaying): by then nobody knows what the
+            // player is doing.
             var pos = np.position
             if np.state == "playing" {
                 pos += now - np.polledAt
@@ -1024,7 +1077,7 @@ enum FeedsService {
     /// answer — no player running, or one that is stopped; `.unknown` is no
     /// answer at all — a spawn that failed or a query that ran out its
     /// deadline — and must not be mistaken for the former.
-    private enum NowPlayingPoll {
+    enum NowPlayingPoll {
         case player(NowPlaying)
         case idle
         case unknown
@@ -1125,6 +1178,235 @@ enum FeedsService {
         return unknown ? .unknown : .idle
     }
 
+    // MARK: HomePods (home-control)
+
+    private static let homeBus = HomeBus()
+
+    /// The Office HomePods as home-control (~/bin/michelg10-apps/home-control)
+    /// sees them. Its bridge on the Pi holds one connection to the pair and
+    /// publishes the room's state on a bus it assumes compromisable
+    /// (api.michelg10.com, namespace "home"), so everything there is sealed:
+    /// ChaCha20-Poly1305 under keys derived from the home key. The latest
+    /// state sits at kv `state`, rewritten on every change worth publishing
+    /// — a new track, play or pause — and at least once a minute. This reads
+    /// that snapshot as `tools/homectl state` does; the bridge's protocol.py
+    /// is the spec: envelope {"v": 2, "n", "c"}, purpose keys from
+    /// HKDF-SHA256(home key, salt "home-control", info = label), the label
+    /// "home-control/v2/<purpose>" again as associated data.
+    ///
+    /// The secrets are homectl's — login Keychain, service "home-control",
+    /// put there by setup-secrets.sh — read through /usr/bin/security as
+    /// homectl reads them (the items trust that tool: no prompt), at most
+    /// once every ten minutes, never written anywhere. Only the `kv` and
+    /// `art` keys are derived and kept: this process can open the room's
+    /// snapshot and its covers, and cannot seal a command. Nor does it ever
+    /// say it is watching — that heartbeat is Room's, and it turns on brisk
+    /// polling and cover uploads at home — so a cover is on the bus only
+    /// while Room has had the room on screen during the track. A Mac
+    /// without home-control has no items, and the HomePods are never asked.
+    final class HomeBus {
+        static let app = "HomePod"
+        private static let base = "https://api.michelg10.com/v1/home"
+
+        private struct Keys {
+            let kv: SymmetricKey
+            let art: SymmetricKey
+            let token: String
+        }
+        private let lock = NSLock()               // the poll and album art run on two threads
+        private var keys: Keys?
+        private var keysReadAt = Date.distantPast
+
+        /// The pair's now-playing, off kv `state`. One GET, on this thread.
+        func nowPlaying() -> NowPlayingPoll {
+            guard let k = currentKeys() else { return .idle }
+            guard let r = Self.get("/kv/state", token: k.token, cap: 1 << 20) else { return .unknown }
+            switch r.status {
+            case 200: break
+            case 404: return .idle                // the bridge has never stored a state
+            case 401, 403: forget(); return .unknown   // the token refused: rotated, read it again
+            default: return .unknown
+            }
+            guard let env = try? JSONSerialization.jsonObject(with: r.body) else { return .unknown }
+            guard let state = Self.open(env, key: k.kv, purpose: "kv") else {
+                forget()                          // the key rotated — or junk at kv, which the next read sorts out
+                return .unknown
+            }
+            return Self.nowPlaying(fromState: state, at: Date().timeIntervalSince1970)
+        }
+
+        /// The cover stored at art/<name>, decrypted. nil when the bus no
+        /// longer has it (the bridge keeps four) or it doesn't open.
+        func cover(_ name: String) -> Data? {
+            guard Self.isArtName(name), let k = currentKeys(),
+                  let r = Self.get("/blob/art/" + name, token: k.token, cap: 4 << 20),
+                  r.status == 200 else { return nil }
+            return Self.openArt(r.body, name: name, key: k.art)
+        }
+
+        private func currentKeys() -> Keys? {
+            lock.lock(); defer { lock.unlock() }
+            if let keys { return keys }
+            guard Date().timeIntervalSince(keysReadAt) > 600 else { return nil }
+            keysReadAt = Date()
+            func item(_ account: String) -> String? {
+                guard let d = runProcess("/usr/bin/security",
+                                         ["find-generic-password", "-s", "home-control", "-a", account, "-w"],
+                                         deadline: 10),
+                      let s = String(data: d, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !s.isEmpty else { return nil }
+                return s
+            }
+            guard let hex = item("command-key"), let secret = Self.parseKey(hex),
+                  let token = item("bus-token-app") else { return nil }
+            keys = Keys(kv: Self.key(secret, "kv"), art: Self.key(secret, "art"), token: token)
+            return keys
+        }
+
+        /// Read the Keychain again on the next poll (still at most every ten
+        /// minutes): what a rotated key or token looks like from here.
+        private func forget() {
+            lock.lock(); keys = nil; lock.unlock()
+        }
+
+        // ── the protocol (bridge/protocol.py) ──
+
+        /// What the bridge's state says the pair is doing, as of `now`. A
+        /// snapshot not rewritten for two and a half minutes — the bridge
+        /// rewrites it at least once a minute — says nothing: the Pi or its
+        /// network is down, and the HomePods may well be playing. The bridge
+        /// itself saying the pair is out of reach, or has nothing loaded, is
+        /// a definite idle.
+        static func nowPlaying(fromState s: [String: Any], at now: Double) -> NowPlayingPoll {
+            guard s["kind"] as? String == "state", let ts = s["ts"] as? Double,
+                  abs(now - ts / 1000) < 150 else { return .unknown }
+            guard let hp = s["homepod"] as? [String: Any], hp["ok"] as? Bool == true,
+                  let state = hp["state"] as? String, state == "playing" || state == "paused",
+                  let title = hp["title"] as? String, !title.isEmpty else { return .idle }
+            let duration = max(0, hp["duration"] as? Double ?? 0)
+            var position = max(0, hp["position"] as? Double ?? 0)
+            // The playhead is a snapshot, true at position_at on home's
+            // clock — the bridge never publishes just because it moved.
+            // Walk it on to now, as Room does.
+            if state == "playing", let at = hp["position_at"] as? Double {
+                position += max(0, now - at / 1000)
+            }
+            if duration > 0 { position = min(position, duration) }
+            let art = ((hp["art"] as? [String: Any])?["name"] as? String).flatMap { isArtName($0) ? $0 : nil }
+            // Composed here for the same reason as the Mac's players: the
+            // album-art key and the feed must be built from one string.
+            return .player(NowPlaying(app: app, state: state,
+                                      title: title.precomposedStringWithCanonicalMapping,
+                                      artist: (hp["artist"] as? String ?? "").precomposedStringWithCanonicalMapping,
+                                      position: position, duration: duration,
+                                      pausedSince: nil, polledAt: now, art: art))
+        }
+
+        static func label(_ purpose: String) -> Data { Data("home-control/v2/\(purpose)".utf8) }
+
+        static func key(_ secret: SymmetricKey, _ purpose: String) -> SymmetricKey {
+            HKDF<SHA256>.deriveKey(inputKeyMaterial: secret, salt: Data("home-control".utf8),
+                                   info: label(purpose), outputByteCount: 32)
+        }
+
+        /// 64 hex characters (the Keychain's form) -> the 32-byte secret.
+        static func parseKey(_ hex: String) -> SymmetricKey? {
+            let u = Array(hex.lowercased().utf8)
+            guard u.count == 64, u.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else { return nil }
+            let bytes = stride(from: 0, to: 64, by: 2).compactMap {
+                UInt8(String(decoding: u[$0..<$0 + 2], as: UTF8.self), radix: 16)
+            }
+            return bytes.count == 32 ? SymmetricKey(data: bytes) : nil
+        }
+
+        static func isArtName(_ s: String) -> Bool {
+            s.utf8.count == 32 && s.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
+        }
+
+        /// The payload if, and only if, the tag verifies under this
+        /// purpose's key and label; nothing is parsed before that. `pad`
+        /// (length padding) is dropped, as unseal() drops it.
+        static func open(_ envelope: Any, key: SymmetricKey, purpose: String) -> [String: Any]? {
+            guard let env = envelope as? [String: Any], Set(env.keys) == ["v", "n", "c"],
+                  env["v"] as? Int == 2,
+                  let n = (env["n"] as? String).flatMap({ Data(base64Encoded: $0) }), n.count == 12,
+                  let c = (env["c"] as? String).flatMap({ Data(base64Encoded: $0) }), c.count >= 16,
+                  let box = try? ChaChaPoly.SealedBox(nonce: ChaChaPoly.Nonce(data: n),
+                                                      ciphertext: c.dropLast(16), tag: c.suffix(16)),
+                  let plain = try? ChaChaPoly.open(box, using: key, authenticating: label(purpose)),
+                  var obj = (try? JSONSerialization.jsonObject(with: plain)) as? [String: Any]
+            else { return nil }
+            obj["pad"] = nil
+            return obj
+        }
+
+        /// Blob art/<name> = nonce (12) || sealed("ART1" || uint32 length ||
+        /// image || zero padding), its associated data the art label + "|" +
+        /// name, so the bus can't serve one cover in place of another.
+        static func openArt(_ blob: Data, name: String, key: SymmetricKey) -> Data? {
+            guard isArtName(name), blob.count >= 12 + 16 + 8,
+                  let box = try? ChaChaPoly.SealedBox(nonce: ChaChaPoly.Nonce(data: blob.prefix(12)),
+                                                      ciphertext: blob.dropFirst(12).dropLast(16),
+                                                      tag: blob.suffix(16)),
+                  let plain = try? ChaChaPoly.open(box, using: key,
+                                                   authenticating: label("art") + Data("|\(name)".utf8)),
+                  plain.count >= 8, plain.prefix(4) == Data("ART1".utf8) else { return nil }
+            let n = plain.dropFirst(4).prefix(4).reduce(0) { $0 << 8 | Int($1) }
+            guard n > 0, 8 + n <= plain.count else { return nil }
+            return Data(plain.dropFirst(8).prefix(n))
+        }
+
+        // ── the wire ──
+
+        /// GET on the bus, on this thread, under homectl's rules: at most
+        /// `cap` bytes (cancelled past it), no proxy — a VPN's must never
+        /// see the token — and no redirects, which would carry the
+        /// Authorization header wherever they pointed. nil for anything
+        /// that didn't finish.
+        private static func get(_ path: String, token: String, cap: Int) -> (status: Int, body: Data)? {
+            guard let url = URL(string: base + path) else { return nil }
+            var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
+            req.setValue("Bearer " + token, forHTTPHeaderField: "Authorization")
+            req.setValue("codesaver/1", forHTTPHeaderField: "User-Agent")
+            let cfg = URLSessionConfiguration.ephemeral
+            cfg.connectionProxyDictionary = [:]
+            cfg.timeoutIntervalForResource = 20
+            let fetch = Fetch(cap: cap)
+            let session = URLSession(configuration: cfg, delegate: fetch, delegateQueue: nil)
+            defer { session.invalidateAndCancel() }   // a session holds its delegate until invalidated
+            session.dataTask(with: req).resume()
+            guard fetch.done.wait(timeout: .now() + 25) == .success, let status = fetch.status else { return nil }
+            return (status, fetch.body)
+        }
+
+        /// One request's delegate. Its fields are written on the session's
+        /// queue and read only after `done` — or never, once the wait gave up.
+        private final class Fetch: NSObject, URLSessionDataDelegate {
+            let cap: Int
+            let done = DispatchSemaphore(value: 0)
+            var body = Data()
+            var status: Int?                      // only for a request that finished whole
+            init(cap: Int) { self.cap = cap }
+
+            func urlSession(_ session: URLSession, task: URLSessionTask,
+                            willPerformHTTPRedirection response: HTTPURLResponse,
+                            newRequest request: URLRequest,
+                            completionHandler: @escaping (URLRequest?) -> Void) {
+                completionHandler(nil)
+            }
+
+            func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+                body.append(data)
+                if body.count > cap { dataTask.cancel() }
+            }
+
+            func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+                if error == nil { status = (task.response as? HTTPURLResponse)?.statusCode }
+                done.signal()
+            }
+        }
+    }
+
     // MARK: Album art
 
     /// Run a subprocess, capture stdout. Pipe ends are always closed — a
@@ -1174,7 +1456,7 @@ enum FeedsService {
     /// fetched — publishes the key alone: the saver reads that as "asked, and
     /// there is none" and rests its placeholder, rather than waiting on art
     /// that will never come.
-    private static func refreshAlbumArt(app: String, key: String) {
+    private static func refreshAlbumArt(_ np: NowPlaying, key: String) {
         guard let wdir = widgetsDir else { return }
         var payload: [String: Any] = ["key": key,
                                       "ts": Date().timeIntervalSince1970]
@@ -1183,7 +1465,7 @@ enum FeedsService {
         // interpreter dependency, no per-track subprocess, and the app works
         // on any machine. feeds/albumart/ramp.py stays in the repo as the
         // reference the port was verified against.
-        if let cg = fetchArtwork(app: app, into: wdir.appendingPathComponent("albumart-src.img")),
+        if let cg = fetchArtwork(np, into: wdir.appendingPathComponent("albumart-src.img")),
            let ramp = AlbumArtRamp.render(
                cg, params: AlbumArtRamp.Params(json: AlbumArtTuning.load()["ramp"] ?? [:])) {
             payload["ramp"] = ramp
@@ -1200,9 +1482,14 @@ enum FeedsService {
     /// player has none (or won't say). On nil the previous track's file is
     /// removed too, so nothing downstream (the tuner's "current track") can
     /// mistake it for this one's.
-    private static func fetchArtwork(app: String, into src: URL) -> CGImage? {
+    private static func fetchArtwork(_ np: NowPlaying, into src: URL) -> CGImage? {
+        let app = np.app
         var ok = false
-        if app == "Music" {
+        if app == HomeBus.app {
+            // The bridge's own copy, decrypted here. None until Room has
+            // had the room on screen during this track (see HomeBus).
+            if let name = np.art, let img = homeBus.cover(name), (try? img.write(to: src)) != nil { ok = true }
+        } else if app == "Music" {
             let script = """
             tell application "Music"
                 set d to raw data of artwork 1 of current track

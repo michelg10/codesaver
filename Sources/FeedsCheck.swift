@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 // The feed daemon's merge, run on fabricated files:
@@ -8,9 +9,12 @@ import Foundation
 // CLAUDE_LIVE_DIR (and its pins/), CODESAVER_SPOOL_DIR — at a fresh temp
 // directory BEFORE the first read (the daemon resolves them once), writes
 // hook, live, pin and spool files for a set of made-up
-// sessions, runs the merge and checks what it made of each. Never touches
-// ~/.claude, ~/.bifrocate or the app-group feed, so it is safe beside a
-// running daemon and real sessions. Exits 1 if any check fails.
+// sessions, runs the merge and checks what it made of each. Then the
+// HomePods' stand-in for now playing: home-control's envelope opened
+// against its own pinned vector, its state read as a panel, and whose
+// music wins — no network, no Keychain. Never touches ~/.claude,
+// ~/.bifrocate or the app-group feed, so it is safe beside a running
+// daemon and real sessions. Exits 1 if any check fails.
 
 @main
 struct FeedsCheck {
@@ -351,8 +355,116 @@ struct FeedsCheck {
             state($0) == "thinking" && near($0["state_since"], now - 8)
         }
 
+        checkNowPlaying(now: now)
+
         print(failures == 0 ? "all checks passed" : "\(failures) check(s) failed")
         exit(failures == 0 ? 0 : 1)
+    }
+
+    /// The HomePods' stand-in: home-control's envelope opened in Swift, its
+    /// state read as a panel, and whose music wins. No network, no Keychain.
+    static func checkNowPlaying(now: Double) {
+        typealias Bus = FeedsService.HomeBus
+        func check(_ what: String, _ ok: Bool) {
+            if ok { print("ok    now playing: \(what)") } else {
+                failures += 1
+                print("FAIL  now playing: \(what)")
+            }
+        }
+        func ms(_ t: Double) -> Double { (t * 1000).rounded() }
+        func said(_ p: FeedsService.NowPlayingPoll) -> String {
+            switch p {
+            case .player(let np): return np.state
+            case .idle: return "idle"
+            case .unknown: return "unknown"
+            }
+        }
+
+        // home-control's cross-language vector (bridge/tests, CROSS_LANGUAGE_VECTOR:
+        // key 0…31, nonce 0…11, purpose cmd) — what protocol.py seals, this opens.
+        let secret = SymmetricKey(data: (0..<32).map { UInt8($0) })
+        let vector: [String: Any] = ["v": 2, "n": "AAECAwQFBgcICQoL",
+                                     "c": "f4mBstDJgO/OCw8MwSvgscl4B1jV6mQ8vPdHdoSxvB8teQygGfe72iEgAzVuaA=="]
+        let opened = Bus.open(vector, key: Bus.key(secret, "cmd"), purpose: "cmd")
+        check("home-control's pinned vector opens",
+              opened?["v"] as? Int == 2 && opened?["hello"] as? String == "wörld" && opened?["n"] as? Int == 7)
+        check("…and not as another purpose", Bus.open(vector, key: Bus.key(secret, "kv"), purpose: "kv") == nil)
+        var tampered = vector
+        tampered["c"] = "g" + (vector["c"] as! String).dropFirst()
+        check("…and not once tampered with", Bus.open(tampered, key: Bus.key(secret, "cmd"), purpose: "cmd") == nil)
+        check("the Keychain's hex is the secret", Bus.parseKey(String(repeating: "0", count: 64)) != nil
+              && Bus.parseKey(String(repeating: "0", count: 62)) == nil
+              && Bus.parseKey("+f" + String(repeating: "0", count: 62)) == nil)
+
+        // A cover, sealed as protocol.seal_art seals one.
+        let artName = String(repeating: "ab", count: 16)
+        let image = Data("not really a jpeg".utf8)
+        var plain = Data("ART1".utf8) + withUnsafeBytes(of: UInt32(image.count).bigEndian) { Data($0) } + image
+        plain += Data(count: 65536 - plain.count)
+        let artKey = Bus.key(secret, "art")
+        let blob = try! ChaChaPoly.seal(plain, using: artKey,
+                                        authenticating: Bus.label("art") + Data("|\(artName)".utf8)).combined
+        check("a cover opens under its own name", Bus.openArt(blob, name: artName, key: artKey) == image)
+        check("…and not under another",
+              Bus.openArt(blob, name: String(repeating: "cd", count: 16), key: artKey) == nil)
+
+        // The bridge's state, as a panel.
+        func home(_ hp: [String: Any], age: Double = 1) -> [String: Any] {
+            ["v": 2, "kind": "state", "ts": ms(now - age), "homepod": hp]
+        }
+        let playing: [String: Any] = ["ok": true, "state": "playing", "title": "偷故事的人", "artist": "aMEI",
+                                      "position": 6.0, "position_at": ms(now - 20), "duration": 258.0,
+                                      "art": ["name": artName, "mime": "image/jpeg"]]
+        if case .player(let np) = Bus.nowPlaying(fromState: home(playing), at: now) {
+            check("the pair's track, its playhead walked on to now",
+                  np.app == "HomePod" && np.title == "偷故事的人" && np.artist == "aMEI"
+                    && abs(np.position - 26) < 0.01 && np.duration == 258 && np.art == artName)
+        } else {
+            check("the pair's track", false)
+        }
+        var paused = playing
+        paused["state"] = "paused"
+        paused["art"] = ["name": "../../etc/passwd"]
+        if case .player(let np) = Bus.nowPlaying(fromState: home(paused), at: now) {
+            check("paused: the playhead holds, a name that isn't one is no cover",
+                  np.state == "paused" && np.position == 6 && np.art == nil)
+        } else {
+            check("paused", false)
+        }
+        var past = playing
+        past["position_at"] = ms(now - 900)
+        if case .player(let np) = Bus.nowPlaying(fromState: home(past), at: now) {
+            check("a playhead walked past the end stops at it", np.position == 258)
+        } else {
+            check("a playhead walked past the end", false)
+        }
+        check("a snapshot the bridge stopped rewriting says nothing",
+              said(Bus.nowPlaying(fromState: home(playing, age: 400), at: now)) == "unknown")
+        check("the pair out of reach is idle",
+              said(Bus.nowPlaying(fromState: home(["ok": false, "err": "not connected to the HomePods"]), at: now)) == "idle")
+        check("nothing loaded is idle",
+              said(Bus.nowPlaying(fromState: home(["ok": true, "state": "idle", "title": NSNull()]), at: now)) == "idle")
+
+        // Whose music the panel shows.
+        func entry(_ app: String, _ state: String, polled: Double? = nil) -> FeedsService.NowPlaying {
+            .init(app: app, state: state, title: "t", artist: "a", position: 0, duration: 100,
+                  pausedSince: nil, polledAt: polled ?? now)
+        }
+        func pick(_ mac: FeedsService.NowPlaying?, _ pods: FeedsService.NowPlaying?) -> String {
+            FeedsService.chooseNowPlaying(mac: mac, homePods: pods, at: now)?.app ?? "nothing"
+        }
+        check("this Mac playing outranks the HomePods playing",
+              pick(entry("Music", "playing"), entry("HomePod", "playing")) == "Music")
+        check("the HomePods playing outrank this Mac paused",
+              pick(entry("Spotify", "paused"), entry("HomePod", "playing")) == "HomePod")
+        check("nothing playing: this Mac's paused track first",
+              pick(entry("Music", "paused"), entry("HomePod", "paused")) == "Music")
+        check("nothing on this Mac: the HomePods, paused or not",
+              pick(nil, entry("HomePod", "paused")) == "HomePod")
+        check("a stale entry never outranks a live one",
+              pick(entry("Music", "playing", polled: now - 100), entry("HomePod", "paused")) == "HomePod")
+        check("both stale: nothing", pick(entry("Music", "playing", polled: now - 100),
+                                         entry("HomePod", "playing", polled: now - 95)) == "nothing")
     }
 
     static func sessions(_ feed: String) -> [String: [String: Any]] {
