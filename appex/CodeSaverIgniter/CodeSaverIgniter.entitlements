@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Hardened runtime with no exceptions, and deliberately no sandbox: the
+     igniter writes its captures both to ~/Library/Application Support/CodeSaver
+     and into the saver extension's own container, reads the Dock's hot-corner
+     preferences, and lists every process to spot a running saver. Screen
+     Recording is a TCC grant, not an entitlement. -->
+<plist version="1.0">
+<dict/>
+</plist>

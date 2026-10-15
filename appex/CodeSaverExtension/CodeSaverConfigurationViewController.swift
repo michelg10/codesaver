@@ -17,7 +17,12 @@ class CodeSaverConfigurationViewController: NSViewController {
     private var formatControl: NSSegmentedControl!
 
     override func loadView() {
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 168))
+        // Until the app has fetched the user's repositories the saver types
+        // its own bundled source; say so, and where the real thing comes from.
+        let sampleNote = CodeSaverView.userCorpusAvailable ? nil : NSTextField(
+            wrappingLabelWithString: "showing sample code — open the CodeSaver app to connect your GitHub")
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 320,
+                                             height: sampleNote == nil ? 168 : 214))
 
         let title = NSTextField(labelWithString: "CodeSaver")
         title.font = .monospacedSystemFont(ofSize: 16, weight: .semibold)
@@ -53,6 +58,18 @@ class CodeSaverConfigurationViewController: NSViewController {
             ok.centerXAnchor.constraint(equalTo: container.centerXAnchor),
             ok.widthAnchor.constraint(greaterThanOrEqualToConstant: 80),
         ])
+        if let note = sampleNote {
+            note.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+            note.textColor = .secondaryLabelColor
+            note.alignment = .center
+            note.translatesAutoresizingMaskIntoConstraints = false
+            container.addSubview(note)
+            NSLayoutConstraint.activate([
+                note.topAnchor.constraint(equalTo: formatControl.bottomAnchor, constant: 18),
+                note.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 24),
+                note.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -24),
+            ])
+        }
 
         self.view = container
         self.preferredContentSize = container.frame.size

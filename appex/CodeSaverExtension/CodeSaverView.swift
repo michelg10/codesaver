@@ -562,6 +562,22 @@ public final class CodeSaverView: ScreenSaverView {
     private var blockRefs: [Range<Int>] = []         // this session's subset
     private var decodedBlocks: [Int: [String]] = [:] // subset slot → lines
     private var fallbackBlocks: [[String]] = []      // legacy corpus.txt path
+    /// True when the session types the bundled sample (CodeSaver's own
+    /// source, scripts/make-sample-corpus.sh) instead of the user's code.
+    public private(set) var showingSampleCorpus = false
+
+    /// CODESAVER_SAMPLE_CORPUS=1 types the bundled sample even when the
+    /// container holds a real corpus, and leaves the container out of the
+    /// resource chain altogether (its spinner verbs, and — unless
+    /// CODESAVER_WIDGETS_DIR names a fixture — its live session and music
+    /// feed): marketing renders must never show the machine owner's code.
+    static let sampleCorpusForced =
+        ProcessInfo.processInfo.environment["CODESAVER_SAMPLE_CORPUS"] == "1"
+
+    /// The bundled sample's file names — distinct from corpus.bin so a
+    /// bundle can never be mistaken for the user's fetched code.
+    private static let sampleCorpusFiles = (bin: "sample-corpus.bin",
+                                            index: "sample-corpus-index.json")
 
     // MARK: Clock
 
@@ -685,13 +701,11 @@ public final class CodeSaverView: ScreenSaverView {
         }
         // The corpus CodeSaver.app fetches at runtime beats anything bundled;
         // the sandboxed appex reaches it through the shared app-group container.
-        if let dir = CorpusStore.corpusDirectory {
+        if !Self.sampleCorpusForced, let dir = CorpusStore.corpusDirectory {
             resourceDirs.append(dir)
         }
-        if let url = Bundle(for: CodeSaverView.self).resourceURL {
-            resourceDirs.append(url)
-        }
-        resourceDirs.append(Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("Resources"))
+        let bundledDirs = Self.bundledResourceDirectories
+        resourceDirs += bundledDirs
 
         func readFirst(_ name: String) -> String? {
             for dir in resourceDirs {
@@ -720,32 +734,21 @@ public final class CodeSaverView: ScreenSaverView {
         }
         if verbs.isEmpty { verbs = [(ing: "Coding", past: "Coded")] }
 
-        // Corpus: corpus.bin (whole files, mmapped) + corpus-index.json.
-        for dir in resourceDirs {
-            guard let data = try? Data(contentsOf: dir.appendingPathComponent("corpus.bin"),
-                                       options: .mappedIfSafe),
-                  let idxData = try? Data(contentsOf: dir.appendingPathComponent("corpus-index.json")),
-                  let idx = (try? JSONSerialization.jsonObject(with: idxData)) as? [String: [[Int]]],
-                  !idx.isEmpty else { continue }
-            // Validate the whole index against the bin before trusting any of
-            // it — a stale/corrupt pair falls through to the legacy fallback
-            // instead of rendering garbage or trapping on Range construction.
-            let blocks = idx.values.flatMap { $0 }
-            let valid = !blocks.isEmpty && blocks.allSatisfy {
-                $0.count == 2 && $0[0] >= 0 && $0[1] > 0 && $0[0] <= data.count - $0[1]
-            }
-            guard valid else { continue }
-            // The producer packs blocks back to back, so the index's last
-            // byte IS the bin's last byte. Bounds alone can't tell a matched
-            // pair from a NEW bin read against an OLD index (the two files
-            // swap in separately, and the corpus normally grows): every old
-            // block would still fit, and the session would slice the new
-            // file at the old file's boundaries.
-            guard blocks.map({ $0[0] + $0[1] }).max() == data.count else { continue }
+        // Corpus: corpus.bin (whole files, mmapped) + corpus-index.json; with
+        // none anywhere — a fresh install, before the app has fetched — the
+        // bundled sample, read by the same code.
+        var found = Self.sampleCorpusForced ? nil : resourceDirs.lazy
+            .compactMap { Self.validCorpus(in: $0) }.first
+        if found == nil {
+            found = bundledDirs.lazy.compactMap {
+                Self.validCorpus(in: $0, files: Self.sampleCorpusFiles)
+            }.first
+            showingSampleCorpus = found != nil
+        }
+        if let (data, idx) = found {
             corpusData = data
             fullIndex = idx
             blockRefs = chooseSubset(budget: Self.subsetSize)
-            break
         }
         if corpusData == nil {
             // Legacy text corpus (blocks separated by U+0001 header lines).
@@ -763,6 +766,51 @@ public final class CodeSaverView: ScreenSaverView {
             if current.count >= 3 { blocks.append(current) }
             fallbackBlocks = blocks.isEmpty ? [Self.fallbackCorpus.components(separatedBy: "\n")] : blocks
         }
+    }
+
+    /// Where this build's own resources live: the appex's or the host app's
+    /// bundle (both carry the sample and the default verbs), and for the
+    /// bare-swiftc harness in build/, the checkout's appex Resources folder.
+    private static var bundledResourceDirectories: [URL] {
+        var dirs: [URL] = []
+        if let url = Bundle(for: CodeSaverView.self).resourceURL { dirs.append(url) }
+        dirs.append(Bundle.main.bundleURL.deletingLastPathComponent()
+            .appendingPathComponent("appex/CodeSaverExtension/Resources"))
+        return dirs
+    }
+
+    /// A corpus pair in `dir`, or nil when it is missing or doesn't hold up.
+    private static func validCorpus(
+        in dir: URL, files: (bin: String, index: String) = ("corpus.bin", "corpus-index.json")
+    ) -> (Data, [String: [[Int]]])? {
+        guard let data = try? Data(contentsOf: dir.appendingPathComponent(files.bin),
+                                   options: .mappedIfSafe),
+              let idxData = try? Data(contentsOf: dir.appendingPathComponent(files.index)),
+              let idx = (try? JSONSerialization.jsonObject(with: idxData)) as? [String: [[Int]]],
+              !idx.isEmpty else { return nil }
+        // Validate the whole index against the bin before trusting any of
+        // it — a stale/corrupt pair falls through to the next source instead
+        // of rendering garbage or trapping on Range construction.
+        let blocks = idx.values.flatMap { $0 }
+        let valid = !blocks.isEmpty && blocks.allSatisfy {
+            $0.count == 2 && $0[0] >= 0 && $0[1] > 0 && $0[0] <= data.count - $0[1]
+        }
+        guard valid else { return nil }
+        // The producer packs blocks back to back, so the index's last
+        // byte IS the bin's last byte. Bounds alone can't tell a matched
+        // pair from a NEW bin read against an OLD index (the two files
+        // swap in separately, and the corpus normally grows): every old
+        // block would still fit, and the session would slice the new
+        // file at the old file's boundaries.
+        guard blocks.map({ $0[0] + $0[1] }).max() == data.count else { return nil }
+        return (data, idx)
+    }
+
+    /// Whether the app has fetched the user's own code yet — i.e. whether a
+    /// saver started now types it rather than the bundled sample. The
+    /// Options sheet asks, to say which one is showing.
+    static var userCorpusAvailable: Bool {
+        CorpusStore.corpusDirectory.flatMap { validCorpus(in: $0) } != nil
     }
 
     /// Draws `budget` blocks across repos: weight ∝ sqrt(file count), capped
@@ -810,6 +858,7 @@ public final class CodeSaverView: ScreenSaverView {
         return lines
     }
 
+    /// Last resort, for a build that somehow ships without the sample.
     private static let fallbackCorpus = """
     func animateOneFrame() {
         let t = CACurrentMediaTime()
@@ -1079,23 +1128,24 @@ public final class CodeSaverView: ScreenSaverView {
     }
 
     /// Metal twin of the snapshot harness's CPU reference frames.
-    public func metalDebugSnapshot() -> CGImage? {
+    /// Scale 1 = point-sized bitmaps; 2 renders the same layout the way a
+    /// Retina display does (CODESAVER_SNAPSHOT_SCALE, for media stills).
+    public func metalDebugSnapshot(scale: CGFloat = 1) -> CGImage? {
         guard let ctx = BoomMetalContext.shared else { return nil }
         if boomMetal == nil { boomMetal = BoomMetalRenderer(context: ctx) }
         guard let metal = boomMetal else { return nil }
-        // Scale 1: the harness's bitmaps are point-sized.
         if let core = boomCore {
             metal.bindFieldIfNeeded(core.fields[boomFieldIndex],
                                     backdrop: backdropSource,
                                     buffer: boomSession?.backdropBuffers[boomFieldIndex],
-                                    scale: 1)
+                                    scale: scale)
         } else if intro == .armed, let img = backdropSource {
             metal.bindBackdropOnly(img)
         }
-        guard let frame = buildFrameInput(scale: 1) else { return nil }
+        guard let frame = buildFrameInput(scale: scale) else { return nil }
         return metal.snapshot(frame, core: intro != .none ? boomCore : nil,
                               fieldIndex: boomFieldIndex,
-                              viewSize: bounds.size, scale: 1)
+                              viewSize: bounds.size, scale: scale)
     }
 
     // MARK: Metal frame builders
@@ -1827,9 +1877,12 @@ public final class CodeSaverView: ScreenSaverView {
 
     /// CODESAVER_WIDGETS=0 leaves the live feed out entirely — the session
     /// timers tick with the wall clock, which is the one thing a seeded
-    /// snapshot run cannot pin.
+    /// snapshot run cannot pin. A forced sample (CODESAVER_SAMPLE_CORPUS=1)
+    /// leaves it out too unless CODESAVER_WIDGETS_DIR names a fixture: the
+    /// real feed carries the owner's project paths and music.
     private static let widgetsDisabled =
         ProcessInfo.processInfo.environment["CODESAVER_WIDGETS"] == "0"
+        || (sampleCorpusForced && ProcessInfo.processInfo.environment["CODESAVER_WIDGETS_DIR"] == nil)
 
     private func pollWidgetFeed() {
         guard !Self.widgetsDisabled, now >= widgetPollAt else { return }

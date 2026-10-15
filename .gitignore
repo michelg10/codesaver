@@ -1,4 +1,5 @@
 .DS_Store
 build/
 appex/build/
+appex/Local.xcconfig
 __pycache__/

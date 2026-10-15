@@ -10,7 +10,7 @@
             ActionType = "Xcode.IDEStandardExecutionActionsCore.ExecutionActionType.ShellScriptAction">
             <ActionContent
                title = "Run Script"
-               scriptText = "#!/bin/sh&#10;BUILD_NUMBER=`date &apos;+%y%m%d.%H%M&apos;`&#10;echo &quot;CURRENT_PROJECT_VERSION = $BUILD_NUMBER&quot; &gt; &quot;${PROJECT_DIR}/BuildNumber.xcconfig&quot;&#10;">
+               scriptText = "#!/bin/sh&#10;BUILD_NUMBER=`date &apos;+%y%m%d.%H%M&apos;`&#10;sed -i &apos;&apos; &quot;s/^CURRENT_PROJECT_VERSION = .*/CURRENT_PROJECT_VERSION = $BUILD_NUMBER/&quot; &quot;${PROJECT_DIR}/BuildNumber.xcconfig&quot;&#10;">
                <EnvironmentBuildable>
                   <BuildableReference
                      BuildableIdentifier = "primary"

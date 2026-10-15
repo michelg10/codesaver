@@ -19,7 +19,7 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0</string>
+	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>CodeSaverAppGroup</key>
@@ -29,7 +29,7 @@
 	<key>NSAppleEventsUsageDescription</key>
 	<string>CodeSaver reads the current track from Music or Spotify to show the saver's now-playing panel.</string>
 	<key>NSHumanReadableCopyright</key>
-	<string>Copyright 2025. All rights reserved.</string>
+	<string>© 2026 Michel Guo · MIT License</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 </dict>

@@ -13,7 +13,6 @@
 //
 
 import Foundation
-import PaperSaverKit
 import ServiceManagement
 
 let args = CommandLine.arguments
@@ -27,18 +26,34 @@ if args.contains("--feeds") {
 
 // Headless mode for install.sh: reinstalling invalidates the wallpaper
 // store's screen-saver selection, so the installer re-activates and exits.
+// The app's Enable button, verbatim: wait for pluginkit to list the
+// /Applications copy, select, read the selection back, retry.
 if args.contains("--activate") {
-    Task { @MainActor in
-        do {
-            try await PaperSaver().setScreensaverEverywhere(module: "CodeSaverExtension")
+    Task.detached {
+        let failure: String
+        switch await SaverControl.enable(progress: { print("   \($0)") }) {
+        case .enabled:
             print("activated")
             exit(0)
-        } catch {
-            FileHandle.standardError.write(Data("activation failed: \(error)\n".utf8))
-            exit(1)
+        case .notInApplications:
+            failure = "this copy isn't /Applications/CodeSaver.app — macOS only uses the screen saver from there"
+        case .notRegistered:
+            failure = "pluginkit never listed /Applications/CodeSaver.app's screen saver"
+        case .failed(let why):
+            failure = why
         }
+        FileHandle.standardError.write(Data("activation failed: \(failure)\n".utf8))
+        exit(1)
     }
     RunLoop.main.run()
+}
+
+// For install.sh, before it replaces the bundle: is CodeSaver the selected
+// saver right now? Exit 0 = yes, 1 = no. Reads only — selects nothing.
+if args.contains("--saver-active") {
+    let active = SaverControl.isActive()
+    print(active ? "active" : "not active")
+    exit(active ? 0 : 1)
 }
 
 // Headless corpus refresh — what the refresh LaunchAgent runs hourly.
@@ -54,8 +69,8 @@ if args.contains("--refresh") {
 // ever turns it on. Both install-time entry points below therefore act on it
 // only when it is already on (enabled, or registered and waiting in Login
 // Items) — a reinstall keeps a chosen daemon running on the new build and
-// never starts one for a user who never chose it.
-func feedsIsOn(_ s: SMAppService.Status) -> Bool { s == .enabled || s == .requiresApproval }
+// never starts one for a user who never chose it. Both go through
+// AgentMaintenance, which the app's post-update repair calls too.
 
 // Called by install.sh when the feeds agent's plist has changed: registering
 // an already-enabled agent is a no-op and launchd keeps the job definition it
@@ -65,27 +80,40 @@ func feedsIsOn(_ s: SMAppService.Status) -> Bool { s == .enabled || s == .requir
 // `launchctl bootout`, and after the bundle swap — the record is keyed by the
 // /Applications path; cycling it starts the job again).
 if args.contains("--reregister-feeds") {
-    guard feedsIsOn(FeedsAgent.status) else {
+    guard let s = AgentMaintenance.cycleFeedsIfOn() else {
         print("feeds agent: off — not registered (turn on Live widgets in the app)")
         exit(0)
     }
-    FeedsAgent.unregister()
-    let s = FeedsAgent.register(interactive: false)
     print("feeds agent: \(RefreshAgent.describe(s))")
-    exit(feedsIsOn(s) ? 0 : 1)
+    exit(AgentMaintenance.isOn(s) ? 0 : 1)
 }
 
-// Called by install.sh once the app is at its stable /Applications path:
-// the corpus refresher always (a no-op that self-heals a stale BTM record),
-// the feeds agent only if it was already on.
+// Called by install.sh once the app is at its stable /Applications path: the
+// corpus refresher when it's on (a no-op that self-heals a stale BTM record)
+// or a GitHub token makes it useful — never for a fresh install with no
+// token, which got a "Background Items Added" notice for an agent that could
+// only fail hourly — and the feeds agent only if it was already on.
+// install.sh's counterpart for the embedded igniter: cycle it when it is on
+// (the agent keeps running the replaced build otherwise), retiring a
+// standalone igniter from an old source install on the way. Off: exit 0 and
+// register nothing — a reinstall never switches ignition on.
+if args.contains("--reregister-igniter") {
+    let s = IgniterService.repairAfterUpdate()
+    print("igniter agent: \(RefreshAgent.describe(s))")
+    exit(IgniterService.isOn(s) || s == .notRegistered ? 0 : 1)
+}
+
 if args.contains("--register-agent") {
-    let s1 = RefreshAgent.register(interactive: false)
-    print("refresh agent: \(RefreshAgent.describe(s1))")
-    var ok = s1 == .enabled || s1 == .requiresApproval
-    if feedsIsOn(FeedsAgent.status) {
-        let s2 = FeedsAgent.register(interactive: false)
+    var ok = true
+    if let s1 = AgentMaintenance.registerRefresh(orIfToken: true) {
+        print("refresh agent: \(RefreshAgent.describe(s1))")
+        ok = AgentMaintenance.isOn(s1)
+    } else {
+        print("refresh agent: off (connect GitHub, then switch on Auto-refresh in the app)")
+    }
+    if let s2 = AgentMaintenance.registerFeedsIfOn() {
         print("feeds agent: \(RefreshAgent.describe(s2)) (kept)")
-        ok = ok && feedsIsOn(s2)
+        ok = ok && AgentMaintenance.isOn(s2)
     } else {
         print("feeds agent: off (opt in with Live widgets in the app)")
     }

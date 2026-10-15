@@ -15,7 +15,7 @@
 //       load the mods below.
 //    2. $CLAUDE_LIVE_DIR/<sid>.json (default ~/.claude/live) — the live
 //       state file claude-mods' pause mod keeps for its session (the
-//       contract is ~/bin/claude-mods/PAUSE.md): every model request and
+//       contract is claude-mods' PAUSE.md): every model request and
 //       tool call in flight, main agent and subagents (thinking,
 //       responding, writing a tool call, which tool is running, held at
 //       the pause gate), how the last turn ended (`aborted` = Esc — no
@@ -28,16 +28,25 @@
 //       even past the hour.
 //    4. Now playing — Music.app / Spotify via AppleScript, polled only
 //       while the player is actually running; a paused track is held for
-//       half an hour. While neither plays, the Office HomePods stand in:
-//       their state off home-control's bus (HomeBus, below), decrypted
-//       here with keys derived from the home key in the login Keychain —
-//       and while the saver is on screen showing them, Room's "watching"
-//       heartbeat, so the bridge stores their covers.
-//    5. LEGACY — ~/.bifrocate/cot/*.jsonl, bifrocate's main-agent CoT
-//       spools. Read only for a session without a fresh live file. Since
-//       Claude Code moved to server-side threads the spool misses most
-//       requests; remove it (tailSpools, SpoolState, the spools
-//       publisher) once the mods are loaded in every session.
+//       half an hour. In a HOME_CONTROL build, while neither plays, a
+//       pair of HomePods stands in: their state off home-control's bus
+//       (HomeBus, below), decrypted here with keys derived from the home
+//       key in the login Keychain — and while the saver is on screen
+//       showing them, Room's "watching" heartbeat, so the bridge stores
+//       their covers.
+//    5. LEGACY, LEGACY_SPOOLS builds only — ~/.bifrocate/cot/*.jsonl,
+//       bifrocate's main-agent CoT spools. Read only for a session
+//       without a fresh live file. Since Claude Code moved to server-side
+//       threads the spool misses most requests; remove it (tailSpools,
+//       SpoolState, the spools publisher) once the mods are loaded in
+//       every session.
+//
+//  HOME_CONTROL and LEGACY_SPOOLS are compile-time switches for the one
+//  setup that has a home-control bridge and bifrocate: a gitignored
+//  appex/Local.xcconfig turns them on (build.sh reads the same file).
+//  Without them — every release — the daemon carries no bus client, never
+//  runs /usr/bin/security, never reads ~/.bifrocate, and merges the other
+//  sources exactly as it does on a Mac that has neither.
 //
 //  Every directory honours an environment override — CLAUDE_LIVE_DIR as
 //  the mods themselves do, CODESAVER_SESSIONS_DIR and CODESAVER_SPOOL_DIR
@@ -70,15 +79,17 @@
 //  that runs forever drains its own pool. Law, like the pipe fds below.
 //
 //  The merge: a fresh live file (its pid alive, written within the last
-//  60 s) decides a session's state; without one, recency between the hook
-//  file and the spool — the freshest signal wins. Either way a
-//  PermissionRequest holds until any newer event for that session: the
-//  live file doesn't report permission dialogs (v1).
+//  60 s) decides a session's state; without one, the hook file does — or,
+//  with the spools, recency between the two: the freshest signal wins.
+//  Either way a PermissionRequest holds until any newer event for that
+//  session: the live file doesn't report permission dialogs (v1).
 //  Host app target only.
 //
 
 import CoreGraphics
+#if HOME_CONTROL
 import CryptoKit
+#endif
 import Foundation
 import ImageIO
 import ServiceManagement
@@ -100,8 +111,10 @@ enum FeedsService {
     private static let hookDir = envDir("CODESAVER_SESSIONS_DIR", ".claude/codesaver/sessions")
     private static let liveDir = envDir("CLAUDE_LIVE_DIR", ".claude/live")
     private static let pinsDir = liveDir.appendingPathComponent("pins", isDirectory: true)
+    #if LEGACY_SPOOLS
     /// LEGACY: bifrocate's CoT spools — goes with tailSpools.
     private static let spoolDir = envDir("CODESAVER_SPOOL_DIR", ".bifrocate/cot")
+    #endif
     static var widgetsDir: URL? { CorpusStore.widgetsDirectory }
 
     /// PAUSE.md's staleness rule for live and pin files: a file not
@@ -112,7 +125,10 @@ enum FeedsService {
     // MARK: Per-session model
 
     /// LEGACY: one session's view off bifrocate's spool — goes with
-    /// tailSpools once every session loads the mods.
+    /// tailSpools once every session loads the mods. Declared in every
+    /// build because the merge is written against it, but only a
+    /// LEGACY_SPOOLS build ever makes one: elsewhere the merge's spool map
+    /// is always empty.
     private struct SpoolState {
         var state = ""          // thinking | responding | toolcall | waiting_tool | done
         var tool: String?
@@ -389,7 +405,7 @@ enum FeedsService {
     /// so the subscriber can carry a playing position forward to the second
     /// it publishes.
     struct NowPlaying {
-        var app: String              // Music | Spotify | HomePod
+        var app: String              // Music | Spotify, and HomePod with HOME_CONTROL
         var state: String            // playing | paused
         var title: String
         var artist: String
@@ -397,7 +413,9 @@ enum FeedsService {
         var duration: Double
         var pausedSince: Double?
         var polledAt: Double
+        #if HOME_CONTROL
         var art: String? = nil       // HomePod only: the cover's blob name on the bus, once there is one
+        #endif
     }
 
     /// Paused music stays on the panel for half an hour — long enough to
@@ -416,14 +434,21 @@ enum FeedsService {
     }
 
     /// Whose music the panel shows: this Mac's player while it plays; the
-    /// HomePods while they play and it doesn't; otherwise whichever is
-    /// paused, this Mac's first. An entry without a completed poll for a
-    /// minute and a half is nobody's — by then nobody knows what that
-    /// player is doing — so a stale one never outranks a live one.
+    /// HomePods (HOME_CONTROL) while they play and it doesn't; otherwise
+    /// whichever is paused, this Mac's first. An entry without a completed
+    /// poll for a minute and a half is nobody's — by then nobody knows what
+    /// that player is doing — so a stale one never outranks a live one, and
+    /// with only this Mac to ask, a stale one is nothing.
+    #if HOME_CONTROL
     static func chooseNowPlaying(mac: NowPlaying?, homePods: NowPlaying?, at now: Double) -> NowPlaying? {
         let fresh = [mac, homePods].compactMap { $0 }.filter { now - $0.polledAt < 90 }
         return fresh.first { $0.state == "playing" } ?? fresh.first
     }
+    #else
+    static func chooseNowPlaying(mac: NowPlaying?, at now: Double) -> NowPlaying? {
+        mac.flatMap { now - $0.polledAt < 90 ? $0 : nil }
+    }
+    #endif
 
     // MARK: Daemon
 
@@ -452,13 +477,19 @@ enum FeedsService {
 
         // LEGACY: bifrocate's spools, the fallback for a session without a
         // fresh live file. Remove with tailSpools once the mods are loaded
-        // everywhere.
+        // everywhere. Without LEGACY_SPOOLS there is no publisher, and the
+        // merge's spool map is empty from the first tick.
+        #if LEGACY_SPOOLS
         var offsets: [String: UInt64] = [:]          // spool path -> bytes consumed
         var spool: [String: SpoolState] = [:]        // session id -> spool view
         let spools = Publisher("spools", every: 1.0) { () -> [String: SpoolState] in
             tailSpools(offsets: &offsets, spool: &spool)
             return spool
         }
+        func latestSpool() -> [String: SpoolState]? { spools.latest?.value }
+        #else
+        func latestSpool() -> [String: SpoolState]? { [:] }
+        #endif
 
         // The pin mod's files, one per pinned session, rewritten on every
         // change and at least every 30 s.
@@ -493,6 +524,7 @@ enum FeedsService {
             }
         }
 
+        #if HOME_CONTROL
         // The HomePods, off home-control's bus: the stand-in while this
         // Mac's players have nothing playing. It subscribes to the Mac's
         // poll and doesn't fetch while that one plays — the HomePods can't
@@ -539,6 +571,11 @@ enum FeedsService {
             chooseNowPlaying(mac: nowPlaying.latest?.value, homePods: homePods.latest?.value,
                              at: Date().timeIntervalSince1970)
         }
+        #else
+        func current() -> NowPlaying? {
+            chooseNowPlaying(mac: nowPlaying.latest?.value, at: Date().timeIntervalSince1970)
+        }
+        #endif
 
         // Album art subscribes to now-playing and publishes a FILE. On a
         // track change it extracts + renders (extraction ~1s, the render
@@ -561,11 +598,15 @@ enum FeedsService {
             }
             guard let np = current() else { return lastArtKey }
             let key = "\(np.app)|\(np.title)|\(np.artist)"
+            #if HOME_CONTROL
             // A HomePod cover reaches the bus only while someone watches —
             // Room, or this saver once its first heartbeat lands — so it
             // turns up seconds after its track did: the blob name decides
             // when to run again, but the saver matches on the key alone.
             let runKey = key + "|" + (np.art ?? "")
+            #else
+            let runKey = key
+            #endif
             if runKey != lastArtKey {
                 lastArtKey = runKey
                 refreshAlbumArt(np, key: key)
@@ -583,7 +624,7 @@ enum FeedsService {
         // (or a pinned panel) for a second. Bounded: a stuck source must not
         // hold the feed.
         let ready = Date().addingTimeInterval(3)
-        while (sessions.latest == nil || live.latest == nil || spools.latest == nil
+        while (sessions.latest == nil || live.latest == nil || latestSpool() == nil
                || pins.latest == nil), Date() < ready {
             Thread.sleep(forTimeInterval: 0.05)
         }
@@ -594,7 +635,7 @@ enum FeedsService {
                 let started = Date()
                 let feed = buildFeed(hooks: sessions.latest?.value ?? [],
                                      live: live.latest?.value ?? [:],
-                                     spool: spools.latest?.value ?? [:],
+                                     spool: latestSpool() ?? [:],
                                      pins: pins.latest?.value ?? [:],
                                      nowPlaying: current(),
                                      stateSince: &stateSince)
@@ -642,6 +683,7 @@ enum FeedsService {
 
     // MARK: Spool tailing (LEGACY)
 
+    #if LEGACY_SPOOLS
     /// bifrocate's CoT spools. Since Claude Code moved to server-side
     /// threads they miss most requests; the merge reads them only for a
     /// session without a fresh live file. Remove this, SpoolState, spoolDir
@@ -710,6 +752,7 @@ enum FeedsService {
             spool[sid] = st
         }
     }
+    #endif
 
     // MARK: Session-file hygiene
 
@@ -794,9 +837,13 @@ enum FeedsService {
     /// now-playing (its poll spawns processes), no prune, no write;
     /// `stateSince` carries across calls as the daemon's does across ticks.
     static func feedOnce(stateSince: inout [String: (String, Double)]) -> String {
+        #if LEGACY_SPOOLS
         var offsets: [String: UInt64] = [:]
         var spool: [String: SpoolState] = [:]
         tailSpools(offsets: &offsets, spool: &spool)
+        #else
+        let spool: [String: SpoolState] = [:]
+        #endif
         var liveCache: [String: Cached<LiveRecord>] = [:]
         var pinCache: [String: Cached<PinRecord>] = [:]
         return buildFeed(hooks: readSessionFiles(),
@@ -897,7 +944,10 @@ enum FeedsService {
                 // for an hour.
                 guard pidAlive(h.pid?.value) else { continue }
             }
-            // LEGACY: the spool only for a session without a fresh live file.
+            // LEGACY: the spool only for a session without a fresh live file
+            // — and only in a LEGACY_SPOOLS build; in any other `spool` is
+            // empty, `s` is always nil, and every use of it below falls
+            // through to the hook file.
             let s = L == nil ? spool[sid] : nil
             let hookTS = max(h?.hook_ts ?? 0, 0)
             let liveMainTS = L?.mainChangedAt ?? 0
@@ -1198,6 +1248,10 @@ enum FeedsService {
 
     // MARK: HomePods (home-control)
 
+    // Only in a HOME_CONTROL build (see the header): none of this — the bus
+    // client, the Keychain read, the heartbeat, the installation id in
+    // CodeSaver's defaults — exists in any other.
+    #if HOME_CONTROL
     private static let homeBus = HomeBus()
 
     /// CodeSaver on screen: ScreenSaverEngine running with our extension in
@@ -1231,14 +1285,14 @@ enum FeedsService {
         return false
     }
 
-    /// The Office HomePods as home-control (~/bin/michelg10-apps/home-control)
-    /// sees them. Its bridge on the Pi holds one connection to the pair and
-    /// publishes the room's state on a bus it assumes compromisable
-    /// (api.michelg10.com, namespace "home"), so everything there is sealed:
-    /// ChaCha20-Poly1305 under keys derived from the home key. The latest
-    /// state sits at kv `state`, rewritten on every change worth publishing
-    /// — a new track, play or pause — and at least once a minute. This reads
-    /// that snapshot as `tools/homectl state` does; the bridge's protocol.py
+    /// A pair of HomePods as home-control sees them. Its bridge on a
+    /// Raspberry Pi holds one connection to the pair and publishes the
+    /// room's state on a bus it assumes compromisable (api.michelg10.com,
+    /// namespace "home"), so everything there is sealed: ChaCha20-Poly1305
+    /// under keys derived from the home key. The latest state sits at kv
+    /// `state`, rewritten on every change worth publishing — a new track,
+    /// play or pause — and at least once a minute. This reads that snapshot
+    /// as home-control's `tools/homectl state` does; its bridge/protocol.py
     /// is the spec: envelope {"v": 2, "n", "c"}, purpose keys from
     /// HKDF-SHA256(home key, salt "home-control", info = label), the label
     /// "home-control/v2/<purpose>" again as associated data.
@@ -1251,7 +1305,7 @@ enum FeedsService {
     /// sealed with the home key does.
     ///
     /// The secrets are homectl's — login Keychain, service "home-control",
-    /// put there by setup-secrets.sh — read through /usr/bin/security as
+    /// put there by home-control's setup-secrets.sh — read through /usr/bin/security as
     /// homectl reads them (the items trust that tool: no prompt), at most
     /// once every ten minutes, never written anywhere. Three purpose keys
     /// are derived and the secret itself dropped: `kv` and `art` to read the
@@ -1523,6 +1577,7 @@ enum FeedsService {
             }
         }
     }
+    #endif
 
     // MARK: Album art
 
@@ -1602,11 +1657,14 @@ enum FeedsService {
     private static func fetchArtwork(_ np: NowPlaying, into src: URL) -> CGImage? {
         let app = np.app
         var ok = false
-        if app == HomeBus.app {
+        switch app {
+        #if HOME_CONTROL
+        case HomeBus.app:
             // The bridge's own copy, decrypted here. None until someone
             // has watched during this track (see HomeBus).
             if let name = np.art, let img = homeBus.cover(name), (try? img.write(to: src)) != nil { ok = true }
-        } else if app == "Music" {
+        #endif
+        case "Music":
             let script = """
             tell application "Music"
                 set d to raw data of artwork 1 of current track
@@ -1617,13 +1675,16 @@ enum FeedsService {
             close access f
             """
             ok = runProcess("/usr/bin/osascript", ["-e", script]) != nil
-        } else {
-            // Spotify exposes a URL, not bytes.
+        default:
+            // Spotify exposes a URL, not bytes. Fetched only over https: the
+            // string is whatever another app hands back, and URLSession would
+            // as happily read a file:// URL off this disk — or a plain-http
+            // one anybody on the network can rewrite.
             let script = "tell application \"\(app)\" to artwork url of current track"
             if let d = runProcess("/usr/bin/osascript", ["-e", script]),
                let urlStr = String(data: d, encoding: .utf8)?
                    .trimmingCharacters(in: .whitespacesAndNewlines),
-               let url = URL(string: urlStr) {
+               let url = URL(string: urlStr), url.scheme?.lowercased() == "https" {
                 let sem = DispatchSemaphore(value: 0)
                 var img: Data?
                 URLSession.shared.dataTask(with: url) { data, _, _ in

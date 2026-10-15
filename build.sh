@@ -9,6 +9,24 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# The compile-time switches the Xcode build takes from the gitignored
+# appex/Local.xcconfig (see appex/Local.xcconfig.example), so feeds-check
+# tests the same daemon this machine's app runs. Only the plain
+# `SWIFT_ACTIVE_COMPILATION_CONDITIONS = …` line is read, its last one if
+# there are several; a `[config=…]` variant is Xcode's alone.
+CONDITIONS=()
+if [[ -f appex/Local.xcconfig ]]; then
+  CONDITIONS=(${=$(sed -n -e 's://.*$::' \
+    -e 's/^[[:space:]]*SWIFT_ACTIVE_COMPILATION_CONDITIONS[[:space:]]*=//p' \
+    appex/Local.xcconfig | tail -1)})
+fi
+SWIFT_FLAGS=()
+for flag in HOME_CONTROL LEGACY_SPOOLS; do
+  if (( ${CONDITIONS[(Ie)$flag]} )); then
+    SWIFT_FLAGS+=(-D "$flag")
+  fi
+done
+
 mkdir -p build
 echo "── compiling preview harness…"
 swiftc -O -parse-as-library -module-name CodeSaverPreview \
@@ -30,11 +48,12 @@ echo "── compiling igniter helper…"
 swiftc -O -parse-as-library helper/Igniter.swift \
   -framework AppKit -framework IOKit -framework ScreenCaptureKit \
   -o build/codesaver-igniter
-echo "── built build/codesaver-igniter  (helper/install.sh installs the LaunchAgent)"
+echo "── built build/codesaver-igniter  (--corners / --capture diagnostics; CodeSaver.app ships its own)"
 
 # --- Feed merge check (the daemon's merge on fabricated files, in a temp dir) -
 echo "── compiling feed check…"
-swiftc -O -parse-as-library -module-name FeedsCheck \
+if (( $#SWIFT_FLAGS )); then echo "   with $SWIFT_FLAGS (appex/Local.xcconfig)"; fi
+swiftc -O -parse-as-library -module-name FeedsCheck $SWIFT_FLAGS \
   appex/CodeSaver/FeedsService.swift \
   appex/CodeSaver/CorpusStore.swift \
   appex/CodeSaver/AlbumArtShared.swift \

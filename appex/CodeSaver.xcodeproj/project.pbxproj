@@ -21,9 +21,16 @@
 		1A0000D1000000000000000A /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 1A0000D0000000000000000B /* Assets.xcassets */; };
 		1A0000A5000000000000000A /* spinner-verbs.txt in Resources */ = {isa = PBXBuildFile; fileRef = 1A0000A3000000000000000B /* spinner-verbs.txt */; };
 		1A0000A7000000000000000A /* spinner-verbs.txt in Resources */ = {isa = PBXBuildFile; fileRef = 1A0000A3000000000000000B /* spinner-verbs.txt */; };
+		2F0000000000000000000001 /* sample-corpus.bin in Resources */ = {isa = PBXBuildFile; fileRef = 2F00000000000000000000A1 /* sample-corpus.bin */; };
+		2F0000000000000000000002 /* sample-corpus-index.json in Resources */ = {isa = PBXBuildFile; fileRef = 2F00000000000000000000A2 /* sample-corpus-index.json */; };
+		2F0000000000000000000003 /* sample-corpus.bin in Resources */ = {isa = PBXBuildFile; fileRef = 2F00000000000000000000A1 /* sample-corpus.bin */; };
+		2F0000000000000000000004 /* sample-corpus-index.json in Resources */ = {isa = PBXBuildFile; fileRef = 2F00000000000000000000A2 /* sample-corpus-index.json */; };
 		1A000084000000000000000A /* RefreshService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A000080000000000000000B /* RefreshService.swift */; };
 		1A000085000000000000000A /* GitHubCorpusFetcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A000081000000000000000B /* GitHubCorpusFetcher.swift */; };
 		1A00008B000000000000000A /* RefreshManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A00008A000000000000000B /* RefreshManager.swift */; };
+		2B0000000000000000000001 /* CodeSources.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2B0000000000000000000002 /* CodeSources.swift */; };
+		2B0000000000000000000003 /* CodeSetupViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2B0000000000000000000004 /* CodeSetupViews.swift */; };
+		2B0000000000000000000005 /* CodePicker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2B0000000000000000000006 /* CodePicker.swift */; };
 		1A000086000000000000000A /* CorpusStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A000082000000000000000B /* CorpusStore.swift */; };
 		1A000087000000000000000A /* CorpusStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A000082000000000000000B /* CorpusStore.swift */; };
 		1A000088000000000000000A /* com.michelg10.CodeSaver.refresh.plist in Embed LaunchAgent */ = {isa = PBXBuildFile; fileRef = 1A000083000000000000000B /* com.michelg10.CodeSaver.refresh.plist */; };
@@ -39,11 +46,26 @@
 		1A000007000000000000000A /* CodeSaverExtension.appex in Embed PlugIns */ = {isa = PBXBuildFile; fileRef = 1A000007000000000000000B /* CodeSaverExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		1A000031000000000000000A /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 1A000031000000000000000B /* Assets.xcassets */; };
 		1A000032000000000000000A /* PluginManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A000032000000000000000B /* PluginManager.swift */; };
+		2E0000000000000000000011 /* AppMover.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2E0000000000000000000001 /* AppMover.swift */; };
+		2E0000000000000000000012 /* SelfRepair.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2E0000000000000000000002 /* SelfRepair.swift */; };
+		2E0000000000000000000013 /* UpdateCheck.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2E0000000000000000000003 /* UpdateCheck.swift */; };
+		2E0000000000000000000014 /* Uninstaller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2E0000000000000000000004 /* Uninstaller.swift */; };
+		2E0000000000000000000015 /* LifecycleViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2E0000000000000000000005 /* LifecycleViews.swift */; };
 		1A000062000000000000000A /* PreviewView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A000062000000000000000B /* PreviewView.swift */; };
 		1A000063000000000000000A /* PreviewViewRepresentable.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A000063000000000000000B /* PreviewViewRepresentable.swift */; };
 		1A000066000000000000000A /* Logger.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A000064000000000000000B /* Logger.swift */; };
 		1A000067000000000000000A /* Logger.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A000064000000000000000B /* Logger.swift */; };
 		1A000070000000000000000A /* PaperSaverKit in Frameworks */ = {isa = PBXBuildFile; productRef = 1A000070000000000000000B /* PaperSaverKit */; };
+		2C0000000000000000000002 /* IgniterService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C0000000000000000000001 /* IgniterService.swift */; };
+		2C0000000000000000000004 /* IgnitionSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C0000000000000000000003 /* IgnitionSection.swift */; };
+		2C0000000000000000000006 /* com.michelg10.CodeSaver.Igniter.plist in Embed LaunchAgent */ = {isa = PBXBuildFile; fileRef = 2C0000000000000000000005 /* com.michelg10.CodeSaver.Igniter.plist */; };
+		2C0000000000000000000008 /* Igniter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C0000000000000000000007 /* Igniter.swift */; };
+		2C000000000000000000000C /* CodeSaver Igniter.app in Embed Login Items */ = {isa = PBXBuildFile; fileRef = 2C000000000000000000000B /* CodeSaver Igniter.app */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		2D0000000000000000000001 /* ClaudeCodeWiring.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D0000000000000000000011 /* ClaudeCodeWiring.swift */; };
+		2D0000000000000000000002 /* LiveWidgetsStep.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D0000000000000000000012 /* LiveWidgetsStep.swift */; };
+		2D0000000000000000000003 /* wire-settings.py in Embed Claude Code Scripts */ = {isa = PBXBuildFile; fileRef = 2D0000000000000000000013 /* wire-settings.py */; };
+		2D0000000000000000000004 /* cc-state-hook.py in Embed Claude Code Scripts */ = {isa = PBXBuildFile; fileRef = 2D0000000000000000000014 /* cc-state-hook.py */; };
+		2D0000000000000000000005 /* cc-statusline-wrapper.sh in Embed Claude Code Scripts */ = {isa = PBXBuildFile; fileRef = 2D0000000000000000000015 /* cc-statusline-wrapper.sh */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -53,6 +75,13 @@
 			proxyType = 1;
 			remoteGlobalIDString = 1A000010000000000000000A;
 			remoteInfo = CodeSaverExtension;
+		};
+		2C0000000000000000000015 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 1A000000000000000000000A /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 2C000000000000000000000F;
+			remoteInfo = CodeSaverIgniter;
 		};
 /* End PBXContainerItemProxy section */
 
@@ -76,8 +105,33 @@
 			files = (
 				1A000088000000000000000A /* com.michelg10.CodeSaver.refresh.plist in Embed LaunchAgent */,
 				1A00008D000000000000000A /* com.michelg10.CodeSaver.feeds.plist in Embed LaunchAgent */,
+				2C0000000000000000000006 /* com.michelg10.CodeSaver.Igniter.plist in Embed LaunchAgent */,
 			);
 			name = "Embed LaunchAgent";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		2C000000000000000000000D /* Embed Login Items */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "Contents/Library/LoginItems";
+			dstSubfolderSpec = 1;
+			files = (
+				2C000000000000000000000C /* CodeSaver Igniter.app in Embed Login Items */,
+			);
+			name = "Embed Login Items";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		2D0000000000000000000020 /* Embed Claude Code Scripts */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "claude-code";
+			dstSubfolderSpec = 7;
+			files = (
+				2D0000000000000000000003 /* wire-settings.py in Embed Claude Code Scripts */,
+				2D0000000000000000000004 /* cc-state-hook.py in Embed Claude Code Scripts */,
+				2D0000000000000000000005 /* cc-statusline-wrapper.sh in Embed Claude Code Scripts */,
+			);
+			name = "Embed Claude Code Scripts";
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXCopyFilesBuildPhase section */
@@ -93,6 +147,8 @@
 		1A0000F0000000000000000B /* BoomMetal.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BoomMetal.swift; sourceTree = "<group>"; };
 		1A0000B1000000000000000B /* CodeSaverConfigurationViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodeSaverConfigurationViewController.swift; sourceTree = "<group>"; };
 		1A0000A3000000000000000B /* spinner-verbs.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "Resources/spinner-verbs.txt"; sourceTree = "<group>"; };
+		2F00000000000000000000A1 /* sample-corpus.bin */ = {isa = PBXFileReference; lastKnownFileType = file; path = "Resources/sample-corpus.bin"; sourceTree = "<group>"; };
+		2F00000000000000000000A2 /* sample-corpus-index.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "Resources/sample-corpus-index.json"; sourceTree = "<group>"; };
 		1A000006000000000000000B /* ScreenSaver.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = ScreenSaver.framework; path = System/Library/Frameworks/ScreenSaver.framework; sourceTree = SDKROOT; };
 		1A000007000000000000000B /* CodeSaverExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = CodeSaverExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		1A00000A000000000000000B /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
@@ -104,6 +160,11 @@
 		1A000011000000000000000B /* CodeSaverExtension.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = CodeSaverExtension.entitlements; sourceTree = "<group>"; };
 		1A000031000000000000000B /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		1A000032000000000000000B /* PluginManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PluginManager.swift; sourceTree = "<group>"; };
+		2E0000000000000000000001 /* AppMover.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppMover.swift; sourceTree = "<group>"; };
+		2E0000000000000000000002 /* SelfRepair.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SelfRepair.swift; sourceTree = "<group>"; };
+		2E0000000000000000000003 /* UpdateCheck.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateCheck.swift; sourceTree = "<group>"; };
+		2E0000000000000000000004 /* Uninstaller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Uninstaller.swift; sourceTree = "<group>"; };
+		2E0000000000000000000005 /* LifecycleViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LifecycleViews.swift; sourceTree = "<group>"; };
 		1A000050000000000000000B /* BuildNumber.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = BuildNumber.xcconfig; sourceTree = "<group>"; };
 		1A000062000000000000000B /* PreviewView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewView.swift; sourceTree = "<group>"; };
 		1A000063000000000000000B /* PreviewViewRepresentable.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewViewRepresentable.swift; sourceTree = "<group>"; };
@@ -112,6 +173,9 @@
 		1A000081000000000000000B /* GitHubCorpusFetcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitHubCorpusFetcher.swift; sourceTree = "<group>"; };
 		1A000082000000000000000B /* CorpusStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CorpusStore.swift; sourceTree = "<group>"; };
 		1A00008A000000000000000B /* RefreshManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RefreshManager.swift; sourceTree = "<group>"; };
+		2B0000000000000000000002 /* CodeSources.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodeSources.swift; sourceTree = "<group>"; };
+		2B0000000000000000000004 /* CodeSetupViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodeSetupViews.swift; sourceTree = "<group>"; };
+		2B0000000000000000000006 /* CodePicker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodePicker.swift; sourceTree = "<group>"; };
 		1A000083000000000000000B /* com.michelg10.CodeSaver.refresh.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "com.michelg10.CodeSaver.refresh.plist"; sourceTree = "<group>"; };
 		1A00008E000000000000000B /* FeedsService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FeedsService.swift; sourceTree = "<group>"; };
 		1A000091000000000000000B /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
@@ -119,6 +183,18 @@
 		1A000098000000000000000B /* AlbumArtShared.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AlbumArtShared.swift; sourceTree = "<group>"; };
 		1A00009A000000000000000B /* AlbumArtTuner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AlbumArtTuner.swift; sourceTree = "<group>"; };
 		1A00008F000000000000000B /* com.michelg10.CodeSaver.feeds.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "com.michelg10.CodeSaver.feeds.plist"; sourceTree = "<group>"; };
+		2C0000000000000000000001 /* IgniterService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IgniterService.swift; sourceTree = "<group>"; };
+		2C0000000000000000000003 /* IgnitionSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IgnitionSection.swift; sourceTree = "<group>"; };
+		2C0000000000000000000005 /* com.michelg10.CodeSaver.Igniter.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "com.michelg10.CodeSaver.Igniter.plist"; sourceTree = "<group>"; };
+		2C0000000000000000000007 /* Igniter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Igniter.swift; path = ../helper/Igniter.swift; sourceTree = SOURCE_ROOT; };
+		2C0000000000000000000009 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		2C000000000000000000000A /* CodeSaverIgniter.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = CodeSaverIgniter.entitlements; sourceTree = "<group>"; };
+		2C000000000000000000000B /* CodeSaver Igniter.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "CodeSaver Igniter.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		2D0000000000000000000011 /* ClaudeCodeWiring.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClaudeCodeWiring.swift; sourceTree = "<group>"; };
+		2D0000000000000000000012 /* LiveWidgetsStep.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveWidgetsStep.swift; sourceTree = "<group>"; };
+		2D0000000000000000000013 /* wire-settings.py */ = {isa = PBXFileReference; lastKnownFileType = text.script.python; path = "wire-settings.py"; sourceTree = "<group>"; };
+		2D0000000000000000000014 /* cc-state-hook.py */ = {isa = PBXFileReference; lastKnownFileType = text.script.python; path = "cc-state-hook.py"; sourceTree = "<group>"; };
+		2D0000000000000000000015 /* cc-statusline-wrapper.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = "cc-statusline-wrapper.sh"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -138,6 +214,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		2C0000000000000000000011 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -147,6 +230,8 @@
 				1A000050000000000000000B /* BuildNumber.xcconfig */,
 				1A000015000000000000000C /* CodeSaver */,
 				1A000016000000000000000C /* CodeSaverExtension */,
+				2C000000000000000000000E /* CodeSaverIgniter */,
+				2D0000000000000000000030 /* feeds */,
 				1A000017000000000000000C /* Frameworks */,
 				1A000018000000000000000C /* Products */,
 			);
@@ -160,12 +245,20 @@
 				1A0000D0000000000000000B /* Assets.xcassets */,
 				1A000002000000000000000B /* ContentView.swift */,
 				1A000032000000000000000B /* PluginManager.swift */,
+				2E0000000000000000000001 /* AppMover.swift */,
+				2E0000000000000000000002 /* SelfRepair.swift */,
+				2E0000000000000000000003 /* UpdateCheck.swift */,
+				2E0000000000000000000004 /* Uninstaller.swift */,
+				2E0000000000000000000005 /* LifecycleViews.swift */,
 				1A000062000000000000000B /* PreviewView.swift */,
 				1A000063000000000000000B /* PreviewViewRepresentable.swift */,
 				1A000080000000000000000B /* RefreshService.swift */,
 				1A000081000000000000000B /* GitHubCorpusFetcher.swift */,
 				1A000082000000000000000B /* CorpusStore.swift */,
 				1A00008A000000000000000B /* RefreshManager.swift */,
+				2B0000000000000000000002 /* CodeSources.swift */,
+				2B0000000000000000000004 /* CodeSetupViews.swift */,
+				2B0000000000000000000006 /* CodePicker.swift */,
 				1A000083000000000000000B /* com.michelg10.CodeSaver.refresh.plist */,
 				1A00008E000000000000000B /* FeedsService.swift */,
 				1A000091000000000000000B /* main.swift */,
@@ -173,10 +266,26 @@
 				1A000098000000000000000B /* AlbumArtShared.swift */,
 				1A00009A000000000000000B /* AlbumArtTuner.swift */,
 				1A00008F000000000000000B /* com.michelg10.CodeSaver.feeds.plist */,
+				2C0000000000000000000001 /* IgniterService.swift */,
+				2C0000000000000000000003 /* IgnitionSection.swift */,
+				2C0000000000000000000005 /* com.michelg10.CodeSaver.Igniter.plist */,
+				2D0000000000000000000011 /* ClaudeCodeWiring.swift */,
+				2D0000000000000000000012 /* LiveWidgetsStep.swift */,
 				1A00000A000000000000000B /* Info.plist */,
 				1A00000B000000000000000B /* CodeSaver.entitlements */,
 			);
 			path = CodeSaver;
+			sourceTree = "<group>";
+		};
+		2D0000000000000000000030 /* feeds */ = {
+			isa = PBXGroup;
+			children = (
+				2D0000000000000000000013 /* wire-settings.py */,
+				2D0000000000000000000014 /* cc-state-hook.py */,
+				2D0000000000000000000015 /* cc-statusline-wrapper.sh */,
+			);
+			name = feeds;
+			path = ../feeds;
 			sourceTree = "<group>";
 		};
 		1A000065000000000000000C /* Helpers */ = {
@@ -198,12 +307,24 @@
 				1A0000F0000000000000000B /* BoomMetal.swift */,
 				1A0000B1000000000000000B /* CodeSaverConfigurationViewController.swift */,
 				1A0000A3000000000000000B /* spinner-verbs.txt */,
+				2F00000000000000000000A1 /* sample-corpus.bin */,
+				2F00000000000000000000A2 /* sample-corpus-index.json */,
 				1A000031000000000000000B /* Assets.xcassets */,
 				1A00000E000000000000000B /* CodeSaverExtension-Bridging-Header.h */,
 				1A00000F000000000000000B /* Info.plist */,
 				1A000011000000000000000B /* CodeSaverExtension.entitlements */,
 			);
 			path = CodeSaverExtension;
+			sourceTree = "<group>";
+		};
+		2C000000000000000000000E /* CodeSaverIgniter */ = {
+			isa = PBXGroup;
+			children = (
+				2C0000000000000000000007 /* Igniter.swift */,
+				2C0000000000000000000009 /* Info.plist */,
+				2C000000000000000000000A /* CodeSaverIgniter.entitlements */,
+			);
+			path = CodeSaverIgniter;
 			sourceTree = "<group>";
 		};
 		1A000017000000000000000C /* Frameworks */ = {
@@ -219,6 +340,7 @@
 			children = (
 				1A00000C000000000000000B /* CodeSaver.app */,
 				1A000007000000000000000B /* CodeSaverExtension.appex */,
+				2C000000000000000000000B /* CodeSaver Igniter.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -260,11 +382,14 @@
 				1A00001D000000000000000A /* Resources */,
 				1A000009000000000000000A /* Embed PlugIns */,
 				1A000089000000000000000A /* Embed LaunchAgent */,
+				2C000000000000000000000D /* Embed Login Items */,
+				2D0000000000000000000020 /* Embed Claude Code Scripts */,
 			);
 			buildRules = (
 			);
 			dependencies = (
 				1A00001E000000000000000A /* PBXTargetDependency */,
+				2C0000000000000000000016 /* PBXTargetDependency */,
 			);
 			name = CodeSaver;
 			packageProductDependencies = (
@@ -272,6 +397,22 @@
 			);
 			productName = CodeSaver;
 			productReference = 1A00000C000000000000000B /* CodeSaver.app */;
+			productType = "com.apple.product-type.application";
+		};
+		2C000000000000000000000F /* CodeSaverIgniter */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 2C0000000000000000000012 /* Build configuration list for PBXNativeTarget "CodeSaverIgniter" */;
+			buildPhases = (
+				2C0000000000000000000010 /* Sources */,
+				2C0000000000000000000011 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = CodeSaverIgniter;
+			productName = CodeSaverIgniter;
+			productReference = 2C000000000000000000000B /* CodeSaver Igniter.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -288,6 +429,9 @@
 						CreatedOnToolsVersion = 15.0;
 					};
 					1A00001A000000000000000A = {
+						CreatedOnToolsVersion = 15.0;
+					};
+					2C000000000000000000000F = {
 						CreatedOnToolsVersion = 15.0;
 					};
 				};
@@ -310,6 +454,7 @@
 			targets = (
 				1A00001A000000000000000A /* CodeSaver */,
 				1A000010000000000000000A /* CodeSaverExtension */,
+				2C000000000000000000000F /* CodeSaverIgniter */,
 			);
 		};
 /* End PBXProject section */
@@ -321,6 +466,8 @@
 			files = (
 				1A0000D1000000000000000A /* Assets.xcassets in Resources */,
 				1A0000A7000000000000000A /* spinner-verbs.txt in Resources */,
+				2F0000000000000000000003 /* sample-corpus.bin in Resources */,
+				2F0000000000000000000004 /* sample-corpus-index.json in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -330,6 +477,8 @@
 			files = (
 				1A000031000000000000000A /* Assets.xcassets in Resources */,
 				1A0000A5000000000000000A /* spinner-verbs.txt in Resources */,
+				2F0000000000000000000001 /* sample-corpus.bin in Resources */,
+				2F0000000000000000000002 /* sample-corpus-index.json in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -343,6 +492,11 @@
 				1A000001000000000000000A /* CodeSaverApp.swift in Sources */,
 				1A000002000000000000000A /* ContentView.swift in Sources */,
 				1A000032000000000000000A /* PluginManager.swift in Sources */,
+				2E0000000000000000000011 /* AppMover.swift in Sources */,
+				2E0000000000000000000012 /* SelfRepair.swift in Sources */,
+				2E0000000000000000000013 /* UpdateCheck.swift in Sources */,
+				2E0000000000000000000014 /* Uninstaller.swift in Sources */,
+				2E0000000000000000000015 /* LifecycleViews.swift in Sources */,
 				1A000066000000000000000A /* Logger.swift in Sources */,
 				1A000062000000000000000A /* PreviewView.swift in Sources */,
 				1A000063000000000000000A /* PreviewViewRepresentable.swift in Sources */,
@@ -357,7 +511,14 @@
 				1A000099000000000000000A /* AlbumArtTuner.swift in Sources */,
 				1A000085000000000000000A /* GitHubCorpusFetcher.swift in Sources */,
 				1A00008B000000000000000A /* RefreshManager.swift in Sources */,
+				2B0000000000000000000001 /* CodeSources.swift in Sources */,
+				2B0000000000000000000003 /* CodeSetupViews.swift in Sources */,
+				2B0000000000000000000005 /* CodePicker.swift in Sources */,
 				1A000086000000000000000A /* CorpusStore.swift in Sources */,
+				2C0000000000000000000002 /* IgniterService.swift in Sources */,
+				2C0000000000000000000004 /* IgnitionSection.swift in Sources */,
+				2D0000000000000000000001 /* ClaudeCodeWiring.swift in Sources */,
+				2D0000000000000000000002 /* LiveWidgetsStep.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -378,6 +539,14 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		2C0000000000000000000010 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				2C0000000000000000000008 /* Igniter.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -385,6 +554,11 @@
 			isa = PBXTargetDependency;
 			target = 1A000010000000000000000A /* CodeSaverExtension */;
 			targetProxy = 1A000008000000000000000A /* PBXContainerItemProxy */;
+		};
+		2C0000000000000000000016 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 2C000000000000000000000F /* CodeSaverIgniter */;
+			targetProxy = 2C0000000000000000000015 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -528,7 +702,6 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.michelg10.CodeSaver;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -555,7 +728,6 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.michelg10.CodeSaver;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -570,7 +742,8 @@
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_APP_SANDBOX = YES;
-				ENABLE_INCOMING_NETWORK_CONNECTIONS = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_INCOMING_NETWORK_CONNECTIONS = NO;
 				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
 				ENABLE_RESOURCE_ACCESS_AUDIO_INPUT = NO;
 				ENABLE_RESOURCE_ACCESS_BLUETOOTH = NO;
@@ -590,7 +763,6 @@
 					"@executable_path/../Frameworks",
 					"@executable_path/../../../../Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.michelg10.CodeSaver.Extension;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -607,7 +779,8 @@
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_APP_SANDBOX = YES;
-				ENABLE_INCOMING_NETWORK_CONNECTIONS = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_INCOMING_NETWORK_CONNECTIONS = NO;
 				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
 				ENABLE_RESOURCE_ACCESS_AUDIO_INPUT = NO;
 				ENABLE_RESOURCE_ACCESS_BLUETOOTH = NO;
@@ -627,12 +800,61 @@
 					"@executable_path/../Frameworks",
 					"@executable_path/../../../../Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.michelg10.CodeSaver.Extension;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_OBJC_BRIDGING_HEADER = "CodeSaverExtension/CodeSaverExtension-Bridging-Header.h";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		2C0000000000000000000013 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = CodeSaverIgniter/CodeSaverIgniter.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				EXECUTABLE_NAME = "codesaver-igniter";
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = CodeSaverIgniter/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				OTHER_SWIFT_FLAGS = "$(inherited) -parse-as-library";
+				PRODUCT_BUNDLE_IDENTIFIER = com.michelg10.CodeSaver.Igniter;
+				PRODUCT_MODULE_NAME = CodeSaverIgniter;
+				PRODUCT_NAME = "CodeSaver Igniter";
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		2C0000000000000000000014 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = CodeSaverIgniter/CodeSaverIgniter.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				EXECUTABLE_NAME = "codesaver-igniter";
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = CodeSaverIgniter/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				OTHER_SWIFT_FLAGS = "$(inherited) -parse-as-library";
+				PRODUCT_BUNDLE_IDENTIFIER = com.michelg10.CodeSaver.Igniter;
+				PRODUCT_MODULE_NAME = CodeSaverIgniter;
+				PRODUCT_NAME = "CodeSaver Igniter";
+				SKIP_INSTALL = YES;
 				SWIFT_VERSION = 5.0;
 			};
 			name = Release;
@@ -663,6 +885,15 @@
 			buildConfigurations = (
 				1A000023000000000000000A /* Debug */,
 				1A000024000000000000000A /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		2C0000000000000000000012 /* Build configuration list for PBXNativeTarget "CodeSaverIgniter" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				2C0000000000000000000013 /* Debug */,
+				2C0000000000000000000014 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

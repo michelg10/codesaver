@@ -1,0 +1,20 @@
+// Copy to appex/Local.xcconfig (gitignored) to build this machine's
+// extras into CodeSaver. BuildNumber.xcconfig includes it if it exists, so
+// install.sh and Xcode pick it up; ./build.sh reads the same line for
+// build/feeds-check. scripts/release.sh blanks these conditions on its
+// command line, so they never reach a published release.
+//
+//   HOME_CONTROL   now playing falls back to a pair of HomePods on a
+//                  home-control bus when this Mac plays nothing, and the
+//                  saver sends the bus its "watching" heartbeat while it
+//                  shows them. Reads the bus key and token from the login
+//                  Keychain (service "home-control") through
+//                  /usr/bin/security.
+//   LEGACY_SPOOLS  the widget feed also reads bifrocate's spools in
+//                  ~/.bifrocate/cot for a session without the claude-mods
+//                  live file.
+//
+// $(inherited) keeps anything set before this file; the project's Debug
+// configuration adds DEBUG on top either way. Drop a flag from the line to
+// build without it; delete the file to build exactly what a release ships.
+SWIFT_ACTIVE_COMPILATION_CONDITIONS = $(inherited) HOME_CONTROL LEGACY_SPOOLS

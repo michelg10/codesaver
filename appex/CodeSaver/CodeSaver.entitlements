@@ -6,5 +6,7 @@
 	<array>
 		<string>$(DEVELOPMENT_TEAM).com.michelg10.CodeSaver</string>
 	</array>
+	<key>com.apple.security.automation.apple-events</key>
+	<true/>
 </dict>
 </plist>

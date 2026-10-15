@@ -1,4 +1,6 @@
+#if HOME_CONTROL
 import CryptoKit
+#endif
 import Foundation
 
 // The feed daemon's merge, run on fabricated files:
@@ -9,12 +11,15 @@ import Foundation
 // CLAUDE_LIVE_DIR (and its pins/), CODESAVER_SPOOL_DIR — at a fresh temp
 // directory BEFORE the first read (the daemon resolves them once), writes
 // hook, live, pin and spool files for a set of made-up
-// sessions, runs the merge and checks what it made of each. Then the
-// HomePods' stand-in for now playing: home-control's envelope opened
-// against its own pinned vector, its state read as a panel, and whose
-// music wins — no network, no Keychain. Never touches ~/.claude,
-// ~/.bifrocate or the app-group feed, so it is safe beside a running
-// daemon and real sessions. Exits 1 if any check fails.
+// sessions, runs the merge and checks what it made of each. Then whose
+// music the panel shows — and, built with HOME_CONTROL, the HomePods'
+// stand-in for now playing: home-control's envelope opened against its
+// own pinned vector, its state read as a panel — no network, no Keychain.
+// The spool checks run only with LEGACY_SPOOLS. build.sh passes both flags
+// exactly when appex/Local.xcconfig turns them on, so this always checks
+// the daemon that machine builds. Never touches ~/.claude, ~/.bifrocate
+// or the app-group feed, so it is safe beside a running daemon and real
+// sessions. Exits 1 if any check fails.
 
 @main
 struct FeedsCheck {
@@ -35,7 +40,9 @@ struct FeedsCheck {
         }
         let sessionsDir = dir("sessions", "CODESAVER_SESSIONS_DIR")
         let liveDir = dir("live", "CLAUDE_LIVE_DIR")
+        #if LEGACY_SPOOLS
         let spoolDir = dir("spool", "CODESAVER_SPOOL_DIR")
+        #endif
         _ = dir("widgets", "CODESAVER_WIDGETS_DIR")      // never written; belt and braces
         let pinsDir = liveDir.appendingPathComponent("pins")
         try? fm.createDirectory(at: pinsDir, withIntermediateDirectories: true)
@@ -119,6 +126,7 @@ struct FeedsCheck {
                 "lastCacheRead": 152_096, "lastContext": 154_000,
             ] as [String: Any])
         }
+        #if LEGACY_SPOOLS
         func spool(_ sid: String, _ events: [[String: Any]]) {
             let text = events.map {
                 String(data: try! JSONSerialization.data(withJSONObject: $0), encoding: .utf8)!
@@ -126,6 +134,7 @@ struct FeedsCheck {
             try! text.write(to: spoolDir.appendingPathComponent("\(sid).jsonl"),
                             atomically: true, encoding: .utf8)
         }
+        #endif
         let restingHook: [String: Any] = ["hook_state": "done", "hook_ts": now - 7200,
                                           "turn_started": now - 7300, "turn_ended": now - 7200]
 
@@ -196,10 +205,12 @@ struct FeedsCheck {
                             "turn_started": now - 400])
         live("stale-live", turn("working", started: now - 200), [act("responding", now - 150)],
              updated: now - 120)
+        #if LEGACY_SPOOLS
         spool("stale-live", [["e": "req", "t": now - 10], ["e": "think", "t": now - 9]])
         hook("spool-ignored", ["hook_state": "done", "hook_ts": now - 50])
         live("spool-ignored", turn("done", started: now - 60, ended: now - 40, end: "answer"))
         spool("spool-ignored", [["e": "req", "t": now - 5], ["e": "think", "t": now - 4]])
+        #endif
         live("dead-live", turn("working", started: now - 10), [act("thinking", now - 5)], pid: dead)
         live("live-only", turn("working", started: now - 10), [act("tool", now - 4, tool: "Grep")])
         hook("live-idle", ["hook_state": "done", "hook_ts": now - 20, "turn_ended": now - 20,
@@ -315,10 +326,16 @@ struct FeedsCheck {
         expect("paused-resumed", "paused before this process's first turn: no turn clock") {
             state($0) == "paused" && $0["turn_ended"] != nil
         }
+        #if LEGACY_SPOOLS
         expect("stale-live", "a stale live file is ignored; the legacy spool decides") {
             state($0) == "thinking"
         }
         expect("spool-ignored", "a fresh live file shuts the spool out") { state($0) == "done" }
+        #else
+        expect("stale-live", "a stale live file is ignored; the hook file decides") {
+            state($0) == "done" && near($0["turn_ended"], now - 300)
+        }
+        #endif
         absent("dead-live", "live file of a dead pid, no hook record")
         expect("live-only", "a session the hooks never saw") {
             state($0) == "waiting_tool" && $0["tool"] as? String == "Grep"
@@ -361,16 +378,22 @@ struct FeedsCheck {
         exit(failures == 0 ? 0 : 1)
     }
 
-    /// The HomePods' stand-in: home-control's envelope opened in Swift, its
-    /// state read as a panel, and whose music wins. No network, no Keychain.
+    /// Whose music wins, and — with HOME_CONTROL — the HomePods' stand-in:
+    /// home-control's envelope opened in Swift and its state read as a
+    /// panel. No network, no Keychain.
     static func checkNowPlaying(now: Double) {
-        typealias Bus = FeedsService.HomeBus
         func check(_ what: String, _ ok: Bool) {
             if ok { print("ok    now playing: \(what)") } else {
                 failures += 1
                 print("FAIL  now playing: \(what)")
             }
         }
+        func entry(_ app: String, _ state: String, polled: Double? = nil) -> FeedsService.NowPlaying {
+            .init(app: app, state: state, title: "t", artist: "a", position: 0, duration: 100,
+                  pausedSince: nil, polledAt: polled ?? now)
+        }
+        #if HOME_CONTROL
+        typealias Bus = FeedsService.HomeBus
         func ms(_ t: Double) -> Double { (t * 1000).rounded() }
         func said(_ p: FeedsService.NowPlayingPoll) -> String {
             switch p {
@@ -460,10 +483,6 @@ struct FeedsCheck {
               said(Bus.nowPlaying(fromState: home(["ok": true, "state": "idle", "title": NSNull()]), at: now)) == "idle")
 
         // Whose music the panel shows.
-        func entry(_ app: String, _ state: String, polled: Double? = nil) -> FeedsService.NowPlaying {
-            .init(app: app, state: state, title: "t", artist: "a", position: 0, duration: 100,
-                  pausedSince: nil, polledAt: polled ?? now)
-        }
         func pick(_ mac: FeedsService.NowPlaying?, _ pods: FeedsService.NowPlaying?) -> String {
             FeedsService.chooseNowPlaying(mac: mac, homePods: pods, at: now)?.app ?? "nothing"
         }
@@ -479,6 +498,16 @@ struct FeedsCheck {
               pick(entry("Music", "playing", polled: now - 100), entry("HomePod", "paused")) == "HomePod")
         check("both stale: nothing", pick(entry("Music", "playing", polled: now - 100),
                                          entry("HomePod", "playing", polled: now - 95)) == "nothing")
+        #else
+        // Whose music the panel shows: this Mac's, while its poll is fresh.
+        func pick(_ mac: FeedsService.NowPlaying?) -> String {
+            FeedsService.chooseNowPlaying(mac: mac, at: now)?.app ?? "nothing"
+        }
+        check("this Mac playing shows", pick(entry("Music", "playing")) == "Music")
+        check("this Mac paused shows", pick(entry("Spotify", "paused")) == "Spotify")
+        check("a stale entry is nothing", pick(entry("Music", "playing", polled: now - 100)) == "nothing")
+        check("nothing on this Mac: nothing", pick(nil) == "nothing")
+        #endif
     }
 
     static func sessions(_ feed: String) -> [String: [String: Any]] {

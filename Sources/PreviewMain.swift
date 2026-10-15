@@ -14,6 +14,13 @@ import ScreenCaptureKit
 // CODESAVER_SEED=<decimal|0xhex> picks a different deterministic scene.
 // The live widget panels read the real feed (their timers follow the wall
 // clock); CODESAVER_WIDGETS=0 leaves them out for byte-identical frames.
+//
+// CODESAVER_SAMPLE_CORPUS=1 is for anything that leaves this machine (site
+// media, screenshots): the bundled sample instead of the container's corpus,
+// the default verbs, no live feed unless CODESAVER_WIDGETS_DIR names a
+// fixture, and never the dropped build/stand-in-capture.png. Snapshots take
+// CODESAVER_SNAPSHOT_SIZE=WxH (alias CODESAVER_SNAPSIZE) for the simulated
+// screen and CODESAVER_SNAPSHOT_SCALE=2 for Retina-density pixels.
 
 @main
 struct PreviewMain {
@@ -30,17 +37,27 @@ struct PreviewMain {
     static func snapshot(outDir: String, times: [Double]) {
         try? FileManager.default.createDirectory(atPath: outDir, withIntermediateDirectories: true)
         // CODESAVER_SNAPSIZE=WxH overrides — e.g. 5120x2880 for perf timing.
+        let env = ProcessInfo.processInfo.environment
         var size = NSSize(width: 1728, height: 1080)
-        if let spec = ProcessInfo.processInfo.environment["CODESAVER_SNAPSIZE"] {
+        if let spec = env["CODESAVER_SNAPSHOT_SIZE"] ?? env["CODESAVER_SNAPSIZE"] {
             let parts = spec.split(separator: "x").compactMap { Double($0) }
             if parts.count == 2 { size = NSSize(width: parts[0], height: parts[1]) }
         }
+        // Pixels per point: the layout stays the simulated screen's, the
+        // bitmap gets denser (1440x900 at 2 = a 2880x1800 Retina frame).
+        let scale = env["CODESAVER_SNAPSHOT_SCALE"].flatMap(Double.init)
+            .map { CGFloat(max(1, $0)) } ?? 1
         // Seed BEFORE the view exists: init draws the first corpus subset,
         // verb, and writer bands off the scene RNG. detonate() pins its
         // BoomCore the same way; this is the other half of "deterministic".
         CodeSaverView.seedSceneRNG(sceneSeed)
         guard let view = CodeSaverView(frame: NSRect(origin: .zero, size: size), isPreview: false) else {
             fatalError("failed to create view")
+        }
+        if view.showingSampleCorpus {
+            print("typing the bundled sample code")
+        } else if CodeSaverView.sampleCorpusForced {
+            print("CODESAVER_SAMPLE_CORPUS=1 but no sample found — typing the built-in fallback")
         }
         // CODESAVER_CLOCK_TOPFRAC overrides the clock's top offset (fraction
         // of height) — e.g. to clear app chrome in social-format renders.
@@ -67,7 +84,7 @@ struct PreviewMain {
             // handler), and its cpu figure never covered the view's build
             // step anyway, so this is the harness's only per-frame number.
             let frameStart = CACurrentMediaTime()
-            guard let cg = view.metalDebugSnapshot() else {
+            guard let cg = view.metalDebugSnapshot(scale: scale) else {
                 print(String(format: "t=%.2f — no Metal frame", target))
                 continue
             }
@@ -158,10 +175,11 @@ struct PreviewMain {
     /// synthesized bright fake desktop (wallpaper, menu bar, windows, dock).
     static func ensureStandInCapture() {
         guard ProcessInfo.processInfo.environment["CODESAVER_CAPTURE"] == nil else { return }
-        // Next to the executable (build/), regardless of launch cwd.
+        // Next to the executable (build/), regardless of launch cwd. Never
+        // under a forced sample: it is a real screen.
         let dropped = URL(fileURLWithPath: CommandLine.arguments[0])
             .deletingLastPathComponent().appendingPathComponent("stand-in-capture.png")
-        if FileManager.default.fileExists(atPath: dropped.path) {
+        if !CodeSaverView.sampleCorpusForced, FileManager.default.fileExists(atPath: dropped.path) {
             setenv("CODESAVER_CAPTURE", dropped.path, 1)
             return
         }

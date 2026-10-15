@@ -58,6 +58,13 @@ enum CorpusStore {
         containerURL?.appendingPathComponent("Library/Caches/CodeSaver/tmp", isDirectory: true)
     }
 
+    /// Filtered mirrors of the user's local folders, one per folder — kept
+    /// apart from the GitHub mirrors so a folder named like a repo can't
+    /// clobber it.
+    static var folderCacheDirectory: URL? {
+        containerURL?.appendingPathComponent("Library/Caches/CodeSaver/folders", isDirectory: true)
+    }
+
     static var corpusExists: Bool {
         guard let dir = corpusDirectory else { return false }
         return FileManager.default.fileExists(atPath: dir.appendingPathComponent("corpus.bin").path)
@@ -77,6 +84,51 @@ enum CorpusStore {
         var repoCount = 0
         var fileCount = 0
         var corpusBytes = 0
+        // Everything below is Optional ON PURPOSE: synthesized Decodable
+        // requires every non-Optional key, so one new non-Optional field would
+        // fail to decode every existing state.json — and loadState() would
+        // then hand back an empty manifest and re-download the world.
+        var problem: Problem?            // the last run's failure, already in plain words
+        var skipped: [Skipped]?          // repos/folders the last run left out, and why
+        var progress: Run?               // non-nil while a run is under way (any process)
+        var listing: Listing?            // the last GitHub listing — the repo picker's rows
+
+        struct Problem: Codable, Equatable {
+            var kind: String             // FetchError.Kind raw value — picks the UI's action
+            var headline: String
+            var detail: String?
+            var resetsAt: Date?
+        }
+
+        struct Skipped: Codable, Equatable {
+            var name: String
+            var isFolder: Bool
+            var reason: String
+        }
+
+        /// Written by whichever process holds the refresh lock, so the app can
+        /// draw a run happening in the hourly agent. `pid` is what tells a live
+        /// run from one that was killed mid-flight and never cleared this.
+        struct Run: Codable, Equatable {
+            var pid: Int32
+            var phase: String            // listing | repos | folders | packing
+            var done = 0
+            var total = 0
+            var current: String?
+        }
+
+        struct Listing: Codable, Equatable {
+            var owner: String
+            var repos: [Repo]            // non-forks, the only ones ever fetched
+            var forks: Int
+            var complete: Bool           // false = hit the page ceiling
+
+            struct Repo: Codable, Equatable {
+                var name: String
+                var isPrivate: Bool
+                var sizeKB: Int
+            }
+        }
     }
 
     static var stateURL: URL? { corpusDirectory?.appendingPathComponent("state.json") }

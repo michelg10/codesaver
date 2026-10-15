@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- LaunchAgent registered by SMAppService (see IgniterService.swift) when the
+     app's Ignition switch is on. Runs the embedded CodeSaver Igniter.app — the
+     capture scout + corner/idle trigger — for the whole session: RunAtLoad +
+     KeepAlive at STANDARD priority, exactly as the plist helper/install.sh used
+     to write (it set no ProcessType, which is Standard). It answers a corner hit
+     within 20 ms; a throttled Background job could not. No StandardErrorPath: launchd
+     expands no ~ and this plist is the same for every user, so the agent opens
+     ~/Library/Logs/CodeSaver/igniter.log itself. Same label as the old
+     standalone install, which the app boots out before registering this. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.michelg10.CodeSaver.Igniter</string>
+	<key>BundleProgram</key>
+	<string>Contents/Library/LoginItems/CodeSaver Igniter.app/Contents/MacOS/codesaver-igniter</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Standard</string>
+	<key>AssociatedBundleIdentifiers</key>
+	<array>
+		<string>com.michelg10.CodeSaver</string>
+	</array>
+</dict>
+</plist>

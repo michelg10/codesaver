@@ -30,15 +30,25 @@ import ScreenCaptureKit
 //   codesaver-igniter --capture       capture + write manifest once, then exit
 //   codesaver-igniter --corners       print corner config + geometry, then exit
 //
-// Screen Recording permission is required for the pixelated-desktop act;
-// without it the saver simply starts normally. Same at the lock screen:
-// ScreenCaptureKit hands back zero displays there, so a corner hit at the
-// lock screen starts the plain saver (there is no desktop to burn) — and
-// must NOT be mistaken for a permission failure, whose ten-minute backoff
-// would then swallow the boom for every hit that follows.
+// Shipped inside CodeSaver.app: the CodeSaverIgniter target builds this file
+// into Contents/Library/LoginItems/CodeSaver Igniter.app, and the app's
+// Ignition switch registers it as an SMAppService LaunchAgent
+// (com.michelg10.CodeSaver.Igniter.plist, BundleProgram into that bundle).
+// ./build.sh still compiles it bare into build/codesaver-igniter for the
+// --corners / --capture diagnostics.
 //
-// Decisions and failures go to stderr with a timestamp; the LaunchAgent
-// routes that to ~/Library/Logs/CodeSaver/igniter.log (helper/install.sh).
+// Screen Recording permission is required for the pixelated-desktop act;
+// without it the saver simply starts normally. The agent asks for it the
+// first time it runs unlocked — the moment the user flips the switch — so
+// the prompt names "CodeSaver Igniter" while the user is there to answer.
+// Same at the lock screen: ScreenCaptureKit hands back zero displays there,
+// so a corner hit at the lock screen starts the plain saver (there is no
+// desktop to burn) — and must NOT be mistaken for a permission failure,
+// whose ten-minute backoff would then swallow the boom for every hit that
+// follows.
+//
+// Decisions and failures go to stderr with a timestamp; watcher mode points
+// stderr at ~/Library/Logs/CodeSaver/igniter.log itself (adoptLogFile).
 
 // MARK: - Probes
 
@@ -69,12 +79,38 @@ func screenIsLocked() -> Bool {
     return (dict["CGSSessionScreenIsLocked"] as? Bool) ?? false
 }
 
-/// stderr with a timestamp. The LaunchAgent plist points stderr at
-/// ~/Library/Logs/CodeSaver/igniter.log, so the rare "why was there no
-/// boom" line survives instead of vanishing into launchd's /dev/null.
+/// stderr with a timestamp. Watcher mode points stderr at
+/// ~/Library/Logs/CodeSaver/igniter.log (adoptLogFile), so the rare "why was
+/// there no boom" line survives instead of vanishing into launchd's /dev/null.
 func igniterLog(_ msg: String) {
     let stamp = ISO8601DateFormatter().string(from: Date())
     FileHandle.standardError.write(Data("\(stamp) igniter: \(msg)\n".utf8))
+}
+
+/// The agent keeps its own log. Its plist ships inside CodeSaver.app and
+/// can't name a per-user path (launchd expands no ~), so StandardErrorPath
+/// is gone and watcher mode reopens stdout + stderr onto igniter.log here.
+/// Rolled at startup once it passes 1 MB, one generation kept as
+/// igniter.log.1: launchd starts the agent at every login and every
+/// restart, and a decision log grows by kilobytes a day, so that is cap
+/// enough without a rotation clock of its own. Only the bundled agent
+/// off a terminal adopts it — a hand-run build/ binary keeps its stderr.
+func adoptLogFile() {
+    guard identityCaveat() == nil, isatty(STDERR_FILENO) == 0 else { return }
+    let fm = FileManager.default
+    let dir = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/CodeSaver")
+    try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+    let log = dir.appendingPathComponent("igniter.log")
+    if let size = (try? fm.attributesOfItem(atPath: log.path))?[.size] as? NSNumber,
+       size.intValue > 1_048_576 {
+        // rename(2) replaces the previous roll in one step.
+        _ = rename(log.path, dir.appendingPathComponent("igniter.log.1").path)
+    }
+    let fd = open(log.path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+    guard fd >= 0 else { return }
+    dup2(fd, STDOUT_FILENO)
+    dup2(fd, STDERR_FILENO)
+    close(fd)
 }
 
 func primaryHeight() -> CGFloat {
@@ -614,6 +650,8 @@ func writeManifest(kind: String, mouse: CGPoint, captures: [CGDirectDisplayID: C
                 // atomic replace, so a reader holding the PREVIOUS manifest
                 // never catches the image name momentarily absent. (The tmp
                 // name keeps the boom- prefix: deleteManifest sweeps strays.)
+                // The link shares the primary's inode, backup exclusion
+                // included.
                 let tmp = dir.appendingPathComponent(name + ".tmp")
                 try? fm.removeItem(at: tmp)
                 if (try? fm.linkItem(at: primary.appendingPathComponent(name), to: tmp)) != nil,
@@ -621,15 +659,38 @@ func writeManifest(kind: String, mouse: CGPoint, captures: [CGDirectDisplayID: C
                     // linked atomically over the old image
                 } else {
                     try? fm.removeItem(at: tmp)
-                    try? data.write(to: dst, options: .atomic)
+                    writeUnbackedUp(data, to: dst)
                 }
             } else {
-                try? data.write(to: dst, options: .atomic)
+                writeUnbackedUp(data, to: dst)
             }
         }
         if primary == nil { primary = dir }
         // Manifest last: readers never see it before its images exist.
-        try? json.write(to: dir.appendingPathComponent("boom-manifest.json"), options: .atomic)
+        writeUnbackedUp(json, to: dir.appendingPathComponent("boom-manifest.json"))
+    }
+}
+
+/// A screenshot of the user's desktop has no business in a backup: it
+/// lives seconds to minutes, but a Time Machine run that lands in that
+/// window would keep it for as long as the backup lasts. The flag
+/// (isExcludedFromBackup, an extended attribute) lives on the inode and
+/// every write replaces the inode, so it goes on each new file — written
+/// under a temp name, marked, then rename(2)d over the target: atomic like
+/// .atomic, and never visible under its real name unmarked. The saver
+/// reads these exact paths from inside its container, so moving them to
+/// Caches (excluded by default) would mean moving the reader too. (The tmp
+/// name keeps the boom- prefix: deleteManifest sweeps strays.)
+func writeUnbackedUp(_ data: Data, to dst: URL) {
+    let fm = FileManager.default
+    var tmp = dst.deletingLastPathComponent().appendingPathComponent(dst.lastPathComponent + ".tmp")
+    try? fm.removeItem(at: tmp)
+    guard (try? data.write(to: tmp)) != nil else { return }
+    var values = URLResourceValues()
+    values.isExcludedFromBackup = true
+    try? tmp.setResourceValues(values)
+    if rename(tmp.path, dst.path) != 0 {
+        try? fm.removeItem(at: tmp)
     }
 }
 
@@ -708,6 +769,11 @@ final class Igniter {
     /// After a failed capture (permission denied), don't keep re-triggering
     /// the TCC prompt — retry occasionally.
     private var captureBackoffUntil = Date.distantPast
+    /// Screen Recording has been asked for (or found granted) this run.
+    private var accessAsked = false
+    /// The grant as last published for the app, and when it was last read.
+    private var publishedAccess: Bool?
+    private var accessReadAt = Date.distantPast
 
     init() {
         deleteManifest()   // never trust leftovers from a previous session
@@ -716,7 +782,45 @@ final class Igniter {
         }
     }
 
+    /// Screen Recording, asked in context. Registered from the app's
+    /// Ignition switch, this agent's first unlocked tick is the moment the
+    /// user flipped it — so ask then, from this process, and the prompt
+    /// names "CodeSaver Igniter" (the identity that holds the grant) while
+    /// the user is at the keyboard to answer, instead of surfacing at the
+    /// first idle capture while they're away. Not at the lock screen, where
+    /// no one can answer; TCC prompts once per identity, later asks are
+    /// silent. This touches nothing in the capture path: an empty display
+    /// list at the lock screen is still read as the lock screen, and only
+    /// CGPreflightScreenCaptureAccess() decides a denial. Off the main
+    /// thread in case the request blocks while its alert is up — the
+    /// corner recognizer runs on this one. A hand-run build/ binary never
+    /// asks: the grant would land on the terminal.
+    private func askForScreenRecording() {
+        accessAsked = true
+        guard identityCaveat() == nil, !CGPreflightScreenCaptureAccess() else { return }
+        igniterLog("no Screen Recording permission yet — asking (System Settings lists it as \"CodeSaver Igniter\")")
+        DispatchQueue.global(qos: .utility).async { _ = CGRequestScreenCaptureAccess() }
+    }
+
+    /// The app's Ignition section shows whether this agent holds Screen
+    /// Recording — a question only this process can ask, since TCC answers
+    /// per code identity and the app's own preflight would be about the
+    /// app. Re-read every 10 s and written to the shared defaults domain
+    /// (key screenRecordingGranted) only when it changes, so a grant made in
+    /// System Settings reaches the app as soon as TCC reports it here.
+    private func publishScreenRecording() {
+        guard identityCaveat() == nil, Date().timeIntervalSince(accessReadAt) > 10 else { return }
+        accessReadAt = Date()
+        let granted = CGPreflightScreenCaptureAccess()
+        guard granted != publishedAccess else { return }
+        publishedAccess = granted
+        defaults?.set(granted, forKey: "screenRecordingGranted")
+        igniterLog("Screen Recording \(granted ? "granted" : "not granted")")
+    }
+
     private func tick() {
+        if !accessAsked, !screenIsLocked() { askForScreenRecording() }
+        publishScreenRecording()
         if capturing, Date().timeIntervalSince(captureStarted) > Self.captureWatchdog {
             captureWatchdogFired()
         }
@@ -1039,8 +1143,29 @@ struct IgniterMain {
             app.run()
         }
 
+        // "Quit & Reopen", the button macOS offers once Screen Recording is
+        // granted, relaunches this bundle through LaunchServices while
+        // launchd's KeepAlive restarts the agent too — two scouts, two
+        // launches per corner hit. The LaunchServices copy (its launchd
+        // label is "application.<bundle id>.…") steps aside for launchd's.
+        if let job = ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"],
+           job.hasPrefix("application.com.michelg10.CodeSaver.Igniter") {
+            exit(0)
+        }
+        adoptLogFile()
+        // launchd stops the agent with SIGTERM — the app's switch turned off,
+        // logout, shutdown. A capture can be on disk at that moment (a corner
+        // approach's sits out a 30 s grace), and nothing would sweep it until
+        // the next start; it is a screenshot of the desktop, so it goes now.
+        signal(SIGTERM, SIG_IGN)
+        let term = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        term.setEventHandler {
+            deleteManifest()
+            exit(0)
+        }
+        term.resume()
         let igniter = Igniter()
-        withExtendedLifetime(igniter) {
+        withExtendedLifetime((igniter, term)) {
             app.run()
         }
     }

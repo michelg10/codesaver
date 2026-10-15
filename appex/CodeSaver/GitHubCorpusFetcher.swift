@@ -3,72 +3,308 @@
 //  CodeSaver
 //
 //  Native GitHub fetch + corpus build (host app only). Swift port of the
-//  retired ingest.py / make_corpus.py pipeline: mirror non-fork repos into the
-//  app-group cache, then pack every cleaned source file whole into corpus.bin
-//  with a repo-keyed byte index. The saver samples and weights at runtime.
+//  retired ingest.py / make_corpus.py pipeline: mirror non-fork repos (and
+//  the user's local folders) into the app-group cache, then pack every
+//  cleaned source file whole into corpus.bin with a repo-keyed byte index.
+//  The saver samples and weights at runtime.
 //
 
 import Foundation
 import CryptoKit
 import Darwin
 
-enum FetchError: LocalizedError {
-    case badResponse
-    case http(Int, String)
-    case tarFailed(String)
-    case emptyCorpus
+/// Every way talking to GitHub — or packing what came back — goes wrong, in
+/// the words the app shows for it. This is the ONE place a status code, a
+/// URLError or an empty build becomes a sentence: the UI and state.json only
+/// ever see `headline`/`detail`, so no raw URL or bare HTTP code can reach a
+/// headline.
+enum FetchError: LocalizedError, Equatable {
+    case tokenRejected                               // 401
+    case rateLimited(resetsAt: Date?, signedIn: Bool) // 403/429 with the allowance spent
+    case forbidden                                   // 403 that isn't the limit
+    case noSuchUser(String)                          // 404 on a user's profile or listing
+    case notFound                                    // 404 on one repo's download
+    case offline                                     // no network, DNS, timeout
+    case server(Int)                                 // 5xx, or any status nobody planned for
+    case badResponse                                 // 2xx we couldn't parse
+    case tarFailed
+    case tooBig(bytes: Int)
+    case emptyCorpus(String)                         // what was found, and why none of it counts
 
-    var errorDescription: String? {
+    /// Picks the UI's action (Replace token, a reset time, …) — stored in
+    /// state.json, so the raw values are a file format.
+    enum Kind: String {
+        case tokenRejected, rateLimited, forbidden, noSuchUser, offline, empty, github, other
+    }
+
+    var kind: Kind {
         switch self {
-        case .badResponse: return "unexpected response from GitHub"
-        case .http(let code, let context): return "GitHub HTTP \(code) (\(context))"
-        case .tarFailed(let repo): return "tar extraction failed for \(repo)"
-        case .emptyCorpus: return "fetched zero usable source files — existing corpus left untouched"
+        case .tokenRejected: return .tokenRejected
+        case .rateLimited: return .rateLimited
+        case .forbidden: return .forbidden
+        case .noSuchUser: return .noSuchUser
+        case .offline: return .offline
+        case .emptyCorpus: return .empty
+        case .notFound, .server, .badResponse, .tarFailed, .tooBig: return .github
+        }
+    }
+
+    // MARK: Classification
+
+    /// A non-2xx response. `missing` is what a 404 means at this call site —
+    /// no such user for a listing, a vanished repo for a download.
+    static func from(_ http: HTTPURLResponse, signedIn: Bool, missing: FetchError) -> FetchError {
+        let remaining = http.value(forHTTPHeaderField: "x-ratelimit-remaining")
+        let retryAfter = http.value(forHTTPHeaderField: "retry-after").flatMap(TimeInterval.init)
+        let reset = http.value(forHTTPHeaderField: "x-ratelimit-reset").flatMap(TimeInterval.init)
+        let status = http.statusCode
+        if status == 401 { return .tokenRejected }
+        // GitHub signals both its hourly limit and its abuse throttle as 403
+        // or 429; only the headers tell a spent allowance from a refusal.
+        if status == 429 || (status == 403 && (remaining == "0" || retryAfter != nil)) {
+            let resetsAt = retryAfter.map { Date().addingTimeInterval($0) }
+                ?? reset.map { Date(timeIntervalSince1970: $0) }
+            return .rateLimited(resetsAt: resetsAt, signedIn: signedIn)
+        }
+        if status == 403 { return .forbidden }
+        if [404, 410, 451].contains(status) { return missing }
+        return .server(status)
+    }
+
+    /// Anything thrown on the way: URLErrors become `.offline`/`.badResponse`,
+    /// decoding failures `.badResponse`; our own errors pass through.
+    static func wrap(_ error: Error) -> Error {
+        if error is FetchError || error is CancellationError { return error }
+        if let url = error as? URLError {
+            switch url.code {
+            case .cancelled:
+                return CancellationError()
+            case .notConnectedToInternet, .networkConnectionLost, .cannotFindHost,
+                 .cannotConnectToHost, .timedOut, .dnsLookupFailed, .internationalRoamingOff,
+                 .dataNotAllowed, .callIsActive, .secureConnectionFailed:
+                // secureConnectionFailed is what a captive portal looks like.
+                return FetchError.offline
+            default:
+                return FetchError.badResponse
+            }
+        }
+        if error is DecodingError { return FetchError.badResponse }
+        return error
+    }
+
+    /// Failures that will hit every remaining repo the same way: a run stops
+    /// at the first one instead of logging it twenty times.
+    var abortsRun: Bool {
+        switch self {
+        case .tokenRejected, .rateLimited, .offline: return true
+        default: return false
+        }
+    }
+
+    // MARK: Words
+
+    var errorDescription: String? { headline }
+
+    var headline: String {
+        switch self {
+        case .tokenRejected:
+            return "GitHub rejected the saved token — it has expired or was revoked"
+        case .rateLimited(let resetsAt, _):
+            return "GitHub's hourly request limit is used up — \(Self.whenReset(resetsAt))"
+        case .forbidden:
+            return "GitHub refused access — the token doesn't reach these repos"
+        case .noSuchUser(let name):
+            return "there's no GitHub user called \(name)"
+        case .notFound:
+            return "GitHub couldn't find a repo — it was renamed, deleted or is empty"
+        case .offline:
+            return "can't reach GitHub — offline? the next refresh will retry"
+        case .server, .badResponse:
+            return "GitHub isn't answering properly right now — the next refresh will retry"
+        case .tarFailed:
+            return "a download from GitHub arrived damaged — the next refresh will retry"
+        case .tooBig(let bytes):
+            return "too big to download (\(Self.size(bytes)))"
+        case .emptyCorpus:
+            return "found no code to show"
+        }
+    }
+
+    /// The second line, where specifics belong. The only place a status code
+    /// may appear, and then only for the "GitHub is broken" case.
+    var detail: String? {
+        switch self {
+        case .tokenRejected:
+            return "replace it with a new one — nothing downloaded so far is lost"
+        case .rateLimited(_, let signedIn):
+            return signedIn ? nil
+                : "without a token GitHub allows 60 requests an hour; a token raises that to 5,000"
+        case .forbidden:
+            return "make a token with access to all repositories (or the ones you want) and Contents: read-only"
+        case .server(let code):
+            return "GitHub answered with error \(code)"
+        case .emptyCorpus(let why):
+            return why
+        default:
+            return nil
+        }
+    }
+
+    /// The connect step's version: the same failure reads differently before
+    /// anything was saved than it does about a token that used to work.
+    var connectMessage: String {
+        switch self {
+        case .tokenRejected:
+            return "GitHub didn't accept that token — check it was copied whole and hasn't expired"
+        case .forbidden:
+            return "GitHub accepted the token but won't list your account with it — make a new one as described above"
+        case .offline:
+            return "can't reach GitHub — check your connection and try again"
+        default:
+            return headline
+        }
+    }
+
+    /// Short form for the skipped-repos list.
+    var repoReason: String {
+        switch self {
+        case .tokenRejected: return "the token was rejected"
+        case .rateLimited: return "hit GitHub's hourly limit"
+        case .forbidden: return "the token has no access to it"
+        case .notFound, .noSuchUser: return "not found — renamed, deleted or empty"
+        case .offline: return "couldn't reach GitHub"
+        case .server(let code): return "GitHub error \(code)"
+        case .badResponse: return "GitHub sent something unreadable"
+        case .tarFailed: return "the download arrived damaged"
+        case .tooBig(let bytes): return "too big to download (\(Self.size(bytes)))"
+        case .emptyCorpus: return "no source files"
+        }
+    }
+
+    static func size(_ bytes: Int) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+    }
+
+    /// A clock time, never "in 30 minutes": the headline is stored in
+    /// state.json and read whenever the window next opens.
+    static func whenReset(_ date: Date?, now: Date = Date()) -> String {
+        guard let date, date > now else { return "try again in an hour" }
+        let f = DateFormatter()
+        f.dateStyle = Calendar.current.isDate(date, inSameDayAs: now) ? .none : .short
+        f.timeStyle = .short
+        return "resets at \(f.string(from: date))"
+    }
+
+    /// What state.json keeps of a failed run. Errors that aren't GitHub's —
+    /// a full disk, a missing container — keep their system description.
+    static func problem(for error: Error) -> CorpusStore.State.Problem {
+        switch error {
+        case let fetch as FetchError:
+            var resetsAt: Date?
+            if case .rateLimited(let at, _) = fetch { resetsAt = at }
+            return .init(kind: fetch.kind.rawValue, headline: fetch.headline,
+                         detail: fetch.detail, resetsAt: resetsAt)
+        default:
+            return .init(kind: Kind.other.rawValue,
+                         headline: error.localizedDescription, detail: nil, resetsAt: nil)
         }
     }
 }
 
 // MARK: - GitHub API
 
-struct GitHubRepo: Decodable {
+struct GitHubRepo: Decodable, Equatable {
     let name: String
     let fork: Bool
     let pushedAt: String?
+    let isPrivate: Bool
+    let sizeKB: Int          // GitHub's own figure: the whole repo, history included
 
     enum CodingKeys: String, CodingKey {
-        case name, fork
+        case name, fork, size
         case pushedAt = "pushed_at"
+        case isPrivate = "private"
+    }
+
+    init(name: String, fork: Bool = false, pushedAt: String? = nil,
+         isPrivate: Bool = false, sizeKB: Int = 0) {
+        self.name = name
+        self.fork = fork
+        self.pushedAt = pushedAt
+        self.isPrivate = isPrivate
+        self.sizeKB = sizeKB
+    }
+
+    // Lenient: a listing that drops `size` or `private` must not fail the
+    // whole decode — unknown size means "try it", unknown visibility "public"
+    // only when GitHub would never have shown us a private repo anyway.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        fork = try c.decodeIfPresent(Bool.self, forKey: .fork) ?? false
+        pushedAt = try c.decodeIfPresent(String.self, forKey: .pushedAt)
+        isPrivate = try c.decodeIfPresent(Bool.self, forKey: .isPrivate) ?? false
+        sizeKB = try c.decodeIfPresent(Int.self, forKey: .size) ?? 0
     }
 }
 
+/// `token == nil` is the "just my public repos" path: listings come from the
+/// unauthenticated API (60 requests an hour per IP — a listing is one request
+/// per hundred repos) and tarballs from codeload, which that limit doesn't
+/// count.
 struct GitHubClient {
-    let token: String
+    let token: String?
 
-    private func request(_ urlString: String) -> URLRequest {
-        var req = URLRequest(url: URL(string: urlString)!)
-        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    private func request(_ urlString: String) throws -> URLRequest {
+        guard let url = URL(string: urlString) else { throw FetchError.badResponse }
+        var req = URLRequest(url: url)
+        if let token {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         req.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
         req.setValue("CodeSaver", forHTTPHeaderField: "User-Agent")  // GitHub rejects UA-less requests
         return req
     }
 
-    private func get(_ urlString: String) async throws -> Data {
-        let (data, resp) = try await URLSession.shared.data(for: request(urlString))
-        guard let http = resp as? HTTPURLResponse else { throw FetchError.badResponse }
-        guard (200..<300).contains(http.statusCode) else {
-            throw FetchError.http(http.statusCode, urlString)
+    private func get(_ urlString: String, missing: FetchError) async throws -> Data {
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: try request(urlString))
+            guard let http = resp as? HTTPURLResponse else { throw FetchError.badResponse }
+            guard (200..<300).contains(http.statusCode) else {
+                throw FetchError.from(http, signedIn: token != nil, missing: missing)
+            }
+            return data
+        } catch {
+            throw FetchError.wrap(error)
         }
-        return data
     }
 
+    private func decode<T: Decodable>(_ type: T.Type, _ data: Data) throws -> T {
+        do { return try JSONDecoder().decode(type, from: data) } catch { throw FetchError.badResponse }
+    }
+
+    private struct User: Decodable { let login: String }
+
+    /// GET /user — who the token signs in as. This is the token's validation:
+    /// a 401 here means the token is wrong, not that something else failed.
     func currentLogin() async throws -> String {
-        struct User: Decodable { let login: String }
-        return try JSONDecoder().decode(User.self, from: try await get("https://api.github.com/user")).login
+        try decode(User.self, try await get("https://api.github.com/user", missing: .tokenRejected)).login
+    }
+
+    /// GET /users/<name> — the public path's validation, and the account's
+    /// canonical spelling (what the listing and codeload expect).
+    func userLogin(_ name: String) async throws -> String {
+        guard let path = name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) else {
+            throw FetchError.noSuchUser(name)
+        }
+        return try decode(User.self, try await get("https://api.github.com/users/\(path)",
+                                                    missing: .noSuchUser(name))).login
     }
 
     struct RepoListing {
         let repos: [GitHubRepo]   // non-forks only
+        let forks: Int            // dropped from `repos` — counted for "found nothing" explanations
         /// The raw walk filled every page it is allowed, so repos past it were
         /// never seen — their absence from `repos` means nothing.
         let hitCeiling: Bool
@@ -76,36 +312,56 @@ struct GitHubClient {
 
     /// Non-fork repos owned by `owner` — what `gh repo list OWNER --source`
     /// used to return. Private repos appear only when `owner` is the token's
-    /// own account (the /user/repos listing).
-    func listSourceRepos(owner: String, ownLogin: String) async throws -> RepoListing {
-        let base = owner.lowercased() == ownLogin.lowercased()
+    /// own account (the /user/repos listing); `ownLogin` is nil without one.
+    func listSourceRepos(owner: String, ownLogin: String?) async throws -> RepoListing {
+        guard let path = owner.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) else {
+            throw FetchError.noSuchUser(owner)
+        }
+        let base = owner.lowercased() == ownLogin?.lowercased()
             ? "https://api.github.com/user/repos?affiliation=owner"
-            : "https://api.github.com/users/\(owner)/repos?type=owner"
+            : "https://api.github.com/users/\(path)/repos?type=owner"
         var repos: [GitHubRepo] = []
         var hitCeiling = true
         for page in 1...10 {  // 1000-repo ceiling, same spirit as the old REPO_LIMIT
-            let batch = try JSONDecoder().decode([GitHubRepo].self,
-                                                 from: try await get("\(base)&per_page=100&page=\(page)"))
+            let batch = try decode([GitHubRepo].self,
+                                   try await get("\(base)&per_page=100&page=\(page)",
+                                                 missing: .noSuchUser(owner)))
             repos.append(contentsOf: batch)
             if batch.count < 100 { hitCeiling = false; break }
         }
         // Forks are dropped AFTER the ceiling check: the filtered count says
         // nothing about whether the raw listing was complete.
-        return RepoListing(repos: repos.filter { !$0.fork }, hitCeiling: hitCeiling)
+        let sources = repos.filter { !$0.fork }
+        return RepoListing(repos: sources, forks: repos.count - sources.count, hitCeiling: hitCeiling)
     }
 
-    /// Downloads the repo tarball to a temp file (URLSession follows the
-    /// codeload redirect and streams to disk — constant memory).
+    /// Downloads the repo tarball to a temp file, streamed to disk (constant
+    /// memory). With a token: the API endpoint, which redirects to a signed
+    /// codeload URL and works for private repos. Without one: codeload
+    /// directly — HEAD is the default branch — so tarballs never spend the
+    /// 60-an-hour API allowance.
     func downloadTarball(owner: String, repo: String) async throws -> URL {
-        let (tmp, resp) = try await URLSession.shared.download(
-            for: request("https://api.github.com/repos/\(owner)/\(repo)/tarball"))
-        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            try? FileManager.default.removeItem(at: tmp)
-            throw FetchError.http((resp as? HTTPURLResponse)?.statusCode ?? -1, "tarball \(repo)")
+        guard let o = owner.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+              let r = repo.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) else {
+            throw FetchError.notFound
         }
-        return tmp
+        let url = token == nil
+            ? "https://codeload.github.com/\(o)/\(r)/tar.gz/HEAD"
+            : "https://api.github.com/repos/\(o)/\(r)/tarball"
+        do {
+            let (tmp, resp) = try await URLSession.shared.download(for: try request(url))
+            guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                try? FileManager.default.removeItem(at: tmp)
+                guard let http = resp as? HTTPURLResponse else { throw FetchError.badResponse }
+                throw FetchError.from(http, signedIn: token != nil, missing: .notFound)
+            }
+            return tmp
+        } catch {
+            throw FetchError.wrap(error)
+        }
     }
 }
+
 
 // MARK: - Filtering + corpus packing (ports of ingest.py / make_corpus.py)
 
@@ -127,6 +383,9 @@ enum CorpusIngest {
     static let maxDirFiles = 150              // more source files than this in one dir → vendored/generated
     static let maxRepoBytes = 200 * 1024 * 1024
     static let maxTarballBytes = 300 * 1024 * 1024
+    /// Entries one walk may visit. A tarball never gets near it; a local
+    /// folder can be someone's whole disk, and this bounds that walk.
+    static let maxWalkEntries = 400_000
     static let maxLineLength = 200
     static let minLines = 4
     static let maxSecretHits = 3              // a file this secret-dense is dropped entirely
@@ -208,13 +467,40 @@ enum CorpusIngest {
         tar.standardError = FileHandle.nullDevice
         try tar.run()
         tar.waitUntilExit()
-        guard tar.terminationStatus == 0 else { throw FetchError.tarFailed(repo) }
+        guard tar.terminationStatus == 0 else { throw FetchError.tarFailed }
 
         let dest = cacheDir.appendingPathComponent(repo, isDirectory: true)
         try? fm.removeItem(at: dest)
         try fm.createDirectory(at: dest, withIntermediateDirectories: true)  // marker even for repos with no source files
+        return mirrorTree(from: extractDir, into: dest)
+    }
 
-        var kept = 0, written = 0
+    /// Mirror a folder on this Mac the same way a tarball is mirrored — same
+    /// walk, same filters. Unlike a tarball the source can be unreadable (moved,
+    /// unmounted, or a folder macOS keeps background processes out of), so the
+    /// root is opened first and its error thrown as-is for the caller to put
+    /// into words; the walk then builds in scratch and swaps in whole, so a
+    /// run that can't read the folder leaves its previous mirror standing.
+    static func mirrorFolder(at root: URL, into dest: URL, scratchDir: URL) throws -> Int {
+        let fm = FileManager.default
+        _ = try fm.contentsOfDirectory(atPath: root.path)
+        let staging = scratchDir.appendingPathComponent("folder-" + dest.lastPathComponent,
+                                                        isDirectory: true)
+        try? fm.removeItem(at: staging)
+        try fm.createDirectory(at: staging, withIntermediateDirectories: true)
+        let kept = mirrorTree(from: root, into: staging)
+        try fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? fm.removeItem(at: dest)
+        try fm.moveItem(at: staging, to: dest)
+        return kept
+    }
+
+    /// The one walk both sources share: copy every wanted file under `root`
+    /// into `dest` (which exists), then prune bulk directories. Returns the
+    /// number of files kept.
+    private static func mirrorTree(from root: URL, into dest: URL) -> Int {
+        let fm = FileManager.default
+        var kept = 0, written = 0, visited = 0
         // Walk by RELATIVE path. The old walk took the absolute URL the
         // enumerator handed back and trimmed `extractDir.path.count + 1`
         // Characters off the front — two counts that have to agree and don't:
@@ -228,14 +514,24 @@ enum CorpusIngest {
         // measure. Its attributes come from lstat, so a symlink is not a
         // regular file and is skipped, which is also what we want: copying one
         // only ever put a dangling link in the mirror.
-        let enumerator = fm.enumerator(atPath: extractDir.path)
+        let enumerator = fm.enumerator(atPath: root.path)
         while let rel = enumerator?.nextObject() as? String {
-            guard let attrs = enumerator?.fileAttributes,
-                  attrs[.type] as? FileAttributeType == .typeRegular else { continue }
+            visited += 1
+            if visited > maxWalkEntries { break }
+            guard let attrs = enumerator?.fileAttributes else { continue }
+            // Don't descend where `wanted` would refuse every file anyway —
+            // pure speed for a tarball, the difference between seconds and
+            // minutes for a local checkout full of node_modules.
+            if attrs[.type] as? FileAttributeType == .typeDirectory {
+                let name = (rel as NSString).lastPathComponent
+                if skipDirs.contains(name) || name.hasPrefix(".") { enumerator?.skipDescendants() }
+                continue
+            }
+            guard attrs[.type] as? FileAttributeType == .typeRegular else { continue }
             let size = (attrs[.size] as? NSNumber)?.intValue ?? 0
             guard wanted(relPath: rel, size: size) else { continue }
             if written + size > maxRepoBytes { break }
-            let url = extractDir.appendingPathComponent(rel)
+            let url = root.appendingPathComponent(rel)
             let target = dest.appendingPathComponent(rel)
             try? fm.createDirectory(at: target.deletingLastPathComponent(),
                                     withIntermediateDirectories: true)
@@ -411,7 +707,19 @@ enum CorpusIngest {
         var bytes = 0
     }
 
-    /// Packs the whole cache into corpus.bin + corpus-index.json, deduplicating
+    struct Source {
+        let name: String
+        let dir: URL
+    }
+
+    /// The per-repo (or per-folder) mirror directories under one cache root.
+    static func mirrorDirectories(in root: URL) -> [URL] {
+        ((try? FileManager.default.contentsOfDirectory(
+            at: root, includingPropertiesForKeys: [.isDirectoryKey])) ?? [])
+            .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+    }
+
+    /// Packs the given mirrors into corpus.bin + corpus-index.json, deduplicating
     /// identical files across repos by content hash, then swaps both into place
     /// with two rename(2)s, bin first. Each rename is atomic but the pair is
     /// not, so the reader binds an index to its exact bin: every block must fit
@@ -419,7 +727,12 @@ enum CorpusIngest {
     /// reader that catches the pair mid-swap (new bin with the old index, or
     /// old bin with the new) fails that check and falls back for one session
     /// instead of slicing the bin at the wrong boundaries.
-    static func buildCorpus(cacheDir: URL, corpusDir: URL) throws -> BuildResult {
+    ///
+    /// `sources` names each mirror's index key: a GitHub mirror is keyed by its
+    /// repo, a folder mirror by the folder's own name — so the saver's
+    /// per-repo weighting treats a folder like one more repo, and a folder
+    /// that IS a checkout of a listed repo merges into that repo's key.
+    static func buildCorpus(sources: [Source], corpusDir: URL) throws -> BuildResult {
         let fm = FileManager.default
         try fm.createDirectory(at: corpusDir, withIntermediateDirectories: true)
         let binTmp = corpusDir.appendingPathComponent("corpus.bin.tmp")
@@ -432,11 +745,8 @@ enum CorpusIngest {
         var offset = 0
         var result = BuildResult()
 
-        let repoDirs = ((try? fm.contentsOfDirectory(at: cacheDir, includingPropertiesForKeys: [.isDirectoryKey])) ?? [])
-            .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
-        for repoDir in repoDirs {
-            let repo = repoDir.lastPathComponent
+        for source in sources.sorted(by: { ($0.name, $0.dir.path) < ($1.name, $1.dir.path) }) {
+            let repo = source.name, repoDir = source.dir
             var files: [URL] = []
             if let e = fm.enumerator(at: repoDir, includingPropertiesForKeys: [.isRegularFileKey]) {
                 while let url = e.nextObject() as? URL {
@@ -464,7 +774,7 @@ enum CorpusIngest {
 
         guard result.fileCount > 0 else {
             try? fm.removeItem(at: binTmp)
-            throw FetchError.emptyCorpus
+            throw FetchError.emptyCorpus("")  // the caller knows what was fetched; it explains
         }
         try JSONSerialization.data(withJSONObject: index, options: [.sortedKeys]).write(to: idxTmp)
         try CorpusStore.replaceFile(at: corpusDir.appendingPathComponent("corpus.bin"), with: binTmp)
