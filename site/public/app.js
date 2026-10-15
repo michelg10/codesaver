@@ -756,9 +756,10 @@ function Hero(root) {
   function drawClock() {
     if (!stage.w) return;
     const m = clockModel(new Date());
-    // Size: the saver's clockScale (2.6% of height), shrunk to fit the stage.
+    // Size: the saver's clockScale (2.6% of height), shrunk to fit the stage:
+    // the saver's 88% of the width, or the hero's padded width on a phone.
     const want = H * 0.026;
-    const fitW = (W * 0.88) / ((m.inner + 2) * 0.62), fitH = (stage.h * 0.58) / (7 * 1.06);
+    const fitW = Math.min(W * 0.88, stage.w) / ((m.inner + 2) * 0.62), fitH = (stage.h * 0.58) / (7 * 1.06);
     const size = Math.max(9, Math.min(want * 1.15, fitW, fitH));
     if (m.key !== clockKey || Math.abs(size - cf) > 0.01) {
       cf = size; clockKey = m.key;
@@ -1062,9 +1063,21 @@ function Hero(root) {
   new IntersectionObserver(es => { visible = es[0].isIntersecting; if (visible) start(); }, { threshold: 0 }).observe(root);
   D.addEventListener('visibilitychange', () => { if (!D.hidden) start(); });
 
-  root.addEventListener('click', e => {
+  // A tap, not a click: iOS Safari synthesizes `click` only on elements it
+  // judges clickable, and a hero of canvas and plain text mostly isn't, so
+  // taps on bare stretches never arrived. Pointer events always do. A press
+  // that stayed put and was short is a tap; a scroll cancels the pointer and
+  // a text drag moves it, so neither ignites.
+  let press = null;
+  root.addEventListener('pointerdown', e => {
+    press = e.isPrimary && e.button === 0 ? { x: e.clientX, y: e.clientY, t: performance.now() } : null;
+  });
+  root.addEventListener('pointercancel', () => { press = null; });
+  root.addEventListener('pointerup', e => {
+    const p = press; press = null;
+    if (!p || Math.hypot(e.clientX - p.x, e.clientY - p.y) > 12 || performance.now() - p.t > 800) return;
     if (e.target.closest('a, button, input, summary, select, textarea, label')) return;
-    if (String(window.getSelection && window.getSelection()) !== '') return;
+    if (e.pointerType === 'mouse' && String(window.getSelection && window.getSelection()) !== '') return;
     const hr = root.getBoundingClientRect();
     ignite(e.clientX - hr.left, e.clientY - hr.top);
   });
@@ -1160,7 +1173,7 @@ function Widgets(el) {
     dpr = Math.min(2, window.devicePixelRatio || 1);
     fs = parseFloat(getComputedStyle(el).fontSize) || 14;
     const c = rackCv.getContext('2d'); setFont(c, fs); cw = c.measureText('M').width;
-    lh = Math.round(fs * 1.55);
+    lh = Math.round(cw * 2);   // the saver's 2:1 cell (AlbumArtGrid.rowStep), which the ramp's sampling assumes
     artCols = clamp(Math.floor((npBox.clientWidth / cw) - 4), 16, 28); artCols -= artCols % 2;
     artRows = artCols / 2;
     buildArt();

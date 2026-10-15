@@ -207,10 +207,21 @@ const BASE_HEADERS = {
 };
 
 let pages: { index: string; notFound: string; indexCsp: string; notFoundCsp: string } | null = null;
+// Cloudflare stretches every asset's browser TTL to hours whatever this
+// server sends, so the pages name their CSS and JS by content: a deploy
+// changes the URL, and a phone holding the old file fetches the new one.
+async function stamp(html: string): Promise<string> {
+  for (const f of ["styles.css", "app.js"]) {
+    const v = createHash("sha256").update(await readFile(join(PUBLIC, f))).digest("hex").slice(0, 10);
+    html = html.replace(new RegExp(`(["/])${f.replace(".", "\\.")}"`, "g"), `$1${f}?v=${v}"`);
+  }
+  return html;
+}
+
 async function loadPages() {
   if (pages && process.env.NODE_ENV === "production") return pages;
-  const index = await readFile(join(PUBLIC, "index.html"), "utf8");
-  const notFound = await readFile(join(PUBLIC, "404.html"), "utf8");
+  const index = await stamp(await readFile(join(PUBLIC, "index.html"), "utf8"));
+  const notFound = await stamp(await readFile(join(PUBLIC, "404.html"), "utf8"));
   pages = { index, notFound, indexCsp: cspFor(index), notFoundCsp: cspFor(notFound) };
   return pages;
 }
