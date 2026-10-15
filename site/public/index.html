@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>CodeSaver: a macOS screensaver for the agentic coding era</title>
+<meta name="description" content="A free, open-source macOS screensaver. Code from your own GitHub repos types itself across a pure-black screen while a Claude Code–style spinner grinds through made-up verbs. Your Mac idles. The agent doesn't.">
+<link rel="canonical" href="https://codesaver.michelg10.com/">
+<meta name="theme-color" content="#000000">
+<meta name="color-scheme" content="dark">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="CodeSaver">
+<meta property="og:url" content="https://codesaver.michelg10.com/">
+<meta property="og:title" content="CodeSaver: Your Mac idles. The agent doesn't.">
+<meta property="og:description" content="A free, open-source macOS screensaver that types code from your own GitHub repos across a pure-black screen, with a Claude Code–style spinner, a half-block clock and an optional ignition boom.">
+<meta property="og:image" content="https://codesaver.michelg10.com/media/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="A black screen of dimly typed code, a boxed clock in chunky block digits, and a violet spinner line reading Sprokbooking.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="CodeSaver: Your Mac idles. The agent doesn't.">
+<meta name="twitter:description" content="A free, open-source macOS screensaver for the agentic coding era.">
+<meta name="twitter:image" content="https://codesaver.michelg10.com/media/og.png">
+<link rel="icon" type="image/png" sizes="32x32" href="icons/icon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="icons/icon-16.png">
+<link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="preload" href="data.json" as="fetch" crossorigin>
+<link rel="stylesheet" href="styles.css">
+<script>document.documentElement.classList.add('js');if(matchMedia('(prefers-reduced-motion: reduce)').matches)document.documentElement.classList.add('rm')</script>
+<script src="app.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="hero" id="top">
+  <canvas class="hero__canvas" aria-hidden="true"></canvas>
+  <nav class="bar" aria-label="Site">
+    <a class="bar__brand" href="#top"><span class="g" aria-hidden="true">✽</span> CodeSaver</a>
+    <ul class="bar__links">
+      <li><a href="#setup">setup</a></li>
+      <li><a href="#faq">faq</a></li>
+      <li><a href="https://github.com/michelg10/codesaver">github</a></li>
+    </ul>
+  </nav>
+  <div class="hero__stage" aria-hidden="true"></div>
+  <div class="hero__copy">
+    <h1>Your Mac idles.<br>The agent <span class="nw">doesn't.<span class="cursor" aria-hidden="true"></span></span></h1>
+    <p class="hero__lede">A free, open-source macOS screensaver. Code from your own GitHub repos types itself across a pure-black screen while a Claude Code–style spinner grinds through made-up verbs.</p>
+    <div class="get" data-slot="hero"><!--release:hero--><p class="get__soon"><span class="g" aria-hidden="true">✽</span> first release coming soon</p><div class="get__row"><a class="btn" href="https://github.com/michelg10/codesaver">build from source</a><a class="get__alt" href="https://github.com/michelg10/codesaver/releases">watch for releases</a></div><p class="get__meta">free · open source · macOS 14+ · universal</p><!--/release:hero--></div>
+  </div>
+  <div class="hero__foot">
+    <button class="ignite" type="button"><span class="g" aria-hidden="true">·</span> click anywhere to ignite</button>
+  </div>
+  <p class="sr-only">Behind this text, a live rendition of the screensaver runs: code types itself in dim blue-grey, a boxed clock shows your local time in block digits, and a spinner line cycles made-up verbs.</p>
+</header>
+
+<main id="main">
+
+<section class="sec" id="see" aria-labelledby="see-h">
+  <h2 class="rail rv" id="see-h"><span class="rail__c" aria-hidden="true">/* </span>what you'll see<span class="rail__c" aria-hidden="true"> */</span></h2>
+  <p class="lead rv rv--type">Pure black, edge to edge, and three things alive on it.</p>
+  <div class="box term rv" data-transcript>
+    <div class="box__top" aria-hidden="true"><span>╭─ </span><span class="box__label">~/your-repos</span><span class="box__fill"></span><span>╮</span></div>
+    <div class="box__body">
+      <p class="t t--prompt"><span class="t__g" aria-hidden="true">&gt;</span> <span class="t__type">what will my screen look like while I'm away?</span></p>
+      <ul class="t__out">
+        <li class="t">
+          <p><span class="t__g t__dot" aria-hidden="true">●</span> <strong>Code from your own GitHub repos</strong>, typed out live in SF Mono.</p>
+          <p class="t__res"><span class="t__g" aria-hidden="true">└</span> A glowing typing head and a block cursor. Settled lines dim as they age, and new lines clip whatever they land on, so it never reads as a grid.</p>
+        </li>
+        <li class="t">
+          <p><span class="t__g t__dot" aria-hidden="true">●</span> <strong>A spinner that never finishes its thought.</strong></p>
+          <p class="t__res t__spin" aria-hidden="true"><span class="t__g">└</span> <span class="sp"><span class="sp__g">✽</span> <span class="sp__v">Sprokbooking…</span> <span class="sp__p">(2m 7s · ↓ 1.6k tokens · still coding with xhigh effort)</span></span></p>
+          <p class="t__res"><span class="t__g" aria-hidden="true">└</span> Made-up verbs run Claude Code's real request lifecycle: a beat of latency, then streaming with elapsed time and a ↓/↑ token counter, up the “still coding” ladder at the real 10, 20, 30 and 45 seconds, until it rests on <span class="done">✻ Sprokbooked for 2m 7s</span>. Then the next one starts.</p>
+        </li>
+        <li class="t">
+          <p><span class="t__g t__dot" aria-hidden="true">●</span> <strong>A clock in a TUI box.</strong></p>
+          <p class="t__res"><span class="t__g" aria-hidden="true">└</span> Chunky half-block digits with ticking seconds, the date as a comment on the top rail. 12 or 24 hours, or off.</p>
+        </li>
+        <li class="t">
+          <p><span class="t__g t__dot" aria-hidden="true">●</span> <strong>Every display, one machine.</strong></p>
+          <p class="t__res"><span class="t__g" aria-hidden="true">└</span> One shared session spans all your screens. Pure black means OLED and mini-LED panels stay dark around the text, and a frame takes about 1–2 ms to draw.</p>
+        </li>
+      </ul>
+      <p class="t t--status" aria-hidden="true"><span class="sp"><span class="sp__g">✻</span> <span class="sp__v">Answered for 6s</span></span></p>
+    </div>
+    <div class="box__bot" aria-hidden="true"><span>╰</span><span class="box__fill"></span><span>╯</span></div>
+  </div>
+</section>
+
+<section class="sec" id="ignition" aria-labelledby="ign-h">
+  <h2 class="rail rv" id="ign-h"><span class="rail__c" aria-hidden="true">/* </span>ignition<span class="rail__c" aria-hidden="true"> */</span></h2>
+  <p class="lead rv rv--type">Your desktop blows apart into the code.</p>
+  <div class="cols">
+    <div class="prose rv rv--rows">
+      <p>Optional. A small helper keeps a fresh capture of your screen while you're idle, so the saver's first frame is your own desktop. Then two shockwaves run through it on the character grid. The first pixelates it into one color per cell, stamps real code over the mosaic and flings characters through the grid. The second wipes it to black, and the saver ignites in its wake.</p>
+      <ul class="ticks">
+        <li><span class="g" aria-hidden="true">·</span> Idle trigger: a short warning line appears beside your pointer first.</li>
+        <li><span class="g" aria-hidden="true">·</span> Hot corner: it goes off at once.</li>
+        <li><span class="g" aria-hidden="true">·</span> Needs Screen Recording permission. Without it, the saver simply starts plain.</li>
+        <li><span class="g" aria-hidden="true">·</span> The capture never leaves your Mac and is deleted the moment you're back.</li>
+      </ul>
+      <p><button class="btn btn--ghost" type="button" data-ignite-top><span class="g" aria-hidden="true">✽</span> ignite the top of this page</button></p>
+    </div>
+    <figure class="box media rv" data-media>
+      <div class="box__top" aria-hidden="true"><span>╭─ </span><span class="box__label">the saver's own renderer</span><span class="box__fill"></span><span>╮</span></div>
+      <div class="box__body">
+        <video class="media__v" muted loop playsinline preload="none" controls data-poster="media/boom-poster.jpg" width="1920" height="1080" aria-label="Recording of the ignition, rendered by CodeSaver over a stand-in desktop: the desktop pixelates into colored cells behind a shockwave, code characters fly through the grid, then a second front wipes it to black and the screensaver starts.">
+          <source src="media/boom.mp4" type="video/mp4">
+        </video>
+        <p class="media__missing">✽ The recording didn't load. The top of this page runs the same ignition live.</p>
+      </div>
+      <div class="box__bot" aria-hidden="true"><span>╰</span><span class="box__fill"></span><button class="media__toggle" type="button" hidden>pause</button><span>─╯</span></div>
+    </figure>
+  </div>
+</section>
+
+<section class="sec" id="widgets" aria-labelledby="wid-h">
+  <h2 class="rail rv" id="wid-h"><span class="rail__c" aria-hidden="true">/* </span>live widgets<span class="rail__c" aria-hidden="true"> */</span></h2>
+  <p class="lead rv rv--type">What your agents are doing while you're not watching.</p>
+  <div class="prose rv rv--rows">
+    <p>Optional. One panel per running Claude Code session: the project, and what it's doing right now. Thinking, running a tool, waiting on your permission, done. Active sessions float above resting ones. In the other corner, whatever is playing in Music or Spotify, its cover redrawn in text.</p>
+  </div>
+  <div class="wd rv" data-widgets aria-hidden="true">
+    <div class="wd__rack"></div>
+    <div class="wd__np"></div>
+  </div>
+  <p class="sr-only">A demo of the widgets: three session panels cycle through Thinking, Bash running, Permissions required, Responding and Done, and a now-playing panel shows a track with a progress bar and a cover drawn in text characters.</p>
+  <dl class="key rv rv--rows">
+    <div><dt><span class="g g--cc" aria-hidden="true">✽</span> orange</dt><dd>is Claude Code's own state, mirrored from your sessions.</dd></div>
+    <div><dt><span class="g" aria-hidden="true">✽</span> violet</dt><dd>is CodeSaver's theater: the spinner, the boom, nothing real.</dd></div>
+  </dl>
+  <p class="note rv rv--rows">Turn on <em>Live widgets</em> in the app. Session panels read Claude Code's hooks; the <a href="https://github.com/michelg10/codesaver#live-widgets-claude-code-sessions-and-now-playing">README</a> has the one-line setup. Everything stays on your Mac.</p>
+  <figure class="box media shot rv">
+    <div class="box__top" aria-hidden="true"><span>╭─ </span><span class="box__label">a full screen with widgets, as the saver draws it</span><span class="box__fill"></span><span>╮</span></div>
+    <div class="box__body">
+      <img class="media__img" src="media/widgets-1440.webp" srcset="media/widgets-1440.webp 1440w, media/widgets-2880.webp 2880w" sizes="(min-width: 1200px) 1240px, 100vw" width="1440" height="900" loading="lazy" decoding="async" alt="CodeSaver full screen at 10:42 PM: the boxed clock and spinner in the middle, three Claude Code session panels at the bottom left (one thinking, one running Bash, one done), a now-playing panel at the bottom right with a synthwave cover drawn in text characters, and a battery gauge at the top right.">
+    </div>
+    <div class="box__bot" aria-hidden="true"><span>╰</span><span class="box__fill"></span><span class="box__label"> 2880×1800 </span><span>─╯</span></div>
+  </figure>
+</section>
+
+<section class="sec" id="setup" aria-labelledby="set-h">
+  <h2 class="rail rv" id="set-h"><span class="rail__c" aria-hidden="true">/* </span>setup<span class="rail__c" aria-hidden="true"> */</span></h2>
+  <p class="lead rv rv--type">Download, drag to Applications, open. Then three clicks.</p>
+  <div class="setup">
+    <div class="box check rv" data-checklist aria-hidden="true">
+      <div class="box__top"><span>╭─ </span><span class="box__label"><span class="g">✽</span> CodeSaver</span><span class="box__fill"></span><span>╮</span></div>
+      <div class="box__body">
+        <div class="ck" data-step="0"><span class="ck__g">·</span><span class="ck__t">Screensaver</span><span class="ck__d"></span><span class="ck__c"><span class="key-btn">Enable</span></span></div>
+        <div class="ck" data-step="1"><span class="ck__g">·</span><span class="ck__t">GitHub</span><span class="ck__d"><span class="field"><span class="field__v"></span><span class="field__ph">username or token</span></span></span><span class="ck__c"></span></div>
+        <div class="ck" data-step="2"><span class="ck__g">·</span><span class="ck__t">Auto-refresh</span><span class="ck__d">daily · plugged in</span><span class="ck__c"><span class="tog">[ off ]</span></span></div>
+        <div class="ck ck--opt" data-step="3"><span class="ck__g">·</span><span class="ck__t">Live widgets</span><span class="ck__d">optional</span><span class="ck__c"><span class="tog">[ off ]</span></span></div>
+      </div>
+      <div class="box__bot"><span>╰</span><span class="box__fill"></span><span class="box__label ck__sum"> 0 of 3 </span><span>─╯</span></div>
+    </div>
+    <ol class="steps rv rv--rows">
+      <li><span class="g" aria-hidden="true">✻</span> <strong>Screensaver.</strong> One click makes CodeSaver your screensaver.</li>
+      <li><span class="g" aria-hidden="true">✻</span> <strong>GitHub.</strong> Your username is enough for public repos. For private ones, paste a read-only token; private repos stay off until you pick them.</li>
+      <li><span class="g" aria-hidden="true">✻</span> <strong>Auto-refresh.</strong> Re-reads your repos about once a day, only when plugged in, at the lowest priority macOS offers.</li>
+      <li class="steps__opt"><span class="g" aria-hidden="true">·</span> <strong>Live widgets</strong> is an optional fourth switch.</li>
+    </ol>
+  </div>
+  <div class="get get--setup rv rv--rows" data-slot="setup"><!--release:setup--><p class="get__soon"><span class="g" aria-hidden="true">✽</span> first release coming soon</p><div class="get__row"><a class="btn" href="https://github.com/michelg10/codesaver">build from source</a><a class="get__alt" href="https://github.com/michelg10/codesaver/releases">watch for releases</a></div><p class="get__meta">free · open source · macOS 14+ · universal</p><!--/release:setup--></div>
+  <p class="note rv rv--rows">Requires macOS 14 Sonoma or later, on Apple silicon or Intel.</p>
+</section>
+
+<section class="sec" id="real" aria-labelledby="real-h">
+  <h2 class="rail rv" id="real-h"><span class="rail__c" aria-hidden="true">/* </span>the real thing<span class="rail__c" aria-hidden="true"> */</span></h2>
+  <p class="lead rv rv--type">The same scene, drawn by the saver itself.</p>
+  <figure class="box media media--wide rv" data-media>
+    <div class="box__top" aria-hidden="true"><span>╭─ </span><span class="box__label">1920×1080 · one spinner cycle, looped</span><span class="box__fill"></span><span>╮</span></div>
+    <div class="box__body">
+      <video class="media__v" muted loop playsinline preload="none" controls data-poster="media/poster.jpg" width="1920" height="1080" aria-label="Recording of CodeSaver running full screen: code typing across black, the boxed clock, and the spinner cycling verbs.">
+        <source src="media/hero.webm" type="video/webm">
+        <source src="media/hero.mp4" type="video/mp4">
+      </video>
+      <p class="media__missing">✽ The recording didn't load.</p>
+    </div>
+    <div class="box__bot" aria-hidden="true"><span>╰</span><span class="box__fill"></span><button class="media__toggle" type="button" hidden>pause</button><span>─╯</span></div>
+  </figure>
+</section>
+
+<section class="sec" id="privacy" aria-labelledby="priv-h">
+  <h2 class="rail rv" id="priv-h"><span class="rail__c" aria-hidden="true">/* </span>privacy<span class="rail__c" aria-hidden="true"> */</span></h2>
+  <p class="lead rv rv--type">Your code stays on your Mac.</p>
+  <dl class="kv rv rv--rows">
+    <div><dt>your code</dt><dd>Downloaded from GitHub into CodeSaver's own folder on your Mac and read from there. Nothing is uploaded, ever.</dd></div>
+    <div><dt>network</dt><dd>GitHub, plus a check for a new version once a day while the app is open. Nothing else.</dd></div>
+    <div><dt>private repos</dt><dd>Off unless you pick them.</dd></div>
+    <div><dt>ignition</dt><dd>Screen captures never leave the Mac and are deleted when you return.</dd></div>
+    <div><dt>this site</dt><dd>No analytics, no cookies, no third-party requests.</dd></div>
+  </dl>
+</section>
+
+<section class="sec" id="new" aria-labelledby="new-h">
+  <h2 class="rail rv" id="new-h"><span class="rail__c" aria-hidden="true">/* </span>what's new<span class="rail__c" aria-hidden="true"> */</span></h2>
+  <div class="prose rv rv--rows" data-slot="notes"><!--release:notes--><p class="lead">No release yet. The first build is on its way.</p><p>Until then, CodeSaver builds from source with Xcode 15 or later:</p><pre class="code" tabindex="0"><code>git clone https://github.com/michelg10/codesaver
+cd codesaver
+./appex/install.sh
+open /Applications/CodeSaver.app</code></pre><!--/release:notes--></div>
+  <p class="note rv rv--rows">Updating is a drag-in replacement: put the new CodeSaver.app over the old one, then open it once so it re-selects itself as your screensaver.</p>
+</section>
+
+<section class="sec" id="faq" aria-labelledby="faq-h">
+  <h2 class="rail rv" id="faq-h"><span class="rail__c" aria-hidden="true">/* </span>faq<span class="rail__c" aria-hidden="true"> */</span></h2>
+  <div class="faq rv rv--rows">
+    <details>
+      <summary>Does it slow my Mac?</summary>
+      <p>No. It only runs while the screensaver is up, and a frame takes about 1–2 ms to draw. The background refresh runs about once a day, only when plugged in, at the lowest priority macOS offers.</p>
+    </details>
+    <details>
+      <summary>Is my code uploaded anywhere?</summary>
+      <p>No. CodeSaver downloads your repos from GitHub to your Mac and reads them from there. It talks to GitHub and, once a day while the app is open, checks for a new version. That's all.</p>
+    </details>
+    <details>
+      <summary>Does it work without GitHub?</summary>
+      <p>Yes. Until you connect an account, it types a small built-in sample of code. Connecting is just a username for public repos.</p>
+    </details>
+    <details>
+      <summary>How do I update it?</summary>
+      <p>Download the new version and drag it into Applications, replacing the old one. Then open CodeSaver once, so it can re-select itself as your screensaver. While the app is open, it checks for a new version once a day and links back here when there is one.</p>
+    </details>
+    <details>
+      <summary>How do I uninstall it?</summary>
+      <p>Open CodeSaver, go to its Advanced section, and click Uninstall.</p>
+    </details>
+    <details>
+      <summary>Is this made by Anthropic?</summary>
+      <p>No. CodeSaver is an independent, unaffiliated homage to Claude Code, made by one developer and released under the MIT license.</p>
+    </details>
+  </div>
+</section>
+
+</main>
+
+<footer class="foot">
+  <div class="foot__rail" aria-hidden="true"></div>
+  <p class="foot__done" aria-hidden="true"><span class="g g--done">✻</span> <span data-browsed>Browsed for a moment</span></p>
+  <p>CodeSaver is free and open source under the MIT license. Made by Michel Guo (<a href="https://github.com/michelg10">michelg10</a>). Source on <a href="https://github.com/michelg10/codesaver">GitHub</a>.</p>
+  <p>An unaffiliated homage to Claude Code. Not affiliated with Anthropic.</p>
+  <p class="dim">Appex scaffolding from AppexSaverMinimal by Guillaume Louel (MIT).</p>
+</footer>
+</body>
+</html>
