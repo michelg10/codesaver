@@ -209,6 +209,8 @@ fi
 # KeepAlive agent otherwise keeps running the replaced binary), and a
 # standalone igniter from helper/install.sh is retired on the way. Off: a
 # no-op — a reinstall never switches ignition on.
+[[ -e "$HOME/Library/LaunchAgents/com.michelg10.CodeSaver.Igniter.plist" ]] \
+  && echo "── moving the standalone igniter into the app (macOS can take a couple of minutes to let go of it)…"
 if IGNITER_OUT="$("$APP_DEST/Contents/MacOS/CodeSaver" --reregister-igniter 2>/dev/null)"; then
   [[ $IGNITER_OUT == *enabled* ]] && echo "── igniter re-registered on the new build"
 else

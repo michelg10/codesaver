@@ -57,21 +57,22 @@ final class IgnitionModel: ObservableObject {
 
     /// Automatic, once, on launch: the window's first appearance is the
     /// launch. A user of the old standalone igniter opens the new app and
-    /// finds Ignition on, same grant, same corners.
+    /// finds Ignition on, same grant, same corners — and a user whose
+    /// registration went missing finds it back.
     private func migrateLegacy() {
-        guard !Self.migrationStarted, IgniterService.legacyInstalled,
-              IgniterService.isAtStablePath else { return }
+        guard !Self.migrationStarted, IgniterService.isAtStablePath else { return }
         Self.migrationStarted = true
-        migrating = true
+        let legacy = IgniterService.legacyInstalled
+        migrating = legacy
         legacyWaiting = false
         Task {
             let status = await Task.detached(priority: .userInitiated) {
-                IgniterService.migrateLegacy()
+                legacy ? IgniterService.migrateLegacy() : IgniterService.restoreIfWanted()
             }.value
             migrating = false
             reload()
-            if let status, !IgniterService.isOn(status) {
-                note = "couldn't take over the old igniter — switch ignition on to try again"
+            if legacy, let status, !IgniterService.isOn(status) {
+                note = "the old igniter is still running — CodeSaver will take it over next time it opens"
             }
         }
     }
@@ -79,6 +80,7 @@ final class IgnitionModel: ObservableObject {
     func setOn(_ on: Bool) {
         note = nil
         guard on else {
+            IgniterService.wanted = false
             IgniterService.disable()
             reload()
             return
@@ -87,6 +89,7 @@ final class IgnitionModel: ObservableObject {
             note = "move CodeSaver to /Applications first — ignition runs from there"
             return
         }
+        IgniterService.wanted = true
         status = IgniterService.enable()
         if !isOn {
             note = "macOS didn't start it (\(RefreshAgent.describe(status))) — try the switch again"

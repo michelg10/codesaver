@@ -811,11 +811,24 @@ final class Igniter {
     private func publishScreenRecording() {
         guard identityCaveat() == nil, Date().timeIntervalSince(accessReadAt) > 10 else { return }
         accessReadAt = Date()
-        let granted = CGPreflightScreenCaptureAccess()
+        let granted = screenRecordingGranted()
         guard granted != publishedAccess else { return }
         publishedAccess = granted
         defaults?.set(granted, forKey: "screenRecordingGranted")
         igniterLog("Screen Recording \(granted ? "granted" : "not granted")")
+    }
+
+    /// TCC answers CGPreflightScreenCaptureAccess() once per process: a grant
+    /// made in System Settings while this agent runs — the user who picks
+    /// "Later" over "Quit & Reopen" — keeps reading as denied here until the
+    /// next launch, though ScreenCaptureKit already captures. Left alone,
+    /// the app showed a missing permission over a working boom, and the
+    /// next empty shot was read as a denial: the ten-minute no-boom shadow
+    /// again. A capture that came back with pictures is the proof.
+    private var captureProvedAccess = false
+
+    private func screenRecordingGranted() -> Bool {
+        captureProvedAccess || CGPreflightScreenCaptureAccess()
     }
 
     private func tick() {
@@ -1027,6 +1040,13 @@ final class Igniter {
                 return
             }
             var userReturned = false
+            if !images.isEmpty, !self.captureProvedAccess {
+                // Pictures came back, so Screen Recording is granted whatever
+                // the preflight says; publish that on the next tick rather
+                // than in ten seconds.
+                self.captureProvedAccess = true
+                self.accessReadAt = .distantPast
+            }
             // No images: write nothing (the saver then starts normally) —
             // but only ONE of the possible reasons deserves the long backoff.
             //  • Screen Recording denied: asked directly, without prompting
@@ -1055,12 +1075,19 @@ final class Igniter {
                 if kind == "corner" { self.lastCornerCapture = .distantPast }
                 else { self.lastIdleCapture = .distantPast }
                 let detail = why ?? "no detail"
-                if !CGPreflightScreenCaptureAccess() {
+                if !self.screenRecordingGranted() {
                     igniterLog("\(kind) capture denied — no Screen Recording permission (\(detail)); backing off 10 min")
                     self.captureBackoffUntil = Date().addingTimeInterval(600)
                 } else if screenIsLocked() {
                     igniterLog("\(kind) capture skipped — screen is locked, no desktop to capture (\(detail))")
                 } else {
+                    // A grant an earlier shot proved may have been revoked
+                    // since, which this process's preflight can't see either
+                    // way: stop leaning on it, so a second empty shot in a
+                    // row reads as the denial it would then be.
+                    if self.captureProvedAccess, !CGPreflightScreenCaptureAccess() {
+                        self.captureProvedAccess = false
+                    }
                     igniterLog("\(kind) capture empty — \(detail); retrying in 2 s")
                     self.captureBackoffUntil = Date().addingTimeInterval(2)
                 }

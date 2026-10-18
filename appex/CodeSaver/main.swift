@@ -97,10 +97,29 @@ if args.contains("--reregister-feeds") {
 // (the agent keeps running the replaced build otherwise), retiring a
 // standalone igniter from an old source install on the way. Off: exit 0 and
 // register nothing — a reinstall never switches ignition on.
-if args.contains("--reregister-igniter") {
-    let s = IgniterService.repairAfterUpdate()
+// The Ignition switch turned on from a script — the recovery for an igniter
+// whose registration was lost. Unlike --reregister-igniter it is a choice,
+// so it starts from .notRegistered.
+if args.contains("--enable-igniter") {
+    IgniterService.wanted = true
+    let s = IgniterService.enable(interactive: false)
     print("igniter agent: \(RefreshAgent.describe(s))")
-    exit(IgniterService.isOn(s) || s == .notRegistered ? 0 : 1)
+    exit(IgniterService.isOn(s) ? 0 : 1)
+}
+
+if args.contains("--reregister-igniter") {
+    // Read before the repair: for an install from before the choice was
+    // recorded, "wanted" is the registration itself, which a failed repair
+    // would turn into "off".
+    let wanted = IgniterService.wanted || IgniterService.legacyInstalled
+    let s = IgniterService.repairAfterUpdate()
+    guard wanted else {
+        print("igniter agent: off (turn on Ignition in the app)")
+        exit(0)
+    }
+    print("igniter agent: \(RefreshAgent.describe(s))")
+    // Wanted but not on is a failure, said so: it used to exit 0 here.
+    exit(IgniterService.isOn(s) ? 0 : 1)
 }
 
 if args.contains("--register-agent") {
