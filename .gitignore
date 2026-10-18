@@ -3,3 +3,4 @@ build/
 appex/build/
 appex/Local.xcconfig
 __pycache__/
+appex/BuildStamp.xcconfig

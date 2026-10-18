@@ -1,9 +1,13 @@
-CURRENT_PROJECT_VERSION = 261010.0000
+// The build number: a timestamp the CodeSaver scheme's pre-action writes
+// into the gitignored BuildStamp.xcconfig on every build (install.sh and
+// scripts/release.sh pass their own), so building never dirties the tree.
+// This default is for a checkout that has never been built.
+CURRENT_PROJECT_VERSION = 1
+#include? "BuildStamp.xcconfig"
 
 // The version people see — CFBundleShortVersionString in both Info.plists,
 // and the tag scripts/release.sh publishes. Set here only: every target
-// inherits it. (The CodeSaver scheme's pre-action restamps the line above
-// on every build and leaves the rest of this file alone.)
+// inherits it.
 MARKETING_VERSION = 1.0.0
 
 // This machine's own settings, if it has any: optional and gitignored (see

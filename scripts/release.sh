@@ -81,13 +81,10 @@ if (( $#FAILED )); then
   exit 1
 fi
 
-# A tree with changes builds a release no commit describes. The scheme's
-# pre-action restamps CURRENT_PROJECT_VERSION in BuildNumber.xcconfig on
-# every build, so that line alone doesn't count.
+# A tree with changes builds a release no commit describes. (The build
+# number stamp lives in the gitignored BuildStamp.xcconfig, so a build alone
+# leaves the tree clean.)
 CHANGES="$(git status --porcelain 2>/dev/null || true)"
-OTHER_LINES="$(git diff -U0 -- appex/BuildNumber.xcconfig 2>/dev/null | grep -E '^[-+]' \
-  | grep -vE '^(\+\+\+|---) |^[-+]CURRENT_PROJECT_VERSION = ' || true)"
-[[ $CHANGES != " M appex/BuildNumber.xcconfig" || -n $OTHER_LINES ]] || CHANGES=""
 [[ -z $CHANGES ]] || warn "the git tree has uncommitted changes, so this release matches no commit (commit first to fix; carrying on)"
 if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null 2>&1; then
   warn "v$VERSION is already tagged — bump MARKETING_VERSION in appex/BuildNumber.xcconfig to fix (carrying on)"
